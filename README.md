@@ -13,7 +13,7 @@
 
 [功能](#-功能全景) · [部署](#-快速部署) · [架构](#-技术架构) · [API](#-api-端点) · [WebDAV](#-webdav-挂载) · [FAQ](#-常见问题)
 
-**Live Demo** → [cloud.bjhr.space](https://cloud.bjhr.space)
+
 
 </div>
 
