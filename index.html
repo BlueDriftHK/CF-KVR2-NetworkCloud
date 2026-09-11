@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CF-KVR2-NetworkCloud — 一个文件，一个 Worker，一个属于你自己的云</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --cyan:#22d3ee;--indigo:#6366f1;--orange:#f38020;
+  --bg:#07080c;--surface:rgba(255,255,255,0.03);--surface-2:rgba(255,255,255,0.06);
+  --text:#e4e4e7;--text-2:rgba(228,228,231,0.6);--text-3:rgba(228,228,231,0.35);
+  --border:rgba(255,255,255,0.06);--glass:rgba(15,16,24,0.7);
+}
+html{scroll-behavior:smooth}
+body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--cyan);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* Aurora background */
+.aurora{position:fixed;inset:0;z-index:-1;overflow:hidden}
+.aurora::before,.aurora::after{content:'';position:absolute;width:600px;height:600px;border-radius:50%;filter:blur(120px);opacity:.12}
+.aurora::before{background:var(--indigo);top:-200px;left:-100px}
+.aurora::after{background:var(--cyan);bottom:-200px;right:-100px}
+.aurora .orb{position:absolute;width:400px;height:400px;border-radius:50%;filter:blur(100px);background:var(--orange);opacity:.06;top:50%;left:50%;transform:translate(-50%,-50%)}
+
+/* Layout */
+.wrap{max-width:1100px;margin:0 auto;padding:0 24px}
+
+/* Hero */
+.hero{min-height:100vh;display:flex;align-items:center;justify-content:center;text-align:center;position:relative;padding:60px 24px}
+.hero-content{max-width:720px}
+.hero-badge{display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:99px;background:var(--surface-2);border:1px solid var(--border);font-size:13px;color:var(--text-2);margin-bottom:28px}
+.hero-badge .dot{width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.hero h1{font-size:clamp(36px,7vw,64px);font-weight:800;letter-spacing:-.03em;line-height:1.1;margin-bottom:20px}
+.hero h1 .grad{background:linear-gradient(135deg,var(--cyan),var(--indigo),var(--orange));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.hero p{font-size:18px;color:var(--text-2);margin-bottom:36px;line-height:1.7}
+.hero-actions{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:12px 28px;border-radius:12px;font-size:15px;font-weight:600;transition:all .2s;cursor:pointer;border:none}
+.btn-primary{background:linear-gradient(135deg,var(--cyan),var(--indigo));color:#fff;box-shadow:0 4px 24px rgba(34,211,238,0.25)}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(34,211,238,0.35)}
+.btn-ghost{background:var(--surface-2);color:var(--text);border:1px solid var(--border)}
+.btn-ghost:hover{background:var(--surface);border-color:rgba(255,255,255,0.12)}
+
+/* Section */
+section{padding:80px 0}
+.sec-label{font-size:12px;text-transform:uppercase;letter-spacing:2px;color:var(--cyan);font-weight:700;margin-bottom:12px}
+.sec-title{font-size:clamp(24px,4vw,36px);font-weight:800;letter-spacing:-.02em;margin-bottom:16px}
+.sec-desc{font-size:16px;color:var(--text-2);max-width:600px;margin-bottom:40px}
+
+/* Stats bar */
+.stats-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1px;background:var(--border);border-radius:16px;overflow:hidden;border:1px solid var(--border)}
+.stat{background:var(--bg);padding:24px 20px;text-align:center}
+.stat .num{font-size:28px;font-weight:800;background:linear-gradient(135deg,var(--cyan),var(--indigo));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.stat .label{font-size:13px;color:var(--text-3);margin-top:4px}
+
+/* Feature cards */
+.features{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+.feat-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;transition:all .2s}
+.feat-card:hover{background:var(--surface-2);border-color:rgba(255,255,255,0.1);transform:translateY(-2px)}
+.feat-card .icon{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;margin-bottom:14px}
+.feat-card .icon.cyan{background:rgba(34,211,238,0.1);color:var(--cyan)}
+.feat-card .icon.indigo{background:rgba(99,102,241,0.1);color:var(--indigo)}
+.feat-card .icon.orange{background:rgba(243,128,32,0.1);color:var(--orange)}
+.feat-card h3{font-size:16px;font-weight:700;margin-bottom:8px;letter-spacing:-.01em}
+.feat-card p{font-size:14px;color:var(--text-2);line-height:1.6}
+.feat-card .tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+.feat-card .tag{font-size:11px;padding:3px 8px;border-radius:6px;background:var(--surface-2);color:var(--text-3)}
+
+/* Tech stack */
+.tech-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
+.tech-item{display:flex;align-items:center;gap:12px;padding:14px 16px;background:var(--surface);border:1px solid var(--border);border-radius:12px;font-size:14px;font-weight:500}
+.tech-item .emoji{font-size:20px}
+
+/* Deploy steps */
+.steps{display:grid;gap:16px;counter-reset:step}
+.step{display:flex;gap:16px;padding:20px;background:var(--surface);border:1px solid var(--border);border-radius:14px;align-items:flex-start}
+.step .num{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,var(--cyan),var(--indigo));color:#fff;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;flex-shrink:0}
+.step .body h4{font-size:15px;font-weight:600;margin-bottom:4px}
+.step .body p{font-size:13px;color:var(--text-2)}
+.step .body code{background:var(--surface-2);padding:2px 8px;border-radius:5px;font-size:12px;font-family:ui-monospace,"SF Mono",monospace}
+
+/* Quote */
+.quote-block{background:var(--surface);border-left:3px solid var(--cyan);border-radius:0 12px 12px 0;padding:20px 24px;margin:24px 0;font-size:15px;color:var(--text-2);line-height:1.8}
+.quote-block strong{color:var(--text)}
+
+/* Footer */
+footer{padding:40px 0;border-top:1px solid var(--border);text-align:center}
+footer p{font-size:13px;color:var(--text-3)}
+footer .links{display:flex;justify-content:center;gap:20px;margin-bottom:12px}
+footer .links a{font-size:14px;color:var(--text-2)}
+footer .links a:hover{color:var(--cyan)}
+
+/* Responsive */
+@media(max-width:768px){
+  .hero h1{font-size:32px}
+  .features{grid-template-columns:1fr}
+  .stats-bar{grid-template-columns:repeat(2,1fr)}
+  .tech-grid{grid-template-columns:1fr 1fr}
+}
+</style>
+</head>
+<body>
+<div class="aurora"><div class="orb"></div></div>
+
+<!-- Hero -->
+<div class="hero">
+<div class="hero-content">
+  <div class="hero-badge"><span class="dot"></span> Open Source · Cloudflare Workers</div>
+  <h1><span class="grad">一个文件</span>，一个 Worker，<br>一个属于你自己的云。</h1>
+  <p>基于 Cloudflare Workers + R2 + KV 构建的个人网盘。<br>无需服务器、无需数据库、无需构建工具。粘贴即部署，全球边缘加速。</p>
+  <div class="hero-actions">
+    <a href="https://cloud.bjhr.space" class="btn btn-primary">🚀 在线体验</a>
+    <a href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud" class="btn btn-ghost">📦 GitHub</a>
+  </div>
+</div>
+</div>
+
+<!-- Stats -->
+<section>
+<div class="wrap">
+  <div class="stats-bar">
+    <div class="stat"><div class="num">~3400</div><div class="label">行 JavaScript</div></div>
+    <div class="stat"><div class="num">1</div><div class="label">单文件部署</div></div>
+    <div class="stat"><div class="num">0</div><div class="label">外部依赖</div></div>
+    <div class="stat"><div class="num">30+</div><div class="label">API 端点</div></div>
+    <div class="stat"><div class="num">300+</div><div class="label">全球节点</div></div>
+    <div class="stat"><div class="num">$0</div><div class="label">出口流量费</div></div>
+  </div>
+</div>
+</section>
+
+<!-- Why -->
+<section>
+<div class="wrap">
+  <div class="sec-label">Why</div>
+  <div class="sec-title">为什么做这个</div>
+  <div class="sec-desc">市面上的网盘要么贵、要么慢、要么审查你的文件。</div>
+  <div class="quote-block">
+    <strong>Cloudflare 免费层给你：</strong>10GB R2 存储 + 10万次/天 Worker 请求 + 零出口流量费。<br>
+    全球 300+ 边缘节点，从东京到纽约都是毫秒级响应。<br>
+    数据完全在你手里——没人审查、没人限速、没人删你文件。
+  </div>
+  <p style="color:var(--text-2);font-size:15px">适合：个人文件备份 · 跨设备同步 · 给家人分享照片 · WebDAV 挂载当本地盘 · 代码项目存档 · 临时文件交换</p>
+</div>
+</section>
+
+<!-- Features -->
+<section>
+<div class="wrap">
+  <div class="sec-label">Features</div>
+  <div class="sec-title">功能全景</div>
+  <div class="sec-desc">从文件管理到媒体播放，从加密分享到 WebDAV 挂载。</div>
+  <div class="features">
+    <div class="feat-card">
+      <div class="icon cyan">📁</div>
+      <h3>文件管理</h3>
+      <p>拖拽上传、文件夹整体上传、粘贴截图、大文件自动分片、在线编辑、历史版本、批量操作</p>
+      <div class="tags"><span class="tag">分片上传</span><span class="tag">版本控制</span><span class="tag">批量重命名</span></div>
+    </div>
+    <div class="feat-card">
+      <div class="icon indigo">🔗</div>
+      <h3>分享与协作</h3>
+      <p>分享链接（密码/过期/次数限制）、上传链接、二维码、文件夹独立密码、访问令牌</p>
+      <div class="tags"><span class="tag">QR Code</span><span class="tag">上传链接</span><span class="tag">多令牌</span></div>
+    </div>
+    <div class="feat-card">
+      <div class="icon orange"></div>
+      <h3>媒体增强</h3>
+      <p>音乐连续播放、图片幻灯片 + EXIF、视频帧截图、Markdown 渲染、PDF 在线预览、代码高亮</p>
+      <div class="tags"><span class="tag">Playlist</span><span class="tag">EXIF</span><span class="tag">PDF.js</span></div>
+    </div>
+    <div class="feat-card">
+      <div class="icon cyan">🛡️</div>
+      <h3>客户端加密</h3>
+      <p>AES-256-GCM 加密，PBKDF2 派生密钥，服务端零知识。加密文件带 .enc 后缀，解密在浏览器完成</p>
+      <div class="tags"><span class="tag">AES-256</span><span class="tag">PBKDF2</span><span class="tag">Zero-Knowledge</span></div>
+    </div>
+    <div class="feat-card">
+      <div class="icon indigo"></div>
+      <h3>WebDAV 协议</h3>
+      <p>把网盘挂载为本地磁盘。支持 Windows / macOS / Raidrive / Cyberduck，Bearer Token 认证</p>
+      <div class="tags"><span class="tag">PROPFIND</span><span class="tag">PUT/GET</span><span class="tag">MKCOL</span></div>
+    </div>
+    <div class="feat-card">
+      <div class="icon orange">📊</div>
+      <h3>管理面板</h3>
+      <p>目录树拖拽、标签筛选、收藏/最近、活动日志、存储统计图表、重复检测、回收站</p>
+      <div class="tags"><span class="tag">Chart.js</span><span class="tag">Drag & Drop</span><span class="tag">Tags</span></div>
+    </div>
+    <div class="feat-card">
+      <div class="icon cyan">🎨</div>
+      <h3>界面体验</h3>
+      <p>Apple 风格 UI、深色/浅色/自动主题、列表/网格视图、中英双语、移动端适配、键盘快捷键、PWA</p>
+      <div class="tags"><span class="tag">Glassmorphism</span><span class="tag">i18n</span><span class="tag">Shortcuts</span></div>
+    </div>
+    <div class="feat-card">
+      <div class="icon indigo">⚡</div>
+      <h3>性能优化</h3>
+      <p>上传前图片压缩、上传去重检测、ZIP 并行读取、DO 缓存加速、缩略图预生成、分片断点续传</p>
+      <div class="tags"><span class="tag">Compress</span><span class="tag">Dedup</span><span class="tag">Parallel</span></div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- Tech Stack -->
+<section>
+<div class="wrap">
+  <div class="sec-label">Stack</div>
+  <div class="sec-title">技术栈</div>
+  <div class="sec-desc">全部跑在 Cloudflare 边缘，无外部服务依赖。</div>
+  <div class="tech-grid">
+    <div class="tech-item"><span class="emoji">⚡</span> Cloudflare Workers</div>
+    <div class="tech-item"><span class="emoji">🪣</span> R2 Object Storage</div>
+    <div class="tech-item"><span class="emoji">🔑</span> Workers KV</div>
+    <div class="tech-item"><span class="emoji"></span> Durable Objects</div>
+    <div class="tech-item"><span class="emoji">📝</span> Vanilla JS / CSS</div>
+    <div class="tech-item"><span class="emoji">📖</span> marked.js</div>
+    <div class="tech-item"><span class="emoji">🎨</span> highlight.js</div>
+    <div class="tech-item"><span class="emoji">📄</span> PDF.js (ESM)</div>
+    <div class="tech-item"><span class="emoji">📊</span> Chart.js</div>
+    <div class="tech-item"><span class="emoji">📷</span> ExifReader</div>
+    <div class="tech-item"><span class="emoji">🔳</span> QRCode.js</div>
+    <div class="tech-item"><span class="emoji">🔐</span> Web Crypto API</div>
+  </div>
+</div>
+</section>
+
+<!-- Deploy -->
+<section>
+<div class="wrap">
+  <div class="sec-label">Deploy</div>
+  <div class="sec-title">5 分钟上线</div>
+  <div class="sec-desc">不需要 Docker、不需要 VPS、不需要 CI/CD。复制粘贴即可。</div>
+  <div class="steps">
+    <div class="step"><div class="num">1</div><div class="body"><h4>创建 R2 存储桶</h4><p>Dashboard → R2 → Create Bucket → 命名 <code>drive</code></p></div></div>
+    <div class="step"><div class="num">2</div><div class="body"><h4>创建 KV 命名空间</h4><p>Dashboard → Workers → KV → Create → 命名 <code>STORE</code></p></div></div>
+    <div class="step"><div class="num">3</div><div class="body"><h4>创建 Worker 并粘贴代码</h4><p>Workers → Create → 粘贴 <code>_workers.js</code> → Deploy</p></div></div>
+    <div class="step"><div class="num">4</div><div class="body"><h4>配置 Bindings</h4><p>绑定 R2 <code>DRIVE</code> + KV <code>STORE</code>（DO <code>DIR</code> 可选）</p></div></div>
+    <div class="step"><div class="num">5</div><div class="body"><h4>设置环境变量</h4><p>添加 <code>DRIVE_PASSWORD</code>，部署。打开域名，开始用。</p></div></div>
+  </div>
+</div>
+</section>
+
+<!-- Architecture -->
+<section>
+<div class="wrap">
+  <div class="sec-label">Architecture</div>
+  <div class="sec-title">存储模型</div>
+  <div class="sec-desc">三层存储各司其职，DO 可选降级。</div>
+  <div class="features" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
+    <div class="feat-card">
+      <div class="icon cyan">🪣</div>
+      <h3>R2 — 文件存储</h3>
+      <p>所有文件二进制存 R2，无出口流量费。支持分片上传 (Multipart Upload) 处理大文件。</p>
+    </div>
+    <div class="feat-card">
+      <div class="icon indigo">🔑</div>
+      <h3>KV — 元数据</h3>
+      <p>目录索引、会话、标签、备注、分享链接、活动日志、用量统计。JSON 序列化存储。</p>
+    </div>
+    <div class="feat-card">
+      <div class="icon orange">🧊</div>
+      <h3>DO — 缓存加速</h3>
+      <p>热目录缓存 + 原子用量计数。3s 超时自动降级到 KV，不配也能跑。</p>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- Footer -->
+<footer>
+<div class="wrap">
+  <div class="links">
+    <a href="https://cloud.bjhr.space">在线体验</a>
+    <a href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud">GitHub</a>
+    <a href="https://t.me/BlueDriftHK">Telegram</a>
+    <a href="https://x.com/BlueDriftHK">X</a>
+  </div>
+  <p>AGPL-3.0 Licensed · Made with ☁️ by BlueDriftHK</p>
+</div>
+</footer>
+</body>
+</html>
