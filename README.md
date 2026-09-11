@@ -4,7 +4,6 @@
 
 基于 Cloudflare Workers + R2 + KV 构建的个人网盘，无需服务器、无需数据库、无需构建工具。把 `_workers.js` 粘贴进 Workers 编辑器，配好 Bindings，点击部署——你的网盘就上线了。
 
-**Live Demo** → [cloud.bjhr.space](https://cloud.bjhr.space)
 
 ---
 
