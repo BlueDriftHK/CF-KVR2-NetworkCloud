@@ -1,14 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 920b985d2f5d9c3397e2be237fdb8e96_1a946b2bbfcb11f197eb525400393706
-    ReservedCode1: 1zEOG4z8FagIdz/tRUMYl8/D9b3105Y228gYfeL7gXV2g96R9Jz05ZwECUpIGZ0mLWDodiTzTHAjAIRBsi0S7ytee2gzS9RjBMUx/Tp7XSj4ga3Ja64J8xcYN35AXozBasbhH4AEdJF0r3MLZA3tjTaY6wv09VwGy5DQCV3UtAEhCg5FejD+islb9dw=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 920b985d2f5d9c3397e2be237fdb8e96_1a946b2bbfcb11f197eb525400393706
-    ReservedCode2: 1zEOG4z8FagIdz/tRUMYl8/D9b3105Y228gYfeL7gXV2g96R9Jz05ZwECUpIGZ0mLWDodiTzTHAjAIRBsi0S7ytee2gzS9RjBMUx/Tp7XSj4ga3Ja64J8xcYN35AXozBasbhH4AEdJF0r3MLZA3tjTaY6wv09VwGy5DQCV3UtAEhCg5FejD+islb9dw=
----
-
 # PersonalDrive
 
 > 部署在 Cloudflare Workers 上的私人网盘，单文件 Worker（约 6500 行），R2 + KV + Durable Object 架构，内置完整 Web 前端（Apple / macOS Sonoma 风格，PWA 支持）。
