@@ -1,16 +1,21 @@
 /**
- * Personal Drive v5.1 - R2 + KV + Durable Object
+ * Personal Drive v5.1.2 - R2 + KV + Durable Object
  * UI: Apple / macOS Sonoma style, refined toolbar layout
- * Fix: 分享链接访问次数限制现在覆盖"打开页面"而非仅"下载"
+ * Security patch v5.1.2: 代码审查全量修复（H1-H4 / M1-M7 / L1-L5 / R1-R8，共约 24 项）
+ *   H1 WebDAV PUT 配额与流式写入 / H2 URL 抓取回滚 / H3 分享目录锁 / H4 分享密码限频
+ *   M1 登录用户级限频 / M2 Turnstile 配置完整性 / M3 WebDAV GET 净化 / M4 删除锁定子树
+ *   M5 chunks 孤儿豁免 / M6 上传计数原子化 / M7 分享 TTL 过期即清
+ *   L1 密码无盐迁移 / L2 token 改 Authorization 头 / L3 前端属性转义 / L4 webhook host 校验 / L5 错误脱敏
  * Bindings: R2="DRIVE", KV="STORE", DO="DIR"(可选), Env: DRIVE_PASSWORD
  */
 
 const SESSION_TTL = 86400 * 7;
-const APP_VERSION = 'v5.1.0';
+const APP_VERSION = 'v5.1.2';
 const THUMB_PREFIX = '.thumb/';
 const VERSIONS_PREFIX = '.versions/';
 const BACKUP_PREFIX = '.backup/';
 const MAX_VERSIONS = 5;
+const MAX_UPLOAD_SIZE = 500 * 1024 * 1024;
 const UNZIP_MAX_BYTES = 50 * 1024 * 1024;
 const USAGE_DO_NAME = '__usage__';
 
@@ -57,10 +62,10 @@ function davPathNorm(p) {
   return '/' + resolved.join('/') + (isDir ? '/' : '');
 }
 function escHtml(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  return String(s == null ? '' : s).replace(/[&<>"'`]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;' }[c]));
 }
 function xmlEsc(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]));
+  return String(s == null ? '' : s).replace(/[&<>"'`]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;', '`': '&#96;' }[c]));
 }
 
 // ===== Hardening helpers =====
@@ -105,7 +110,13 @@ async function moveNote(env, oldKey, newKey) {
 }
 // ===== Range / 流式响应 =====
 function dangerType(mime) {
-  return /^(text\/html|application\/xhtml\+xml|image\/svg\+xml|text\/xml|application\/xml)$/i.test(String(mime || ''));
+  const m = String(mime || '').toLowerCase();
+  if (!m) return false;
+  if (/^(text\/html|application\/xhtml\+xml|image\/svg\+xml|text\/xml|application\/xml|application\/xhtml)$/.test(m)) return true;
+  if (m.indexOf('+xml') >= 0) return true;
+  if (/^application\/(javascript|ecmascript|x-javascript)$/.test(m)) return true;
+  if (/^text\/(javascript|ecmascript|x-javascript)$/.test(m)) return true;
+  return false;
 }
 // 解析 Range 头：返回 {offset,length,start,end}，或 {invalid:true}
 function parseRange(header, size) {
@@ -130,7 +141,7 @@ function parseRange(header, size) {
 async function serveObject(env, req, key, opts) {
   opts = opts || {};
   const rangeHeader = (req && req.headers) ? req.headers.get('Range') : null;
-  const base = { 'Accept-Ranges': 'bytes', 'X-Content-Type-Options': 'nosniff' };
+  const base = { 'Accept-Ranges': 'bytes', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' };
   let obj, status = 200, contentRange = null, contentLength = null;
   if (rangeHeader) {
     let head = null;
@@ -172,7 +183,8 @@ async function counterAdd(env, id, delta) {
   }
   try {
     const cur = await env.STORE.get('counter:' + id, 'json');
-    const v = (typeof cur === 'number' ? cur : 0) + (delta || 0);
+    const base = (typeof cur === 'number' && Number.isFinite(cur)) ? cur : 0;
+    const v = base + (Number(delta) || 0);
     await env.STORE.put('counter:' + id, JSON.stringify(v));
     return v;
   } catch (e) { return null; }
@@ -189,7 +201,11 @@ function turnstileSecret(env) { return (env && env.TURNSTILE_SECRET) || ''; }
 function turnstileSiteKey(env) { return (env && env.TURNSTILE_SITE_KEY) || ''; }
 async function verifyTurnstile(env, token, ip) {
   const secret = turnstileSecret(env);
-  if (!secret) return true;                       // 未配置 → 不做验证
+  if (!secret) {
+    // M2: 配置了 site key（意图启用验证）但缺 secret 时视为配置不完整，拒绝放行
+    if (turnstileSiteKey(env)) return false;
+    return true;                                  // 完全未配置 → 保持跳过（向后兼容）
+  }
   if (!token) return false;
   try {
     const form = new FormData();
@@ -817,7 +833,16 @@ async function adminPasswordSet(env) {
 }
 async function checkAdminPassword(env, pw) {
   const rec = await adminPasswordRec(env);
-  if (rec && rec.hash) return await verifyPassword(pw || '', rec);
+  if (rec && rec.hash) {
+    const ok = await verifyPassword(pw || '', rec);
+    // L1: 兼容历史无盐记录，验证通过后自动迁移为带盐哈希
+    if (ok && !rec.salt) {
+      const salt = randToken().substring(0, 16);
+      const hash = await hashPassword(String(pw || ''), salt);
+      try { await env.STORE.put('meta:adminpass', JSON.stringify({ hash, salt })); } catch (e) {}
+    }
+    return ok;
+  }
   const expected = env.DRIVE_PASSWORD;
   if (!expected) return false;
   return safeEqual(pw || '', expected);
@@ -837,86 +862,6 @@ async function handleAdminPassSet(env, current, next) {
     const keys = await listKV(env, 'session:', 1000);
     for (const k of keys) { try { await env.STORE.delete(k); } catch (e) {} }
   } catch (e) {}
-  return json({ ok: true });
-}
-
-// ===== TOTP 两步验证（RFC 6238，纯 JS，SHA-1 / 6 位 / 30s） =====
-const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-function base32Encode(bytes) {
-  let bits = 0, val = 0, out = '';
-  for (let i = 0; i < bytes.length; i++) {
-    val = (val << 8) | bytes[i]; bits += 8;
-    while (bits >= 5) { out += B32[(val >>> (bits - 5)) & 31]; bits -= 5; }
-  }
-  if (bits > 0) out += B32[(val << (5 - bits)) & 31];
-  return out;
-}
-function base32Decode(s) {
-  const clean = String(s || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
-  let bits = 0, val = 0; const out = [];
-  for (let i = 0; i < clean.length; i++) {
-    const idx = B32.indexOf(clean[i]);
-    if (idx < 0) continue;
-    val = (val << 5) | idx; bits += 5;
-    if (bits >= 8) { out.push((val >>> (bits - 8)) & 0xff); bits -= 8; }
-  }
-  return new Uint8Array(out);
-}
-async function hmacSha1(keyBytes, msgBytes) {
-  const k = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
-  return new Uint8Array(await crypto.subtle.sign('HMAC', k, msgBytes));
-}
-async function totpAt(secretB32, epochSec) {
-  const key = base32Decode(secretB32);
-  if (!key.length) return '';
-  const counter = Math.floor(epochSec / 30);
-  const buf = new ArrayBuffer(8); const dv = new DataView(buf);
-  dv.setUint32(0, Math.floor(counter / 0x100000000)); dv.setUint32(4, counter >>> 0);
-  const mac = await hmacSha1(key, new Uint8Array(buf));
-  const off = mac[mac.length - 1] & 0x0f;
-  const bin = ((mac[off] & 0x7f) << 24) | ((mac[off + 1] & 0xff) << 16) | ((mac[off + 2] & 0xff) << 8) | (mac[off + 3] & 0xff);
-  return String(bin % 1000000).padStart(6, '0');
-}
-async function totpVerify(secretB32, code, skew) {
-  const c = String(code == null ? '' : code).replace(/\D/g, '');
-  if (c.length !== 6 || !secretB32) return false;
-  const now = Math.floor(Date.now() / 1000);
-  const s = (skew == null ? 1 : skew);
-  for (let d = -s; d <= s; d++) { if (await totpAt(secretB32, now + d * 30) === c) return true; }
-  return false;
-}
-async function getTotp(env) {
-  try {
-    const r = await env.STORE.get('meta:totp', 'json');
-    if (r && r.secret && r.enabled) return r;
-  } catch (e) {}
-  return null;
-}
-async function handleTotpState(env) { return json({ enabled: !!(await getTotp(env)) }); }
-async function handleTotpSetup(env, b) {
-  if (await getTotp(env)) return json({ error: 'Already enabled' }, 400);
-  const raw = new Uint8Array(20); crypto.getRandomValues(raw);
-  const secret = base32Encode(raw);
-  await env.STORE.put('meta:totp_pending', JSON.stringify({ secret, t: Date.now() }), { expirationTtl: 900 });
-  const label = encodeURIComponent((b && b.label) || 'BlueDrift');
-  const issuer = encodeURIComponent((b && b.issuer) || 'BlueDrift');
-  return json({ secret, otpauth: 'otpauth://totp/' + label + '?secret=' + secret + '&issuer=' + issuer + '&period=30&digits=6' });
-}
-async function handleTotpEnable(env, code) {
-  let pend = null;
-  try { pend = await env.STORE.get('meta:totp_pending', 'json'); } catch (e) {}
-  if (!pend || !pend.secret) return json({ error: 'No pending setup' }, 400);
-  if (!await totpVerify(pend.secret, code)) return json({ error: 'Wrong code' }, 403);
-  await env.STORE.put('meta:totp', JSON.stringify({ secret: pend.secret, enabled: true, created: Date.now() }));
-  try { await env.STORE.delete('meta:totp_pending'); } catch (e) {}
-  return json({ ok: true });
-}
-async function handleTotpDisable(env, current, code) {
-  const rec = await getTotp(env);
-  if (!rec) return json({ ok: true });
-  if (!await checkAdminPassword(env, current || '')) return json({ error: 'Wrong password' }, 403);
-  if (!await totpVerify(rec.secret, code)) return json({ error: 'Wrong code' }, 403);
-  try { await env.STORE.delete('meta:totp'); } catch (e) {}
   return json({ ok: true });
 }
 
@@ -1025,6 +970,19 @@ async function getLockedPrefixes(env) {
   } catch (e) {}
   return set;
 }
+async function unlockedPrefixes(env, sessionToken) {
+  const locked = await getLockedPrefixes(env);
+  if (!sessionToken) return locked;
+  const out = new Set();
+  for (const lp of locked) {
+    try {
+      const u = await env.STORE.get('unlock:' + sessionToken + ':' + lp, 'json');
+      if (u && Date.now() < u.exp) continue;
+    } catch (e) {}
+    out.add(lp);
+  }
+  return out;
+}
 function insideLocked(p, locked) {
   for (const lp of locked) { if (p !== lp && p.startsWith(lp)) return true; }
   return false;
@@ -1094,6 +1052,14 @@ async function handleLogin(req, env) {
     if (attempts.n >= 5 && Date.now() - attempts.t < 300000) return json({ error: 'Too many attempts, wait 5min' }, 429);
   } catch (e) {}
   const form = await req.formData();
+  // M1: 增加用户名级限频，防定向爆破
+  const loginUser = String(form.get('username') || '');
+  if (loginUser) {
+    try {
+      const ua = JSON.parse(await env.STORE.get('login:u:' + loginUser) || '{"n":0,"t":0}');
+      if (ua.n >= 5 && Date.now() - ua.t < 300000) return json({ error: 'Too many attempts, wait 5min' }, 429);
+    } catch (e) {}
+  }
   const configured = (await adminPasswordSet(env)) || !!env.DRIVE_PASSWORD;
   if (!configured) return json({ error: 'Server not configured' }, 500);
   if (!await checkAdminPassword(env, form.get('password') || '')) {
@@ -1102,23 +1068,16 @@ async function handleLogin(req, env) {
       attempts.n = Date.now() - attempts.t > 300000 ? 1 : attempts.n + 1;
       attempts.t = Date.now();
       await env.STORE.put('login:' + ip, JSON.stringify(attempts), { expirationTtl: 600 });
+      if (loginUser) {
+        const ua = JSON.parse(await env.STORE.get('login:u:' + loginUser) || '{"n":0,"t":0}');
+        ua.n = Date.now() - ua.t > 300000 ? 1 : ua.n + 1;
+        ua.t = Date.now();
+        await env.STORE.put('login:u:' + loginUser, JSON.stringify(ua), { expirationTtl: 600 });
+      }
     } catch (e) {}
     return json({ error: 'Wrong password' }, 401);
   }
-  const totpRec = await getTotp(env);
-  if (totpRec) {
-    const code = String(form.get('code') || '');
-    if (!await totpVerify(totpRec.secret, code)) {
-      try {
-        const at = JSON.parse(await env.STORE.get('login:' + ip) || '{"n":0,"t":0}');
-        at.n = Date.now() - at.t > 300000 ? 1 : at.n + 1;
-        at.t = Date.now();
-        await env.STORE.put('login:' + ip, JSON.stringify(at), { expirationTtl: 600 });
-      } catch (e) {}
-      return json({ error: 'TOTP required', totpRequired: true }, 401);
-    }
-  }
-  await env.STORE.delete('login:' + ip);
+  await env.STORE.delete('login:' + ip); if (loginUser) { try { await env.STORE.delete('login:u:' + loginUser); } catch (e) {} }
   return json({ token: await makeSession(env, req) });
 }
 
@@ -1143,6 +1102,12 @@ async function handleUnlockDir(env, sessionToken, dirPath, password) {
   const pass = await env.STORE.get('dirpass:' + dirPath, 'json');
   if (!pass) return json({ ok: true });
   if (!await verifyPassword(password || '', pass)) return json({ error: 'Wrong password' }, 403);
+  // L1: 目录密码同样支持无盐记录自动迁移
+  if (!pass.salt) {
+    const salt = randToken().substring(0, 16);
+    const hash = await hashPassword(String(password || ''), salt);
+    try { await env.STORE.put('dirpass:' + dirPath, JSON.stringify({ hash, salt })); } catch (e) {}
+  }
   await env.STORE.put('unlock:' + sessionToken + ':' + dirPath, JSON.stringify({ path: dirPath, exp: Date.now() + 3600000 }), { expirationTtl: 3700 });
   return json({ ok: true });
 }
@@ -1161,6 +1126,7 @@ async function handleUpload(req, env, path) {
   const thumb = form.get('thumb');
   const relPath = (form.get('relPath') || '').toString().replace(/^\/+/, '');
   if (!file || typeof file === 'string') return json({ error: 'No file' }, 400);
+  if (file.size > MAX_UPLOAD_SIZE) return json({ error: 'File too large', max: MAX_UPLOAD_SIZE }, 413);
 
   let uploadDir = path;
   if (relPath) {
@@ -1243,6 +1209,8 @@ async function handleThumb(env, req, path) {
 }
 
 async function handleSaveText(env, path, content) {
+  if (typeof content !== 'string') return json({ error: 'Bad content' }, 400);
+  if (content.length > 2 * 1024 * 1024) return json({ error: 'Text too large' }, 413);
   const norm = normPath('/' + String(path || '').replace(/^\/+/, ''));
   const dir = parentOf(norm);
   const name = sanitizeName(norm.split('/').filter(Boolean).pop() || 'untitled');
@@ -1280,6 +1248,9 @@ async function handleDelete(env, path) {
   await removeDirItem(env, dir, name);
 
   if (entry.type === 'dir') {
+    // M4: 删除目录前检查子孙锁定子树，防止绕过锁定
+    const lockedSub = await hasLockedSubtree(env, path + '/');
+    if (lockedSub) return json({ error: 'Locked', path: lockedSub }, 423);
     await recursiveDeleteDir(env, path + '/');
     return json({ ok: true });
   }
@@ -1289,9 +1260,22 @@ async function handleDelete(env, path) {
   trash.push({ name, type: 'file', size: entry.size || 0, mime: entry.mime || '', originalPath: path, deletedAt: new Date().toISOString(), id: randToken().substring(0, 8) });
   await putDir(env, '/.trash/', trash);
   try { await addLog(env, 'del', path, (entry.size || 0) + ' bytes → 回收站'); } catch (e) {}
+  try { await addDailyStat(env, 'del', entry.size || 0); } catch (e) {}
   return json({ ok: true });
 }
 
+// M4: 递归检查目录内是否存在已锁定子目录，返回首个锁定路径（无则 null）
+async function hasLockedSubtree(env, dirPath) {
+  const items = await getDir(env, dirPath);
+  for (const it of items) {
+    if (it.type !== 'dir') continue;
+    const sub = dirPath + it.name + '/';
+    if (await isPathLocked(env, sub, '')) return sub;
+    const deeper = await hasLockedSubtree(env, sub);
+    if (deeper) return deeper;
+  }
+  return null;
+}
 async function recursiveDeleteDir(env, dirPath) {
   const items = await getDir(env, dirPath);
   const BATCH = 10;
@@ -1313,7 +1297,17 @@ async function recursiveDeleteDir(env, dirPath) {
   const dirOps = items.filter(it => it.type === 'dir');
   for (let i = 0; i < dirOps.length; i += BATCH) {
     const batch = dirOps.slice(i, i + BATCH);
-    await Promise.all(batch.map(it => recursiveDeleteDir(env, dirPath + it.name + '/')));
+    await Promise.all(batch.map(async it => {
+      const sub = dirPath + it.name + '/';
+      // R4: 锁定子树跳过删除；目录删除幂等重试（最多 3 次，避免 KV 最终一致残留）
+      if (await hasLockedSubtree(env, sub)) return;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await recursiveDeleteDir(env, sub);
+        const remain = await getDir(env, sub);
+        if (!remain.length) break;
+        await new Promise(res => setTimeout(res, 300 * (attempt + 1)));
+      }
+    }));
   }
   await destroyDir(env, dirPath);
 }
@@ -1323,7 +1317,7 @@ async function handleTrash(env) {
   const now = Date.now();
   const enriched = items.map(it => {
     const dt = it.deletedAt ? new Date(it.deletedAt).getTime() : now;
-    const daysLeft = Math.max(0, 30 - Math.floor((now - dt) / 86400000));
+    const daysLeft = Math.max(0, 30 - Math.floor((now - (Number.isFinite(dt) ? dt : now)) / 86400000));
     return { ...it, daysLeft };
   });
   return json({ items: enriched });
@@ -1336,9 +1330,8 @@ async function handleRestore(env, id) {
   if (idx < 0) return { error: 'Not in trash', status: 404 };
   const entry = trash[idx]; const dir = parentOf(entry.originalPath);
   const existing = await findDirItem(env, dir, entry.name);
-  if (!existing.item) {
-    await upsertDirItem(env, dir, { name: entry.name, type: entry.type, size: entry.size, mime: entry.mime, time: entry.deletedAt });
-  }
+  if (existing.item) return { error: 'Name exists', status: 409 };
+  await upsertDirItem(env, dir, { name: entry.name, type: entry.type, size: entry.size, mime: entry.mime, time: entry.deletedAt });
   trash.splice(idx, 1); await putDir(env, '/.trash/', trash);
   try { await addLog(env, 'res', entry.originalPath, '从回收站恢复'); } catch (e) {}
   return { ok: true };
@@ -1383,7 +1376,9 @@ async function handleBatchPurge(env, ids) {
 
 async function handleMkdir(env, path, name) {
   path = normPath(path);
-  await upsertDirItem(env, path, { name, type: 'dir', time: new Date().toISOString() });
+  const safeName = sanitizeName(name);
+  if (!safeName) return json({ error: 'Bad name' }, 400);
+  await upsertDirItem(env, path, { name: safeName, type: 'dir', time: new Date().toISOString() });
   return json({ ok: true });
 }
 
@@ -1434,7 +1429,7 @@ async function recursiveMoveDir(env, oldPrefix, newPrefix) {
       await recursiveMoveDir(env, oldPrefix + it.name + '/', newPrefix + it.name + '/');
     }
   }
-  if (items && items.length) await putDir(env, newPrefix, items);
+  await putDir(env, newPrefix, items || []);
   await destroyDir(env, oldPrefix);
   try {
     const dp = await env.STORE.get('dirpass:' + oldPrefix, 'json');
@@ -1559,6 +1554,7 @@ async function handleDuplicates(env) {
         if (locked.has(sub)) continue;
         await scanDir(sub);
       }
+      if (Object.keys(hashMap).length >= 2000) return;
     }
   }
   await scanDir('/');
@@ -1573,6 +1569,7 @@ async function addDailyStat(env, kind, bytes) {
     const all = (await env.STORE.get('meta:daily', 'json')) || {};
     const d = all[day] || { up: 0, upBytes: 0, dl: 0, dlBytes: 0 };
     if (kind === 'up') { d.up = (d.up || 0) + 1; d.upBytes = (d.upBytes || 0) + (bytes || 0); }
+    else if (kind === 'del') { /* 只累计，不展示 */ }
     else { d.dl = (d.dl || 0) + 1; d.dlBytes = (d.dlBytes || 0) + (bytes || 0); }
     all[day] = d;
     const keys = Object.keys(all).sort();
@@ -1640,15 +1637,17 @@ async function handleGetTags(env) { return json({ tags: await getAllTags(env) })
 async function handleTagFilter(env, tagName) {
   const locked = await getLockedPrefixes(env);
   const results = [];
+  const seen = new Set();
   async function scanDir(dirPath) {
     const items = await getDir(env, dirPath);
     for (const it of items) {
-      if (it.type === 'file') { const ft = await getFileTags(env, dirPath + it.name); if (ft.find(t => t.name === tagName)) results.push({ ...it, path: dirPath }); }
+      if (it.type === 'file') { const ft = await getFileTags(env, dirPath + it.name); if (ft.find(t => t.name === tagName)) { const k = dirPath + it.name; if (!seen.has(k)) { seen.add(k); results.push({ ...it, path: dirPath }); } } }
       else if (it.type === 'dir') {
         const sub = dirPath + it.name + '/';
         if (locked.has(sub)) continue;
         await scanDir(sub);
       }
+      if (results.length >= 500) return;
     }
   }
   await scanDir('/');
@@ -1680,6 +1679,7 @@ async function handleChunkInit(env, fileName, totalSize, hash, dirPath) {
   const uploadId = randToken().substring(0, 16);
   dirPath = normPath(dirPath);
   const size = parseInt(totalSize, 10) || 0;
+  if (size > MAX_UPLOAD_SIZE) return json({ error: 'File too large', max: MAX_UPLOAD_SIZE }, 413);
   if (size > 0) {
     const u = await getUsage(env);
     if ((u.used || 0) + size > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413);
@@ -1688,11 +1688,12 @@ async function handleChunkInit(env, fileName, totalSize, hash, dirPath) {
   if (isHex64(hash)) {
     try {
       const r = await instantStore(env, hash, fileName, dirPath, size);
-      if (r.hit) return json({ instant: true, name: r.name });
+      if (r.hit) { try { await env.STORE.delete('chunk:' + uploadId); } catch (e) {} return json({ instant: true, name: r.name }); }
     } catch (e) {}
   }
   return json({ uploadId, chunkSize: 5 * 1024 * 1024 });
 }
+// 分片上传：每个分片用独立 KV 键记录已上传状态，避免并发覆盖
 async function handleChunkUpload(req, env, uploadId, chunkIndex) {
   const meta = await env.STORE.get('chunk:' + uploadId, 'json');
   if (!meta) return json({ error: 'Upload not found' }, 404);
@@ -1701,13 +1702,31 @@ async function handleChunkUpload(req, env, uploadId, chunkIndex) {
   const idx = parseInt(chunkIndex, 10);
   if (!Number.isFinite(idx) || idx < 0 || idx > 100000) return json({ error: 'Bad chunk index' }, 400);
   const body = await req.arrayBuffer();
+  if (body.byteLength > 5 * 1024 * 1024) return json({ error: 'Chunk too large' }, 413);
   await env.DRIVE.put('chunks/' + uploadId + '/' + idx, body);
-  meta.chunks = Math.max(meta.chunks || 0, idx + 1);
-  if (!Array.isArray(meta.got)) meta.got = [];
-  if (meta.got.indexOf(idx) < 0) meta.got.push(idx);
-  if (meta.got.length > 20000) meta.got = meta.got.slice(-20000);
-  await env.STORE.put('chunk:' + uploadId, JSON.stringify(meta), { expirationTtl: 86400 });
+  // 每个分片独立 key，避免并发写入互相覆盖
+  try { await env.STORE.put('chunkgot:' + uploadId + ':' + idx, '1', { expirationTtl: 86400 }); } catch (e) {}
+  if ((meta.chunks || 0) <= idx) {
+    meta.chunks = idx + 1;
+    try { await env.STORE.put('chunk:' + uploadId, JSON.stringify(meta), { expirationTtl: 86400 }); } catch (e) {}
+  }
   return json({ ok: true, received: meta.chunks });
+}
+async function listGotChunks(env, uploadId) {
+  const got = [];
+  const prefix = 'chunkgot:' + uploadId + ':';
+  try {
+    let cursor;
+    do {
+      const res = await env.STORE.list({ prefix, cursor, limit: 1000 });
+      for (const k of (res.keys || [])) {
+        const idx = parseInt(k.name.substring(prefix.length), 10);
+        if (Number.isFinite(idx)) got.push(idx);
+      }
+      cursor = res.list_complete ? undefined : res.cursor;
+    } while (cursor);
+  } catch (e) {}
+  return got;
 }
 async function handleChunkComplete(req, env, uploadId) {
   const meta = await env.STORE.get('chunk:' + uploadId, 'json');
@@ -1721,7 +1740,7 @@ async function handleChunkComplete(req, env, uploadId) {
   const total = Math.max(0, parseInt(meta.chunks, 10) || 0);
   if (!total) return json({ error: 'No chunks uploaded' }, 400);
 
-  const oldRes = await findDirItem(env, meta.dirPath, name);
+  const oldRes = await findDirItem(env, outDir, name);
   const oldItem = oldRes.item;
   if (oldItem) await pushVersion(env, key, oldItem);
 
@@ -1748,19 +1767,20 @@ async function handleChunkComplete(req, env, uploadId) {
         done = true;
       } catch (e) {
         try { await multipart.abort(); } catch (e2) {}
+        console.warn('multipart upload failed, fallback to memory assembly:', e && e.message);
       }
-    } catch (e) {}
+    } catch (e) { console.warn('createMultipartUpload failed:', e && e.message); }
   }
 
   if (!done) {
-    // 退化为内存拼装（上限 100MB，避免 Worker OOM）
+    // 退化为内存拼装（上限 50MB，避免 Worker OOM）
     const parts = []; let totalLen = 0;
     for (let i = 0; i < total; i++) {
       const chunk = await env.DRIVE.get('chunks/' + uploadId + '/' + i);
       if (!chunk) return json({ error: 'Missing chunk ' + i }, 400);
       const ab = await chunk.arrayBuffer();
       totalLen += ab.byteLength;
-      if (totalLen > 100 * 1024 * 1024) return json({ error: 'File too large for assembly (max 100MB without multipart)' }, 413);
+      if (totalLen > 50 * 1024 * 1024) return json({ error: 'File too large for assembly (max 50MB without multipart)' }, 413);
       parts.push(new Uint8Array(ab));
     }
     const buf = new Uint8Array(totalLen); let offset = 0;
@@ -1773,6 +1793,15 @@ async function handleChunkComplete(req, env, uploadId) {
   const delPromises = [];
   for (let i = 0; i < total; i++) { delPromises.push(env.DRIVE.delete('chunks/' + uploadId + '/' + i).catch(() => {})); }
   await Promise.all(delPromises);
+  // 清理分片标记键
+  try {
+    let gcursor;
+    do {
+      const res = await env.STORE.list({ prefix: 'chunkgot:' + uploadId + ':', cursor: gcursor, limit: 1000 });
+      for (const k of (res.keys || [])) { try { await env.STORE.delete(k.name); } catch (e) {} }
+      gcursor = res.list_complete ? undefined : res.cursor;
+    } while (gcursor);
+  } catch (e) {}
   await env.STORE.delete('chunk:' + uploadId);
   if (meta.hash) { try { await env.STORE.put('hash:' + meta.hash, JSON.stringify({ key, time: Date.now() })); } catch (e) {} }
 
@@ -1787,22 +1816,23 @@ async function handleChunkComplete(req, env, uploadId) {
 async function handleChunkStatus(env, uploadId) {
   const meta = await env.STORE.get('chunk:' + uploadId, 'json');
   if (!meta) return json({ error: 'Not found' }, 404);
+  const got = await listGotChunks(env, uploadId);
   return json({
     chunks: meta.chunks, total: Math.ceil(meta.totalSize / (5 * 1024 * 1024)),
-    got: Array.isArray(meta.got) ? meta.got : [],
+    got: got,
     fileName: meta.fileName, totalSize: meta.totalSize, dirPath: meta.dirPath
   });
 }
 
-async function handleSearch(env, query, path) {
+async function handleSearch(env, query, path, sessionToken) {
   path = normPath(path);
-  const locked = await getLockedPrefixes(env);
+  const locked = await unlockedPrefixes(env, sessionToken);
   if (insideLocked(path, locked)) return json({ results: [] });
   return json({ results: await searchDir(env, path, query, locked) });
 }
 
-async function handleTree(env) {
-  const locked = await getLockedPrefixes(env);
+async function handleTree(env, sessionToken) {
+  const locked = await unlockedPrefixes(env, sessionToken);
   async function buildNode(dirPath, depth) {
     if (depth > 6) return null;
     const items = await getDir(env, dirPath);
@@ -1829,6 +1859,9 @@ async function createShare(env, filePath, days, maxAccesses, password, isDir) {
   const pwSalt = password ? randToken().substring(0, 16) : '';
   const pwHash = password ? await hashPassword(password, pwSalt) : '';
   const clean = filePath.replace(/\/+$/, '') || '/';
+  // H3: 创建分享前校验目录锁（目录分享查目录本身，文件分享查父目录）
+  const lockPath = isDir ? clean + '/' : parentOf(clean);
+  if (await isPathLocked(env, lockPath, '')) return { ok: false, locked: true, path: lockPath };
   const name = clean.split('/').filter(Boolean).pop() || (isDir ? 'root' : 'file');
   let size = 0, mime = '';
   if (!isDir) {
@@ -1842,7 +1875,9 @@ async function createShare(env, filePath, days, maxAccesses, password, isDir) {
   return { ok: true, url: '/s/' + t, hasPassword: !!pwHash, path: filePath, name };
 }
 async function handleShare(env, filePath, days, maxAccesses, password, isDir) {
-  return json(await createShare(env, filePath, days, maxAccesses, password, !!isDir));
+  const r = await createShare(env, filePath, days, maxAccesses, password, !!isDir);
+  if (r && r.ok === false && r.locked) return json({ error: 'Locked', path: r.path }, 423);
+  return json(r);
 }
 // 目录分享：相对路径解析为绝对 key，且必须落在被分享目录内（防 ../ 逃逸）
 function shareRelKey(data, rel) {
@@ -1857,14 +1892,23 @@ function shareRelKey(data, rel) {
 async function shareGuard(env, shareToken, req, countHit, needPw) {
   const data = await env.STORE.get('share:' + shareToken, 'json');
   if (!data) return { resp: json({ error: 'Not found' }, 404) };
-  if (Date.now() > data.exp) return { resp: json({ error: 'Expired' }, 410) };
+  if (Date.now() > data.exp) {
+    // M7: 过期即清理，消除与 KV expirationTtl 的时间偏差
+    try { await env.STORE.delete('share:' + shareToken); } catch (e) {}
+    return { resp: json({ error: 'Expired' }, 410) };
+  }
+  // H3: 分享访问同样校验目录锁（目录分享看目录本身，文件分享看父目录）
+  const shareLockPath = (data.type === 'dir') ? (normPath(data.path) + '/') : parentOf(normPath(data.path));
+  if (await isPathLocked(env, shareLockPath, '')) return { resp: json({ error: 'Locked' }, 423) };
   if (countHit) {
+    const before = data.hits || 0;
+    if (data.max > 0 && before >= data.max) return { resp: json({ error: 'Access limit reached', hits: data.max, max: data.max, name: data.name }, 403) };
     const atom = await counterAdd(env, 'share:' + shareToken, 1);
-    const hits = (atom == null) ? ((data.hits || 0) + 1) : atom;
+    const hits = (atom == null) ? (before + 1) : atom;
     data.hits = hits;
     try { await env.STORE.put('share:' + shareToken, JSON.stringify(data), { expirationTtl: Math.max(60, Math.ceil((data.exp - Date.now()) / 1000) + 60) }); } catch (e) {}
     if (data.max > 0 && hits > data.max) return { resp: json({ error: 'Access limit reached', hits: data.max, max: data.max, name: data.name }, 403) };
-  } else if (data.max > 0 && (data.hits || 0) > data.max) {
+  } else if (data.max > 0 && (data.hits || 0) >= data.max) {
     return { resp: json({ error: 'Access limit reached' }, 403) };
   }
   if (needPw && data.pwHash) {
@@ -1873,17 +1917,22 @@ async function shareGuard(env, shareToken, req, countHit, needPw) {
   }
   return { data };
 }
+// 分享 /data：密码未通过前不返回真实元数据（仅返回 needPassword + hits/max）
 async function handleShareData(env, shareToken, req) {
   try {
-    const g = await shareGuard(env, shareToken, req, true, false);
+    const pw = new URL(req.url).searchParams.get('pw') || '';
+    const hasPw = pw !== '';
+    // 未带 pw 视为"首次打开"，计一次访问；带 pw 视为"验证尝试"，不重复计数
+    const g = await shareGuard(env, shareToken, req, !hasPw, false);
     if (g.resp) return g.resp;
     const d = g.data;
-    return json({
-      type: d.type || 'file', name: d.name, size: d.size || 0, mime: d.mime || '',
-      hasPassword: !!d.pwHash,
-      hits: d.max > 0 ? Math.min(d.hits || 0, d.max) : (d.hits || 0),
-      max: d.max || 0
-    });
+    const stats = { hits: d.max > 0 ? Math.min(d.hits || 0, d.max) : (d.hits || 0), max: d.max || 0 };
+    if (d.pwHash && !await verifyPassword(pw, { hash: d.pwHash, salt: d.pwSalt })) {
+      return json(Object.assign({ needPassword: true, hasPassword: true }, stats));
+    }
+    return json(Object.assign({
+      type: d.type || 'file', name: d.name, size: d.size || 0, mime: d.mime || ''
+    }, stats));
   } catch (e) { return json({ error: 'Invalid' }, 400); }
 }
 async function handleShareList(env, shareToken, req) {
@@ -1922,7 +1971,7 @@ async function handleShareDownload(env, shareToken, req) {
     const name = key.split('/').pop();
     const resp = await serveObject(env, req, key, { disposition: 'attachment; filename="' + encodeURIComponent(name) + '"' });
     if (resp.status === 200) {
-      await addDownloadLog(env, Object.assign({ time: new Date().toISOString(), path: '/' + key, name, size: 0, source: 'share' }, clientInfo(req)));
+      await addDownloadLog(env, Object.assign({ time: new Date().toISOString(), path: '/' + key, name, size: g.data.size || 0, source: 'share' }, clientInfo(req)));
     }
     return resp;
   } catch (e) { return json({ error: 'Invalid' }, 400); }
@@ -1934,7 +1983,7 @@ async function handleBatchShare(env, paths, days, maxAccesses, password, session
     try {
       const fp = '/' + String(p || '').replace(/^\/+/, '');
       if (fp === '/') { failed++; continue; }
-      if (await isPathLocked(env, parentOf(fp), sessionToken || '')) { items.push({ path: fp, error: 'locked' }); failed++; continue; }
+      if (await isPathLocked(env, fp, sessionToken || '') || await isPathLocked(env, parentOf(fp), sessionToken || '')) { items.push({ path: fp, error: 'locked' }); failed++; continue; }
       const r = await createShare(env, fp, days, maxAccesses, password);
       items.push({ path: fp, name: r.name, url: r.url });
       created++;
@@ -1955,8 +2004,6 @@ async function handleBatchMove(env, paths, target) {
   }
   return json({ ok: true, moved: ok, failed });
 }
-
-
 
 function sharePage(token) {
   const title = '文件分享';
@@ -2000,7 +2047,7 @@ button:hover{background:var(--accent-h);border-color:var(--accent-h)}
 var tk=${JSON.stringify(token)};
 var pw='';
 var fname='',fmime='',fsize=0;
-function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function esc(s){return String(s==null?'':s).replace(/[&<>"'\`]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','\`':'&#96;'}[c]})}
 function fmt(b){if(!b||b===0)return'0 B';var u=['B','KB','MB','GB'];var i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(1)+' '+u[i]}
 function setMsg(s,isErr){var m=document.getElementById('msg');m.textContent=s||'';m.className='msg'+(isErr?' err':'')}
 function iconFor(m){m=String(m||'').toLowerCase();if(m.indexOf('image/')===0)return'🖼️';if(m.indexOf('video/')===0)return'🎬';if(m.indexOf('audio/')===0)return'🎵';if(m.indexOf('pdf')>=0)return'📄';if(m.indexOf('zip')>=0||m.indexOf('compress')>=0)return'📦';if(m.indexOf('text/')===0||m.indexOf('json')>=0)return'📝';if(m.indexOf('word')>=0||m.indexOf('document')>=0)return'📃';if(m.indexOf('sheet')>=0||m.indexOf('excel')>=0)return'📊';return'📄'}
@@ -2018,16 +2065,18 @@ function loadData(){
       return;
     }
     if(d.error){setMsg(d.error,true);document.getElementById('meta').textContent='—';return}
+    if(d.needPassword){
+      document.getElementById('meta').textContent=(d.max>0?('已访问 '+d.hits+'/'+d.max):'');
+      document.getElementById('pwRow').classList.remove('hidden');
+      return;
+    }
     fname=d.name||'';fmime=d.mime||'';fsize=d.size||0;
     document.getElementById('fname').textContent=fname;
     document.getElementById('ficon').textContent=iconFor(fmime);
     document.getElementById('meta').textContent=fmt(fsize)+' · '+(d.max>0?('已访问 '+d.hits+'/'+d.max):'');
-    if(d.hasPassword){
-      document.getElementById('pwRow').classList.remove('hidden');
-    }else{
-      document.getElementById('dlRow').classList.remove('hidden');
-      tryPreview();
-    }
+    document.getElementById('pwRow').classList.add('hidden');
+    document.getElementById('dlRow').classList.remove('hidden');
+    tryPreview();
   }).catch(function(){setMsg('加载失败',true)});
 }
 function tryPreview(){
@@ -2051,13 +2100,21 @@ function tryPreview(){
 document.getElementById('btnPw').onclick=function(){
   pw=document.getElementById('pwInput').value;
   setMsg('');
-  fetch('/s/'+tk+'/pv?pw='+encodeURIComponent(pw)).then(function(r){
-    if(r.status===403){setMsg('密码错误或访问次数已达上限',true);return}
-    if(r.status===410){setMsg('链接已过期',true);return}
+  fetch('/s/'+tk+'/data?pw='+encodeURIComponent(pw),{cache:'no-store'}).then(function(r){
+    return r.json().then(function(d){return{r:r,d:d}});
+  }).then(function(res){
+    var d=res.d;
+    if(res.r.status===403 || d.error==='Access limit reached'){setMsg('访问次数已达上限，链接已失效',true);return}
+    if(res.r.status===410){setMsg('链接已过期',true);return}
+    if(d.needPassword){setMsg('密码错误',true);return}
+    fname=d.name||'';fmime=d.mime||'';fsize=d.size||0;
+    document.getElementById('fname').textContent=fname;
+    document.getElementById('ficon').textContent=iconFor(fmime);
+    document.getElementById('meta').textContent=fmt(fsize)+' · '+(d.max>0?('已访问 '+d.hits+'/'+d.max):'');
     document.getElementById('pwRow').classList.add('hidden');
     document.getElementById('dlRow').classList.remove('hidden');
     tryPreview();
-  });
+  }).catch(function(){setMsg('密码错误或加载失败',true)});
 };
 document.getElementById('pwInput').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnPw').click()};
 document.getElementById('btnDl').onclick=function(){
@@ -2114,7 +2171,7 @@ button.btn:hover{background:var(--accent-h);border-color:var(--accent-h)}
 </div>
 <script>
 var tk=${tk},pw='',rel='';
-function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function esc(s){return String(s==null?'':s).replace(/[&<>"'\`]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','\`':'&#96;'}[c]})}
 function fmt(b){if(!b||b===0)return'0 B';var u=['B','KB','MB','GB'];var i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(1)+' '+u[i]}
 function setMsg(s,isErr){var m=document.getElementById('msg');m.textContent=s||'';m.className='msg'+(isErr?' err':'')}
 function iconFor(n,m){m=String(m||'').toLowerCase();n=String(n||'').toLowerCase();if(m.indexOf('image/')===0)return'🖼️';if(m.indexOf('video/')===0)return'🎬';if(m.indexOf('audio/')===0)return'🎵';if(n.endsWith('.zip'))return'📦';if(m.indexOf('pdf')>=0)return'📄';if(m.indexOf('sheet')>=0||n.endsWith('.xlsx')||n.endsWith('.xls'))return'📊';if(n.endsWith('.docx')||n.endsWith('.doc'))return'📃';if(m.indexOf('text/')===0||m.indexOf('json')>=0||n.endsWith('.md'))return'📝';return'📄'}
@@ -2123,10 +2180,16 @@ function load(){
     var d=res.d;
     if(res.r.status===403){setMsg(d.error==='Access limit reached'?'访问次数已达上限，链接已失效':(d.error||''),true);document.getElementById('fname').textContent=d.name||'';document.getElementById('meta').textContent='—';return}
     if(d.error){setMsg(d.error,true);document.getElementById('meta').textContent='—';return}
+    if(d.needPassword){
+      document.getElementById('meta').textContent=(d.max>0?('已访问 '+d.hits+'/'+d.max):'');
+      document.getElementById('pwRow').classList.remove('hidden');
+      return;
+    }
     document.getElementById('fname').textContent=d.name||'—';
     document.getElementById('meta').textContent=(d.max>0?('已访问 '+d.hits+'/'+d.max):'');
-    if(d.hasPassword){document.getElementById('pwRow').classList.remove('hidden');}
-    else{document.getElementById('box').classList.remove('hidden');render();}
+    document.getElementById('pwRow').classList.add('hidden');
+    document.getElementById('box').classList.remove('hidden');
+    render();
   }).catch(function(){setMsg('加载失败',true)});
 }
 function go(r){rel=r;render()}
@@ -2159,12 +2222,18 @@ function render(){
 }
 document.getElementById('btnPw').onclick=function(){
   pw=document.getElementById('pwInput').value;setMsg('');
-  fetch('/s/'+tk+'/list?p=&pw='+encodeURIComponent(pw)).then(function(r){
-    if(!r.ok){setMsg('密码错误或访问次数已达上限',true);return}
+  fetch('/s/'+tk+'/data?pw='+encodeURIComponent(pw),{cache:'no-store'}).then(function(r){
+    return r.json().then(function(d){return{r:r,d:d}});
+  }).then(function(res){
+    var d=res.d;
+    if(res.r.status===403){setMsg('访问次数已达上限，链接已失效',true);return}
+    if(d.needPassword){setMsg('密码错误',true);return}
+    document.getElementById('fname').textContent=d.name||'—';
+    document.getElementById('meta').textContent=(d.max>0?('已访问 '+d.hits+'/'+d.max):'');
     document.getElementById('pwRow').classList.add('hidden');
     document.getElementById('box').classList.remove('hidden');
     render();
-  });
+  }).catch(function(){setMsg('密码错误或加载失败',true)});
 };
 document.getElementById('pwInput').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnPw').click()};
 load();
@@ -2358,7 +2427,8 @@ async function handleBackupRestore(env, key, password) {
   }
   if (snap.kv && typeof snap.kv === 'object') {
     for (const k of Object.keys(snap.kv)) {
-      if (k.indexOf('meta:adminpass') === 0 || k.indexOf('meta:totp') === 0 || k.indexOf('session:') === 0) continue;
+      // 敏感密钥：不随快照回滚
+      if (k.indexOf('meta:adminpass') === 0 || k.indexOf('meta:totp') === 0 || k.indexOf('session:') === 0 || k.indexOf('meta:tokens') === 0) continue;
       try { await env.STORE.put(k, snap.kv[k]); kvN++; } catch (e) {}
     }
   }
@@ -2372,7 +2442,7 @@ async function handleHealth(env) {
   async function run(name, fn) {
     const t0 = Date.now();
     try { const info = await fn(); checks.push({ name, ok: true, ms: Date.now() - t0, info: info || '' }); }
-    catch (e) { checks.push({ name, ok: false, ms: Date.now() - t0, error: (e && e.message) || 'error' }); }
+    catch (e) { checks.push({ name, ok: false, ms: Date.now() - t0, error: 'check failed' }); }
   }
   await run('R2 主存储', async () => { const l = await env.DRIVE.list({ prefix: '', limit: 1 }); return 'objects=' + ((l.objects || []).length); });
   await run('KV 命名空间', async () => { await env.STORE.get('meta:usage'); return 'ok'; });
@@ -2388,17 +2458,18 @@ async function handleHealth(env) {
 
 // ===== 孤儿文件扫描 =====
 async function listAllKeys(env, cap) {
-  const keys = []; const sizes = {};
+  const keys = []; const sizes = {}; const ages = {};
   let cursor;
   do {
     const r = await env.DRIVE.list({ prefix: '', limit: 1000, cursor });
     for (const o of (r.objects || [])) {
       keys.push(o.key); sizes[o.key] = o.size || 0;
-      if (keys.length >= cap) return { keys, sizes, capped: true };
+      if (o.uploaded) ages[o.key] = o.uploaded;
+      if (keys.length >= cap) return { keys, sizes, ages, capped: true };
     }
     cursor = r.truncated ? r.cursor : undefined;
   } while (cursor);
-  return { keys, sizes, capped: false };
+  return { keys, sizes, ages, capped: false };
 }
 async function scanOrphans(env) {
   const dirs = await collectDirs(env);
@@ -2424,6 +2495,9 @@ async function scanOrphans(env) {
       const base = rest.substring(0, rest.lastIndexOf('/'));
       if (!base || !referenced.has(base)) orphanInternal.push({ key: k, size: listed.sizes[k] || 0, base });
     } else if (k.indexOf('chunks/') === 0) {
+      // M5: chunks/ 由上传会话管理，24 小时内视为活跃，不归孤儿
+      const upAt = listed.ages[k] ? new Date(listed.ages[k]).getTime() : 0;
+      if (upAt && Date.now() - upAt < 24 * 3600 * 1000) continue;
       orphanInternal.push({ key: k, size: listed.sizes[k] || 0, base: '' });
     } else {
       orphanFiles.push({ key: k, size: listed.sizes[k] || 0 });
@@ -2440,6 +2514,8 @@ async function scanOrphans(env) {
 async function handleScanOrphans(env) { return json(await scanOrphans(env)); }
 async function handlePurgeOrphans(env, mode) {
   const data = await scanOrphans(env);
+  // R3: 扫描被截断（对象数超过 2 万上限）时拒绝清理，防止误删
+  if (data.capped) return json({ error: 'Scan incomplete, purge refused', capped: true }, 409);
   let deleted = 0, removed = 0;
   if (mode === 'objects' || mode === 'all') {
     for (const o of (data.orphans || [])) { try { await deleteAndMirror(env, o.key); deleted++; } catch (e) {} }
@@ -2467,7 +2543,7 @@ async function handleSetWebhook(env, b) {
     try {
       const u = new URL(url);
       if (u.protocol !== 'http:' && u.protocol !== 'https:') return json({ error: 'Only http(s)' }, 400);
-      if (isBlockedHost(u.hostname)) return json({ error: 'Blocked host' }, 403);
+      if (await resolveAndCheckHost(u.hostname)) return json({ error: 'Blocked host' }, 403);
     } catch (e) { return json({ error: 'Bad url' }, 400); }
   }
   const w = {
@@ -2486,6 +2562,8 @@ async function notifyWebhook(env, payload) {
     const body = JSON.stringify(Object.assign({ version: APP_VERSION, at: new Date().toISOString() }, payload));
     const headers = { 'Content-Type': 'application/json', 'User-Agent': 'BlueDrift/' + APP_VERSION };
     if (w.secret) headers['X-Signature'] = 'sha256=' + await sha256HexBytes(new TextEncoder().encode(w.secret + ':' + body));
+    // L4: 发送前二次校验目标 host，防 SSRF
+    try { const tu = new URL(w.url); if (await resolveAndCheckHost(tu.hostname)) return; } catch (e) { return; }
     await fetch(w.url, { method: 'POST', headers, body, signal: AbortSignal.timeout(3000) });
   } catch (e) {}
 }
@@ -2548,7 +2626,7 @@ async function handleAlbumRaw(env, req, id) {
   const k = String(new URL(req.url).searchParams.get('k') || '');
   const base = a.path.replace(/^\/+/, '');
   if (!k || k.indexOf(base) !== 0 || k.indexOf('..') >= 0) return json({ error: 'Forbidden' }, 403);
-  return await serveObject(env, req, k, { disposition: 'inline', cacheControl: 'public, max-age=3600' });
+  return await serveObject(env, req, k, { disposition: 'inline', sanitize: true, cacheControl: 'public, max-age=3600' });
 }
 
 // ===== 公开相册页 =====
@@ -2582,7 +2660,7 @@ h1{font-size:20px;font-weight:700;letter-spacing:-.02em}
 <div class="lb" id="lb"><span class="x" id="lbx">✕</span><div id="lbbody" style="max-width:100%;max-height:100%;display:flex;align-items:center;justify-content:center"></div></div>
 <script>
 var ID=${aid};
-function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function esc(s){return String(s==null?'':s).replace(/[&<>"'\`]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','\`':'&#96;'}[c]})}
 function closeLb(){document.getElementById('lb').classList.remove('show');document.getElementById('lbbody').innerHTML=''}
 fetch('/album/'+ID+'/list',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
   if(d.error){document.getElementById('msg').style.display='block';document.getElementById('msg').textContent=d.error;return}
@@ -2676,7 +2754,9 @@ async function handleUploadViaLink(req, env, linkToken) {
     else { await addUsage(env, file.size, 1); }
     await addLog(env, 'up', dirPath + safeName, file.size + ' bytes (link)');
 
-    data.count = (data.count || 0) + 1;
+    // M6: 上传计数改为原子累加，避免并发上传覆盖计数
+    const cnt = await counterAdd(env, 'ulink:' + linkToken, 1);
+    data.count = (cnt != null && Number.isFinite(cnt)) ? cnt : (data.count || 0) + 1;
     await env.STORE.put('ulink:' + linkToken, JSON.stringify(data), { expirationTtl: Math.max(60, Math.ceil((data.exp - Date.now()) / 1000) + 60) });
     return json({ ok: true });
   } catch (e) { return json({ error: 'Failed' }, 500); }
@@ -2725,6 +2805,7 @@ async function handleListShares(env) {
     try {
       const d = await env.STORE.get(k, 'json');
       if (!d) continue;
+      if (d.exp && Date.now() > d.exp) { try { await env.STORE.delete(k); } catch (e) {} continue; }
       shares.push({ token: k.substring(6), name: d.name || '', path: d.path || '', size: d.size || 0, hits: d.hits || 0, max: d.max || 0, exp: d.exp || 0, hasPassword: !!d.pwHash, mime: d.mime || '' });
     } catch (e) {}
   }
@@ -2744,6 +2825,7 @@ async function handleListUploadLinks(env) {
     try {
       const d = await env.STORE.get(k, 'json');
       if (!d) continue;
+      if (d.exp && Date.now() > d.exp) { try { await env.STORE.delete(k); } catch (e) {} continue; }
       links.push({ token: k.substring(6), path: d.path || '', exp: d.exp || 0, max: d.max || 0, count: d.count || 0 });
     } catch (e) {}
   }
@@ -2833,9 +2915,10 @@ function buildZip(files) {
   result.set(end, pos);
   return result.buffer;
 }
-async function handleZip(env, dirPath) {
+async function handleZip(env, dirPath, sessionToken) {
   dirPath = normPath(dirPath);
   const prefix = dirPath.replace(/^\//, '');
+  const locked = await unlockedPrefixes(env, sessionToken || '');
   const files = [];
   let totalBytes = 0;
   let cursor;
@@ -2844,10 +2927,12 @@ async function handleZip(env, dirPath) {
   let hitLimit = false;
   const pending = [];
   do {
-    const listed = await env.DRIVE.list({ prefix: prefix, limit: 500 });
+    const listed = await env.DRIVE.list({ prefix: prefix, limit: 500, cursor });
     for (const obj of listed.objects) {
       const rel = obj.key.slice(prefix.length);
       if (!rel || rel.startsWith('chunks/') || rel.startsWith('.trash/') || rel.startsWith(THUMB_PREFIX) || rel.startsWith(VERSIONS_PREFIX)) continue;
+      // 过滤掉被密码保护的子目录内容
+      if (insideLocked('/' + obj.key, locked)) continue;
       if (files.length + pending.length >= MAX_FILES || totalBytes >= MAX_BYTES) { hitLimit = true; break; }
       totalBytes += obj.size;
       pending.push(env.DRIVE.get(obj.key).then(o => o ? o.arrayBuffer().then(buf => ({ name: rel, data: buf })) : null));
@@ -2900,6 +2985,7 @@ function isBlockedHost(hostname) {
   if (!h) return true;
   if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.home.arpa')) return true;
   if (h === '::1' || h === '0:0:0:0:0:0:0:1') return true;
+  if (/^(fc|fd|fe[89a-f])/.test(h)) return true;
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
   if (m) {
     const a = +m[1], b = +m[2];
@@ -2912,6 +2998,23 @@ function isBlockedHost(hostname) {
   }
   return false;
 }
+async function resolveAndCheckHost(hostname) {
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '').split(':')[0];
+  if (!h) return true;
+  if (isBlockedHost(h)) return true;
+  if (/^[\d.]+$/.test(h) || h.indexOf(':') >= 0) return isBlockedHost(h);
+  try {
+    const dns = await fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(h) + '&type=A', { headers: { 'accept': 'application/dns-json' } });
+    if (!dns.ok) return false;
+    const dj = await dns.json();
+    const answers = (dj && dj.Answer) || [];
+    for (const a of answers) {
+      if (a && a.type === 1 && isBlockedHost(String(a.data))) return true;
+    }
+  } catch (e) {}
+  return false;
+}
+// 手动跟随重定向，逐跳校验主机（防 SSRF）
 async function handleFetchUrl(req, env, b) {
   if (env && env.DISABLE_URL_FETCH === '1') return json({ error: 'URL fetch disabled' }, 403);
   const raw = String((b && b.url) || '').trim();
@@ -2919,26 +3022,64 @@ async function handleFetchUrl(req, env, b) {
   let u;
   try { u = new URL(raw); } catch (e) { return json({ error: 'Bad url' }, 400); }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return json({ error: 'Only http(s)' }, 400);
-  if (isBlockedHost(u.hostname)) return json({ error: 'Blocked host' }, 403);
+  if (await resolveAndCheckHost(u.hostname)) return json({ error: 'Blocked host' }, 403);
   const dir = normPath((b && b.dir) || '/');
   if (await isPathLocked(env, dir, '')) return json({ locked: true, path: dir }, 423);
   const maxBytes = (Number(env && env.FETCH_MAX_BYTES) > 0) ? Number(env.FETCH_MAX_BYTES) : 200 * 1024 * 1024;
-  let resp;
-  try { resp = await fetch(u.toString(), { redirect: 'follow', headers: { 'User-Agent': 'BlueDrift/1.0' } }); }
-  catch (e) { return json({ error: 'Fetch failed' }, 502); }
+  const MAX_REDIRECTS = 5;
+  let current = u.toString();
+  let resp = null;
+  try {
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      resp = await fetch(current, { redirect: 'manual', headers: { 'User-Agent': 'BlueDrift/1.0' }, signal: AbortSignal.timeout(10000) });
+      if (resp.status >= 300 && resp.status < 400) {
+        const loc = resp.headers.get('location');
+        if (!loc) break;
+        let next;
+        try { next = new URL(loc, current); } catch (e) { return json({ error: 'Bad redirect' }, 502); }
+        if (next.protocol !== 'http:' && next.protocol !== 'https:') return json({ error: 'Blocked redirect' }, 403);
+        if (await resolveAndCheckHost(next.hostname)) return json({ error: 'Blocked host' }, 403);
+        current = next.toString();
+        continue;
+      }
+      break;
+    }
+  } catch (e) { return json({ error: 'Fetch failed' }, 502); }
+  if (!resp) return json({ error: 'Fetch failed' }, 502);
+  if (resp.status >= 300 && resp.status < 400) return json({ error: 'Too many redirects' }, 502);
   if (!resp.ok) return json({ error: 'Remote HTTP ' + resp.status }, 502);
   const len = Number(resp.headers.get('content-length') || 0);
   if (len && len > maxBytes) return json({ error: 'Remote file too large' }, 413);
   if (len) { const uu = await getUsage(env); if ((uu.used || 0) + len > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413); }
-  const baseName = (b && b.name) ? sanitizeName(b.name) : sanitizeName(decodeURIComponent((u.pathname.split('/').pop() || 'download')));
-  const name = await uniqueFileName(env, dir, baseName || 'download');
+  let baseName;
+  try { baseName = sanitizeName(decodeURIComponent((new URL(current).pathname.split('/').pop() || 'download'))); } catch (e) { baseName = sanitizeName('download'); }
+  const wantName = (b && b.name) ? sanitizeName(b.name) : baseName;
+  const name = await uniqueFileName(env, dir, wantName || 'download');
   const ctype = resp.headers.get('content-type') || 'application/octet-stream';
   const outDir = await applyAutoArchive(env, dir, name, ctype);
   const key = outDir.replace(/^\//, '') + name;
+  if (!len) {
+    // H2: 无 Content-Length（chunked）时先用 HEAD 探测体积，仍未知则写后回滚
+    try {
+      const probe = await fetch(current, { method: 'HEAD', redirect: 'manual', signal: AbortSignal.timeout(8000) });
+      const hlen = Number((probe && probe.headers.get('content-length')) || 0);
+      if (hlen > maxBytes) return json({ error: 'Remote file too large' }, 413);
+      if (hlen) { const uu = await getUsage(env); if ((uu.used || 0) + hlen > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413); }
+    } catch (e) {}
+  }
   try { await putAndMirror(env, key, resp.body, { httpMetadata: { contentType: ctype } }); }
   catch (e) { return json({ error: 'Save failed' }, 500); }
   let size = len;
   if (!size) { try { const h = await env.DRIVE.head(key); size = h ? h.size : 0; } catch (e) {} }
+  if (size > maxBytes) {
+    try { await deleteAndMirror(env, key); } catch (e) {}
+    return json({ error: 'Remote file too large' }, 413);
+  }
+  const uu2 = await getUsage(env);
+  if ((uu2.used || 0) + size > quotaTotal(env)) {
+    try { await deleteAndMirror(env, key); } catch (e) {}
+    return json({ error: 'Quota exceeded' }, 413);
+  }
   await upsertDirItem(env, outDir, { name, type: 'file', size, mime: ctype, time: new Date().toISOString(), hash: '', hasThumb: false });
   await addUsage(env, size, 1);
   await addLog(env, 'up', outDir + name, size + ' bytes (url)');
@@ -2957,7 +3098,7 @@ async function uniqueFileName(env, dir, name) {
   const ext = i > 0 ? base.substring(i) : '';
   return sanitizeName(stem + '-' + Date.now().toString(36) + ext);
 }
-// 命中已有内容则直接在目标目录“落一份”，不再上传
+// 命中已有内容则直接在目标目录"落一份"，不再上传
 async function instantStore(env, hash, name, dir, size) {
   let idx = null;
   try { idx = await env.STORE.get('hash:' + hash, 'json'); } catch (e) {}
@@ -3862,7 +4003,6 @@ input,select,textarea,.tag-chip,.file-list input[type=checkbox],.gitem input[typ
 <div class="login-sub">安全 · 私密 · 快速</div>
 <div class="login-card">
 <div class="row"><input id="pw" type="password" placeholder="输入访问密码" style="flex:1" autocomplete="current-password"><button id="btnLogin" class="btn">登录</button></div>
-<div class="row hidden" id="otpRow"><input id="otpCode" inputmode="numeric" maxlength="6" placeholder="6 位动态验证码" autocomplete="one-time-code" style="flex:1"></div>
 <div class="login-err" id="loginErr">密码错误，请重试</div>
 </div>
 <div class="ver login-ver">${APP_VERSION}</div>
@@ -3928,7 +4068,6 @@ input,select,textarea,.tag-chip,.file-list input[type=checkbox],.gitem input[typ
         <button id="btnAdminPass" class="chip">🔐 改密码</button>
         <button id="btnClearPend" class="chip">🧹 清除断点记录</button>
         <button id="btnSessions" class="chip">🖥 登录设备</button>
-        <button id="btnTotp" class="chip">🔐 两步验证</button>
         <button id="btnBackup" class="chip">💾 备份与恢复</button>
         <button id="btnHealth" class="chip">🩺 健康检查</button>
         <button id="btnOrphans" class="chip">🧹 孤儿扫描</button>
@@ -3973,7 +4112,6 @@ input,select,textarea,.tag-chip,.file-list input[type=checkbox],.gitem input[typ
 <div class="modal-bg" id="apModal"><div class="modal" style="min-width:360px;max-width:460px"><button class="mclose" id="apClose">✕</button><h3>修改管理员密码</h3><div id="apContent"></div></div></div>
 <div class="modal-bg" id="autoModal"><div class="modal" style="min-width:360px;max-width:460px"><button class="mclose" id="autoClose">✕</button><h3>上传后自动归档</h3><div id="autoContent"></div></div></div>
 <div class="modal-bg" id="sessModal"><div class="modal" style="min-width:380px;max-width:560px"><button class="mclose" id="sessClose">✕</button><h3>登录设备</h3><div id="sessContent"></div></div></div>
-<div class="modal-bg" id="totpModal"><div class="modal" style="min-width:360px;max-width:470px"><button class="mclose" id="totpClose">✕</button><h3>两步验证</h3><div id="totpContent"></div></div></div>
 <div class="modal-bg" id="bkModal"><div class="modal" style="min-width:400px;max-width:600px"><button class="mclose" id="bkClose">✕</button><h3>备份与恢复</h3><div id="bkContent"></div></div></div>
 <div class="modal-bg" id="hlModal"><div class="modal" style="min-width:380px;max-width:560px"><button class="mclose" id="hlClose">✕</button><h3>健康检查</h3><div id="hlContent"></div></div></div>
 <div class="modal-bg" id="orModal"><div class="modal" style="min-width:420px;max-width:640px"><button class="mclose" id="orClose">✕</button><h3>孤儿文件扫描</h3><div id="orContent"></div></div></div>
@@ -3999,7 +4137,7 @@ function isText(it){var m=it.mime||'';return m.indexOf('text/')===0||m==='applic
 function isZip(name){return(name||'').toLowerCase().endsWith('.zip')}
 function normP(p){if(!p||p==='/')return'/';p='/'+p.replace(/^\\/+/, '').replace(/\\/+$/,'')+'/';while(p.indexOf('//')>=0)p=p.replace('//','/');return p}
 function isPreviewable(it){return it.type==='file'&&((it.mime||'').indexOf('image/')===0||(it.mime||'').indexOf('video/')===0||(it.mime||'').indexOf('audio/')===0||isText(it)||isPDF(it.name))}
-function api(p,o){o=o||{};var s=p.indexOf('?')>=0?'&':'?';return fetch(p+s+'token='+tk,o).then(function(r){if(r.status===401){show('login');throw 0}return r.json()})}
+function api(p,o){o=o||{};o.headers=o.headers||{};if(tk)o.headers['Authorization']='Bearer '+tk;return fetch(p,o).then(function(r){if(r.status===401){show('login');throw 0}return r.json()})}
 
 var themePref=localStorage.getItem('dth')||'auto';
 function applyTheme(){
@@ -4055,7 +4193,7 @@ function matchFilter(it){
 function render(){
   selected={};updateBatch();
   var parts=cur.split('/').filter(Boolean);var h='<a data-p="/">'+t('home')+'</a>';var acc='/';
-  parts.forEach(function(p){acc+=p+'/';h+=' <span style="opacity:.4">/</span> <a data-p="'+acc+'">'+esc(p)+'</a>'});
+  parts.forEach(function(p){acc+=p+'/';h+=' <span style="opacity:.4">/</span> <a data-p="'+esc(acc)+'">'+esc(p)+'</a>'});
   var bcEl=document.getElementById('bcPath');bcEl.innerHTML=h;
   bcEl.querySelectorAll('a').forEach(function(a){a.onclick=function(){cur=a.getAttribute('data-p');searchMode=false;favMode=false;recentMode=false;load()}});
   document.getElementById('btnView').textContent=viewMode==='list'?(lang==='zh'?'网格':'Grid'):(viewMode==='grid'?(lang==='zh'?'图库':'Gallery'):(lang==='zh'?'列表':'List'));
@@ -4106,15 +4244,15 @@ function render(){
   promise.then(function(d){
     clearTimeout(skTimer);
     if(d&&d.locked){
-      document.getElementById('fileList').innerHTML='<p class="empty">🔒 '+t('locked')+'</p>';
-      var pw=prompt(t('enterPw'));
-      if(pw===null||pw==='')return;
-      api('/api/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:d.path,password:pw})}).then(function(r){
-        if(r&&r.ok){load()}else{alert(t('wrongPw'))}
-      });
+      document.getElementById('fileList').innerHTML='<div class="lock-panel"><p class="empty">🔒 '+t('locked')+'</p><form id="lockForm" class="lock-form"><input type="password" id="lockPw" placeholder="'+t('enterPw')+'" autocomplete="off" /><button type="submit" class="btn">'+(lang==='zh'?'解锁':'Unlock')+'</button></form></div>';
+      var lf=document.getElementById('lockForm');
+      if(lf)lf.onsubmit=function(ev){ev.preventDefault();var pw=document.getElementById('lockPw').value;if(!pw)return;api('/api/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:d.path,password:pw})}).then(function(r){if(r&&r.ok){load()}else{alert(t('wrongPw'))}});};
+      var lpw=document.getElementById('lockPw');if(lpw)lpw.focus();
       return;
     }
     var items=sortItems((d.items||[]).filter(matchFilter).slice());
+    var truncated=false;
+    if(!searchMode&&!favMode&&!recentMode&&!tagFilterMode&&items.length>500){items=items.slice(0,500);truncated=true;}
     currentItems=items;
     var container=document.getElementById('fileList');
     if(!items.length){container.innerHTML='<p class="empty">'+(searchMode||favMode||recentMode?t('noResult'):((filterType||filterAge)?(lang==='zh'?'没有符合条件的文件':'No matching files'):t('empty')))+'</p>';return}
@@ -4173,6 +4311,7 @@ function render(){
         html+='<button class="btn tiny danger" data-del="'+esc(it.name)+'">'+t('del')+'</button>';
         html+='</span></li>';
       });
+      if(truncated)html+='<li class="list-tip">'+(lang==='zh'?'目录较大，仅显示前 500 项，请使用搜索或筛选定位':'Directory truncated to 500 items, use search/filter to locate')+'</li>';
       html+='</ul>';
     }
     container.innerHTML=html;bindEvents(container);
@@ -4505,7 +4644,6 @@ function playPlaylist(idx){
   var prev=document.getElementById('plPrev');if(prev)prev.onclick=function(){if(playlistIdx>0)playPlaylist(playlistIdx-1)};
   var next=document.getElementById('plNext');if(next)next.onclick=function(){if(playlistIdx<audios.length-1)playPlaylist(playlistIdx+1)};
   box.querySelectorAll('[data-pli]').forEach(function(el){el.onclick=function(){playPlaylist(parseInt(el.getAttribute('data-pli')))}});
-  // Scroll active into view
   var active=box.querySelector('.pl-item.active');
   if(active)active.scrollIntoView({block:'nearest',behavior:'smooth'});
 }
@@ -4719,52 +4857,70 @@ function showTagModal(fileName){
   api('/api/tags').then(function(d){
     var allTags=d.tags||[];
     var fileTags=[];
-    var h='';
+    function render(){
+      title.textContent=fileName?(t('tags')+' · '+fileName):t('tags');
+      var h='';
+      h+='<div style="margin-bottom:14px"><div style="font-size:13px;color:var(--sys-text-2);margin-bottom:8px">'+t('addTag')+'</div>';
+      h+='<div style="display:flex;gap:8px"><input id="newTagInput" placeholder="Tag name" style="flex:1;padding:8px 12px;border-radius:8px;border:none;background:var(--sys-fill);color:var(--sys-text);font-size:14px">';
+      h+='<input id="newTagColor" type="color" value="#0a84ff" style="width:36px;height:36px;border:none;border-radius:8px;cursor:pointer">';
+      h+='<button id="addTagBtn" class="btn small">+</button></div></div>';
+      h+='<div style="font-size:13px;color:var(--sys-text-2);margin-bottom:8px">All tags:</div>';
+      h+='<div style="display:flex;flex-wrap:wrap;gap:6px">';
+      allTags.forEach(function(tg){
+        var has=fileName&&fileTags.some(function(ft){return ft.name===tg.name});
+        h+='<span class="tag-chip" data-tc="'+esc(tg.name)+'"'+(has?' style="outline:2px solid var(--sys-accent)"':'')+'><span class="tag-dot" style="background:'+(tg.color||'#0a84ff')+'"></span>'+esc(tg.name);
+        if(fileName)h+='<span class="tag-x" data-tx="'+esc(tg.name)+'">✕</span>';
+        h+='</span>';
+      });
+      h+='</div>';
+      if(!allTags.length)h+='<div style="color:var(--sys-text-3);text-align:center;padding:20px">'+t('noTags')+'</div>';
+      box.innerHTML=h;
+      document.getElementById('tagModal').classList.add('show');
+      var addBtn=document.getElementById('addTagBtn');
+      if(addBtn)addBtn.onclick=function(){
+        var name=document.getElementById('newTagInput').value.trim();
+        if(!name)return;
+        var color=document.getElementById('newTagColor').value;
+        if(fileName){
+          var merged=fileTags.concat([{name:name,color:color}]);
+          merged=merged.filter(function(t,i,a){return !a.slice(0,i).some(function(x){return x.name===t.name})});
+          api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path,tags:merged})}).then(function(){showTagModal(fileName);renderTagSidebar()});
+        }else{
+          api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'/.tag-register/',tags:[{name:name,color:color}]})}).then(function(){showTagModal();renderTagSidebar()});
+        }
+      };
+      box.querySelectorAll('[data-tc]').forEach(function(el){
+        el.onclick=function(){
+          if(!fileName)return;
+          var tn=el.getAttribute('data-tc');
+          var has=fileTags.some(function(ft){return ft.name===tn});
+          var merged;
+          if(has){
+            merged=fileTags.filter(function(ft){return ft.name!==tn});
+          }else{
+            var tg=allTags.find(function(x){return x.name===tn})||{name:tn,color:'#0a84ff'};
+            merged=fileTags.concat([tg]);
+          }
+          api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path,tags:merged})}).then(function(){showTagModal(fileName);renderTagSidebar()});
+        };
+      });
+      box.querySelectorAll('[data-tx]').forEach(function(el){
+        el.onclick=function(e){
+          e.stopPropagation();
+          var tn=el.getAttribute('data-tx');
+          var merged=fileTags.filter(function(ft){return ft.name!==tn});
+          api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path,tags:merged})}).then(function(){showTagModal(fileName);renderTagSidebar()});
+        };
+      });
+    }
     if(fileName){
-      title.textContent=t('tags')+' · '+fileName;
       api('/api/tags?filter=__get__&path='+encodeURIComponent(path)).then(function(ft){
         fileTags=ft.tags||[];
-      }).catch(function(){});
+        render();
+      }).catch(function(){render()});
     }else{
-      title.textContent=t('tags');
+      render();
     }
-    h+='<div style="margin-bottom:14px"><div style="font-size:13px;color:var(--sys-text-2);margin-bottom:8px">'+t('addTag')+'</div>';
-    h+='<div style="display:flex;gap:8px"><input id="newTagInput" placeholder="Tag name" style="flex:1;padding:8px 12px;border-radius:8px;border:none;background:var(--sys-fill);color:var(--sys-text);font-size:14px">';
-    h+='<input id="newTagColor" type="color" value="#0a84ff" style="width:36px;height:36px;border:none;border-radius:8px;cursor:pointer">';
-    h+='<button id="addTagBtn" class="btn small">+</button></div></div>';
-    h+='<div style="font-size:13px;color:var(--sys-text-2);margin-bottom:8px">All tags:</div>';
-    h+='<div style="display:flex;flex-wrap:wrap;gap:6px">';
-    allTags.forEach(function(tg){
-      h+='<span class="tag-chip" data-tc="'+esc(tg.name)+'"><span class="tag-dot" style="background:'+(tg.color||'#0a84ff')+'"></span>'+esc(tg.name);
-      if(fileName)h+='<span class="tag-x" data-tx="'+esc(tg.name)+'">✕</span>';
-      h+='</span>';
-    });
-    h+='</div>';
-    if(!allTags.length)h+='<div style="color:var(--sys-text-3);text-align:center;padding:20px">'+t('noTags')+'</div>';
-    box.innerHTML=h;
-    document.getElementById('tagModal').classList.add('show');
-    var addBtn=document.getElementById('addTagBtn');
-    if(addBtn)addBtn.onclick=function(){
-      var name=document.getElementById('newTagInput').value.trim();
-      if(!name)return;
-      var color=document.getElementById('newTagColor').value;
-      var tags=[{name:name,color:color}];
-      if(fileName){
-        api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path,tags:tags})}).then(function(){showTagModal(fileName);renderTagSidebar()});
-      }else{
-        api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'/.tag-register/',tags:tags})}).then(function(){showTagModal();renderTagSidebar()});
-      }
-    };
-    box.querySelectorAll('[data-tc]').forEach(function(el){
-      el.onclick=function(){
-        if(!fileName)return;
-        var tn=el.getAttribute('data-tc');
-        api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path,tags:[{name:tn,color:el.querySelector('.tag-dot').style.background||'#0a84ff'}]})}).then(function(){showTagModal(fileName)});
-      };
-    });
-    box.querySelectorAll('[data-tx]').forEach(function(el){
-      el.onclick=function(e){e.stopPropagation()};
-    });
   });
 }
 function doTagFile(name){showTagModal(name)}
@@ -4857,15 +5013,11 @@ function showTrash(){
 document.getElementById('btnLogin').onclick=function(){
   var fd=new FormData();
   fd.append('password',document.getElementById('pw').value);
-  var oc=document.getElementById('otpCode');
-  if(oc&&oc.value)fd.append('code',oc.value);
   fetch('/api/login',{method:'POST',body:fd}).then(function(r){return r.json()}).then(function(d){
     if(d.token){tk=d.token;sessionStorage.setItem('dt',tk);show('main');load()}
-    else if(d.totpRequired){document.getElementById('otpRow').classList.remove('hidden');try{document.getElementById('otpCode').focus()}catch(e){};var el=document.getElementById('loginErr');el.style.display='block';el.textContent='请输入动态验证码'}
     else document.getElementById('loginErr').style.display='block';
   });
 };
-document.getElementById('otpCode').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnLogin').click()};
 document.getElementById('pw').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnLogin').click()};
 document.getElementById('btnLogout').onclick=function(){tk='';sessionStorage.removeItem('dt');show('login')};
 
@@ -4969,7 +5121,6 @@ function pendFind(file,dir){var l=pendList(),t=Date.now();for(var i=0;i<l.length
 function pendAdd(rec){var l=pendList().filter(function(p){return p.uploadId!==rec.uploadId});l.push(rec);pendSave(l)}
 function pendRemove(id){pendSave(pendList().filter(function(p){return p.uploadId!==id}))}
 async function uploadSimple(file,div,thumb){
-  // Dedup check: skip if same name+size exists in current dir
   try{
     var dirItems=await api('/api/list?path='+encodeURIComponent(cur));
     if(dirItems.items&&dirItems.items.some(function(r){return r.name===file.name&&r.size===file.size})){setDone(div);return}
@@ -5068,7 +5219,6 @@ document.addEventListener('keydown',function(e){
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT')return;
   if(document.getElementById('pvModal').classList.contains('show'))return;
   if(document.querySelector('.modal-bg.show'))return;
-  // Ctrl+A: select all
   if((e.ctrlKey||e.metaKey)&&e.key==='a'){
     e.preventDefault();
     var cbs=document.querySelectorAll('[data-chk]');
@@ -5077,19 +5227,16 @@ document.addEventListener('keydown',function(e){
     cbs.forEach(function(cb){cb.checked=!allChecked;cb.dispatchEvent(new Event('change'))});
     return;
   }
-  // Delete: delete selected
   if(e.key==='Delete'&&Object.keys(selected).length){
     if(!confirm('Delete '+Object.keys(selected).length+'?'))return;
     api('/api/batch-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:Object.keys(selected).map(function(k){return cur+k})})}).then(function(){selected={};load()});
     return;
   }
-  // F2: rename first selected
   if(e.key==='F2'){
     var keys=Object.keys(selected);
     if(keys.length===1){var o=keys[0];var n=prompt(t('rename'),o);if(n&&n!==o)api('/api/rename',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur+o,newName:n})}).then(load)}
     return;
   }
-  // Backspace: go up
   if(e.key==='Backspace'&&cur!=='/'){
     e.preventDefault();
     var parts=cur.split('/').filter(Boolean);parts.pop();
@@ -5097,7 +5244,6 @@ document.addEventListener('keydown',function(e){
     searchMode=false;favMode=false;recentMode=false;load();
     return;
   }
-  // Ctrl+F: focus search
   if((e.ctrlKey||e.metaKey)&&e.key==='f'){
     e.preventDefault();
     document.getElementById('searchInput').focus();
@@ -5248,7 +5394,7 @@ function showLog(){
 }
 function renderLog(){
   var box=document.getElementById('logContent');
-  var ACT={up:{zh:'上传',en:'upload',c:'var(--sys-green)',i:'⬆'},del:{zh:'删除',en:'delete',c:'var(--sys-red)',i:'🗑'},shr:{zh:'分享',en:'share',c:'var(--sys-orange)',i:'🔗'},mov:{zh:'移动',en:'move',c:'var(--sys-blue)',i:'➡'},res:{zh:'恢复',en:'restore',c:'var(--sys-green)',i:'↩'}};
+  var ACT={up:{zh:'上传',en:'upload',c:'var(--sys-green)',i:'⬆'},del:{zh:'删除',en:'delete',c:'var(--sys-red)',i:'🗑'},shr:{zh:'分享',en:'share',c:'var(--sys-orange)',i:'🔗'},mov:{zh:'移动',en:'move',c:'var(--sys-blue)',i:'➡'},res:{zh:'恢复',en:'restore',c:'var(--sys-green)',i:'↩'},sec:{zh:'安全',en:'security',c:'var(--sys-red)',i:'🔒'}};
   var counts={};
   logCache.forEach(function(l){counts[l.action]=(counts[l.action]||0)+1});
   var tabs=[['','全部','All'],['up','上传','Upload'],['del','删除','Delete'],['shr','分享','Share'],['mov','移动','Move']];
@@ -5615,58 +5761,6 @@ function showSessions(){
   }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">Error</p>'});
 }
 
-// ===== 两步验证 =====
-document.getElementById('btnTotp').onclick=function(){showTotp()};
-document.getElementById('totpClose').onclick=function(){document.getElementById('totpModal').classList.remove('show')};
-document.getElementById('totpModal').onclick=function(e){if(e.target===this)this.classList.remove('show')};
-function showTotp(){
-  var box=document.getElementById('totpContent');
-  box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">Loading...</p>';
-  document.getElementById('totpModal').classList.add('show');
-  api('/api/totp').then(function(st){
-    if(st&&st.enabled){
-      var h='<p style="font-size:13px;color:var(--sys-text-2);margin-bottom:12px;line-height:1.6">'+(lang==='zh'?'两步验证已启用。关闭需输入当前密码与动态码。':'Two-factor is enabled. Provide password and code to disable.')+'</p>';
-      h+='<input id="tdPw" type="password" placeholder="'+(lang==='zh'?'当前密码':'Password')+'" style="width:100%;padding:9px 12px;margin-bottom:8px">';
-      h+='<input id="tdCode" inputmode="numeric" maxlength="6" placeholder="'+(lang==='zh'?'6 位动态码':'6-digit code')+'" style="width:100%;padding:9px 12px">';
-      h+='<div id="tdMsg" style="margin-top:10px;font-size:13px;min-height:18px"></div>';
-      h+='<div style="margin-top:12px;text-align:right"><button id="tdOff" class="btn danger small">'+(lang==='zh'?'关闭两步验证':'Disable')+'</button></div>';
-      box.innerHTML=h;
-      document.getElementById('tdOff').onclick=function(){
-        var m=document.getElementById('tdMsg');
-        api('/api/totp/disable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current:document.getElementById('tdPw').value,code:document.getElementById('tdCode').value})}).then(function(r){
-          if(r&&r.ok){m.style.color='var(--sys-green)';m.textContent=(lang==='zh'?'已关闭':'Disabled');setTimeout(showTotp,700)}
-          else{m.style.color='var(--sys-red)';m.textContent=(r&&r.error)||'failed'}
-        }).catch(function(){m.style.color='var(--sys-red)';m.textContent='failed'});
-      };
-    }else{
-      box.innerHTML='<p style="font-size:13px;color:var(--sys-text-2);margin-bottom:10px;line-height:1.6">'+(lang==='zh'?'开启后登录需额外输入 6 位动态码，兼容 Google Authenticator / 微软验证器。':'Scan the QR with your authenticator app, then confirm.')+'</p><div id="tq" style="display:flex;justify-content:center;min-height:0"></div><div id="tsMsg" style="margin-top:10px;font-size:13px;min-height:18px"></div><div style="margin-top:12px;text-align:right"><button id="tsOn" class="btn small">'+(lang==='zh'?'生成二维码':'Generate')+'</button></div>';
-      document.getElementById('tsOn').onclick=function(){
-        var m=document.getElementById('tsMsg');
-        api('/api/totp/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:location.hostname||'BlueDrift'})}).then(function(r){
-          if(!r||!r.secret){m.style.color='var(--sys-red)';m.textContent=(r&&r.error)||'failed';return}
-          var q=document.getElementById('tq');
-          q.style.cssText='display:flex;justify-content:center;padding:12px;background:#fff;border-radius:8px;margin-top:6px';
-          q.innerHTML='';
-          try{ if(typeof QRCode!=='undefined'){ new QRCode(q,{text:r.otpauth,width:170,height:170,correctLevel:QRCode.CorrectLevel.M}); }else{ q.textContent=r.otpauth } }catch(e){ q.textContent=r.otpauth }
-          var extra='<div style="margin-top:10px;font-size:12px;color:var(--sys-text-3);word-break:break-all">'+(lang==='zh'?'手动密钥：':'Manual key: ')+'<code>'+esc(r.secret)+'</code></div>';
-          extra+='<input id="tsCode" inputmode="numeric" maxlength="6" placeholder="'+(lang==='zh'?'输入验证器显示的 6 位码':'6-digit code')+'" style="width:100%;padding:9px 12px;margin-top:10px">';
-          extra+='<div id="tsMsg2" style="margin-top:10px;font-size:13px;min-height:18px"></div>';
-          extra+='<div style="margin-top:12px;text-align:right"><button id="tsConfirm" class="btn small">'+(lang==='zh'?'确认开启':'Confirm')+'</button></div>';
-          box.insertAdjacentHTML('beforeend',extra);
-          var on2=document.getElementById('tsOn'); if(on2)on2.style.display='none';
-          document.getElementById('tsConfirm').onclick=function(){
-            var m2=document.getElementById('tsMsg2');
-            api('/api/totp/enable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:document.getElementById('tsCode').value})}).then(function(r2){
-              if(r2&&r2.ok){m2.style.color='var(--sys-green)';m2.textContent=(lang==='zh'?'已开启':'Enabled');setTimeout(showTotp,800)}
-              else{m2.style.color='var(--sys-red)';m2.textContent=(r2&&r2.error)||'failed'}
-            }).catch(function(){m2.style.color='var(--sys-red)';m2.textContent='failed'});
-          };
-        }).catch(function(){m.style.color='var(--sys-red)';m.textContent='failed'});
-      };
-    }
-  }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">Error</p>'});
-}
-
 // ===== 备份与恢复 =====
 document.getElementById('btnBackup').onclick=function(){showBackup()};
 document.getElementById('bkClose').onclick=function(){document.getElementById('bkModal').classList.remove('show')};
@@ -5966,7 +6060,9 @@ async function handleWebDAV(req, env) {
       const key = np.replace(/^\//, '');
       try {
         if (!await env.DRIVE.head(key)) return new Response('Not Found', { status: 404 });
-        return await serveObject(env, req, key, {});
+        // M3: GET 增加文件名净化与附件下载语义
+        const davName = key.split('/').filter(Boolean).pop() || 'download';
+        return await serveObject(env, req, key, { sanitize: true, disposition: 'attachment; filename="' + encodeURIComponent(davName) + '"' });
       } catch (e) { return new Response('Error', { status: 500 }); }
     }
 
@@ -5974,11 +6070,38 @@ async function handleWebDAV(req, env) {
       const dirPath = parentOf(np);
       const fileName = np.split('/').filter(Boolean).pop();
       if (!fileName) return new Response('Bad Request', { status: 400 });
+      if (await isPathLocked(env, dirPath, '')) return new Response('Locked', { status: 423 });
       const safeName = sanitizeName(fileName);
+      // H1: 上限与配额前置检查（流式写入，避免整块入内存）
+      const clen = Number(req.headers.get('Content-Length') || 0);
+      if (clen > 100 * 1024 * 1024) return new Response('File too large', { status: 413 });
+      const existing = await findDirItem(env, dirPath, safeName);
+      const oldItem = existing.item;
+      const delta = oldItem ? (clen ? clen - (oldItem.size || 0) : 0) : clen;
+      if (delta > 0) {
+        const u = await getUsage(env);
+        if ((u.used || 0) + delta > quotaTotal(env)) return new Response('Quota exceeded', { status: 413 });
+      }
+      const key = dirPath.replace(/^\//, '') + safeName;
+      const contentType = req.headers.get('Content-Type') || 'application/octet-stream';
+      if (clen > 0) {
+        await putAndMirror(env, key, req.body, { httpMetadata: { contentType } });
+        await addUsage(env, delta, oldItem ? 0 : 1);
+        if (oldItem) await pushVersion(env, key, oldItem);
+        if (oldItem && oldItem.hasThumb) await deleteThumb(env, key);
+        const entry = { name: safeName, type: 'file', size: clen, mime: contentType, time: new Date().toISOString() };
+        await upsertDirItem(env, dirPath, entry);
+        await addLog(env, 'up', np, clen + ' bytes (WebDAV)');
+        return new Response('', { status: 201 });
+      }
+      // Content-Length 缺失（chunked）：限 100MB 后落盘，仍做配额检查
       const buf = await req.arrayBuffer();
-      await putAndMirror(env, np.replace(/^\//, ''), buf, { httpMetadata: { contentType: req.headers.get('Content-Type') || 'application/octet-stream' } });
-      const entry = { name: safeName, type: 'file', size: buf.byteLength, mime: req.headers.get('Content-Type') || '', time: new Date().toISOString() };
-      await upsertDirItem(env, dirPath, entry);
+      if (buf.byteLength > 100 * 1024 * 1024) return new Response('File too large', { status: 413 });
+      const u2 = await getUsage(env);
+      if ((u2.used || 0) + buf.byteLength > quotaTotal(env)) return new Response('Quota exceeded', { status: 413 });
+      await putAndMirror(env, key, buf, { httpMetadata: { contentType } });
+      const entry2 = { name: safeName, type: 'file', size: buf.byteLength, mime: contentType, time: new Date().toISOString() };
+      await upsertDirItem(env, dirPath, entry2);
       await addUsage(env, buf.byteLength, 1);
       await addLog(env, 'up', np, buf.byteLength + ' bytes (WebDAV)');
       return new Response('', { status: 201 });
@@ -5997,7 +6120,13 @@ async function handleWebDAV(req, env) {
       const destName = sanitizeName(destNp.split('/').filter(Boolean).pop() || '');
       if (!destName) return new Response('Bad Request', { status: 400 });
       if (await isPathLocked(env, destDir, '')) return new Response('Locked', { status: 423 });
-      const srcKey = np.replace(/^\//, '');
+      // 目标已存在：按 Overwrite 头处理
+      const existingDest = await findDirItem(env, destDir, destName);
+      const overwrite = (req.headers.get('Overwrite') || 'T').toUpperCase() === 'T';
+      if (existingDest.item && !overwrite) return new Response('Precondition Failed', { status: 412 });
+      const srcDirNp = parentOf(np);
+      const srcNameNp = sanitizeName(np.split('/').filter(Boolean).pop() || '');
+      const srcKey = srcDirNp.replace(/^\//, '') + srcNameNp;
       let obj = null;
       try { obj = await env.DRIVE.get(srcKey); } catch (e) {}
       if (!obj) return new Response('Not Found', { status: 404 });
@@ -6005,17 +6134,18 @@ async function handleWebDAV(req, env) {
       const buf = new Uint8Array(await obj.arrayBuffer());
       const meta = obj.httpMetadata || {};
       const newKey = destDir.replace(/^\//, '') + destName;
+      if (existingDest.item) {
+        try { await pushVersion(env, newKey, existingDest.item); } catch (e) {}
+      }
       await putAndMirror(env, newKey, buf, { httpMetadata: meta });
       await upsertDirItem(env, destDir, { name: destName, type: 'file', size: buf.byteLength, mime: meta.contentType || '', time: new Date().toISOString() });
       if (method === 'MOVE') {
-        const srcDir = parentOf(np);
-        const srcName = np.split('/').filter(Boolean).pop();
-        await removeDirItem(env, srcDir, srcName);
+        await removeDirItem(env, srcDirNp, srcNameNp);
         await deleteAndMirror(env, srcKey);
         await deleteThumb(env, srcKey);
         await deleteVersions(env, srcKey);
       }
-      return new Response(null, { status: 201 });
+      return new Response(null, { status: existingDest.item ? 204 : 201 });
     }
 
     if (method === 'DELETE') {
@@ -6032,6 +6162,7 @@ async function handleWebDAV(req, env) {
       const dirPath = parentOf(np);
       const folderName = np.split('/').filter(Boolean).pop();
       if (!folderName) return new Response('Bad Request', { status: 400 });
+      if (await isPathLocked(env, dirPath, '')) return new Response('Locked', { status: 423 });
       const safeName = sanitizeName(folderName);
       const existing = await findDirItem(env, dirPath, safeName);
       if (existing.item) return new Response('Method Not Allowed', { status: 405 });
@@ -6113,6 +6244,8 @@ export default {
         const auth = await authInfo(env, req);
         if (!auth.ok) return json({ error: 'Unauthorized' }, 401);
         if (auth.perm === 'ro' && req.method !== 'GET' && req.method !== 'HEAD') return json({ error: 'Read-only token' }, 403);
+        const requireRw = (auth.perm === 'rw');
+        const denyRo = () => json({ error: 'Read-only token' }, 403);
         try {
           if (p === '/api/list') return await handleList(env, url.searchParams.get('path') || '/', url.searchParams.get('size') === '1', url.searchParams.get('token') || '');
           if (p === '/api/unlock' && req.method === 'POST') { const b = await req.json(); return await handleUnlockDir(env, url.searchParams.get('token') || '', b.path, b.password); }
@@ -6121,19 +6254,15 @@ export default {
           if (p === '/api/preview') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handlePreview(env, req, url.searchParams.get('path') || ''); }
           if (p === '/api/thumb') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handleThumb(env, req, url.searchParams.get('path') || ''); }
           if (p === '/api/save' && req.method === 'POST') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; const content = await req.text(); return await handleSaveText(env, url.searchParams.get('path') || '', content); }
-          if (p === '/api/delete' && req.method === 'DELETE') { const fp = url.searchParams.get('path') || ''; const g = await guard(env, req, parentOf('/' + String(fp).replace(/^\/+/, ''))); if (g) return g; return await handleDelete(env, fp); }
-          if (p === '/api/batch-delete' && req.method === 'POST') { const b = await req.json(); return await handleBatchDelete(env, b.paths); }
-          if (p === '/api/batch-rename' && req.method === 'POST') { const b = await req.json(); return await handleBatchRename(env, b.paths, b.pattern); }
+          if (p === '/api/delete' && req.method === 'DELETE') { const fp = url.searchParams.get('path') || ''; const np = '/' + String(fp).replace(/^\/+/, ''); const g = await guard(env, req, np, parentOf(np)); if (g) return g; return await handleDelete(env, fp); }
+          if (p === '/api/batch-delete' && req.method === 'POST') { const b = await req.json(); const paths = Array.isArray(b.paths) ? b.paths.map(x => '/' + String(x || '').replace(/^\/+/, '')) : []; const g = await guard(env, req, ...paths, ...paths.map(x => parentOf(x))); if (g) return g; return await handleBatchDelete(env, b.paths); }
+          if (p === '/api/batch-rename' && req.method === 'POST') { const b = await req.json(); const paths = Array.isArray(b.paths) ? b.paths.map(x => '/' + String(x || '').replace(/^\/+/, '')) : []; const g = await guard(env, req, ...paths, ...paths.map(x => parentOf(x))); if (g) return g; return await handleBatchRename(env, b.paths, b.pattern); }
           if (p === '/api/batch-share' && req.method === 'POST') { const b = await req.json(); return await handleBatchShare(env, b.paths, b.days, b.max, b.password, url.searchParams.get('token') || ''); }
-          if (p === '/api/batch-move' && req.method === 'POST') { const b = await req.json(); const parents = Array.isArray(b.paths) ? b.paths.map(x => parentOf('/' + String(x || '').replace(/^\/+/, ''))) : []; const g = await guard(env, req, b.target, ...parents); if (g) return g; return await handleBatchMove(env, b.paths, b.target); }
-          if (p === '/api/admin-pass' && req.method === 'GET') return await handleAdminPassGet(env);
+          if (p === '/api/batch-move' && req.method === 'POST') { const b = await req.json(); const paths = Array.isArray(b.paths) ? b.paths.map(x => '/' + String(x || '').replace(/^\/+/, '')) : []; const parents = paths.map(x => parentOf(x)); const g = await guard(env, req, b.target, ...paths, ...parents); if (g) return g; return await handleBatchMove(env, b.paths, b.target); }
+          if (p === '/api/admin-pass' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleAdminPassGet(env); }
           if (p === '/api/admin-pass' && req.method === 'POST') { const b = await req.json(); return await handleAdminPassSet(env, b.current, b.next); }
-          if (p === '/api/sessions' && req.method === 'GET') return await handleListSessions(env, url.searchParams.get('token') || '');
+          if (p === '/api/sessions' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleListSessions(env, url.searchParams.get('token') || ''); }
           if (p === '/api/session-revoke' && req.method === 'POST') { const b = await req.json(); return await handleRevokeSession(env, b.id, !!b.all); }
-          if (p === '/api/totp' && req.method === 'GET') return await handleTotpState(env);
-          if (p === '/api/totp/setup' && req.method === 'POST') { let b = {}; try { b = await req.json(); } catch (e) {} return await handleTotpSetup(env, b); }
-          if (p === '/api/totp/enable' && req.method === 'POST') { const b = await req.json(); return await handleTotpEnable(env, b.code); }
-          if (p === '/api/totp/disable' && req.method === 'POST') { const b = await req.json(); return await handleTotpDisable(env, b.current, b.code); }
           if (p === '/api/duplicates') return await handleDuplicates(env);
           if (p === '/api/note' && req.method === 'GET') return await handleGetNote(env, url.searchParams.get('path') || '');
           if (p === '/api/note' && req.method === 'POST') { const b = await req.json(); return await handleSetNote(env, b.path, b.note); }
@@ -6152,21 +6281,21 @@ export default {
           if (p === '/api/auto-rule' && req.method === 'GET') return await handleGetAutoRule(env);
           if (p === '/api/auto-rule' && req.method === 'POST') { const b = await req.json(); return await handleSetAutoRule(env, b); }
           if (p === '/api/mkdir' && req.method === 'POST') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; const b = await req.json(); return await handleMkdir(env, url.searchParams.get('path') || '/', b.name); }
-          if (p === '/api/rename' && req.method === 'PUT') { const b = await req.json(); const g = await guard(env, req, parentOf('/' + String(b.path || '').replace(/^\/+/, ''))); if (g) return g; return await handleRename(env, b.path, b.newName); }
-          if (p === '/api/move' && req.method === 'PUT') { const b = await req.json(); const g = await guard(env, req, parentOf('/' + String(b.path || '').replace(/^\/+/, '')), b.target); if (g) return g; return await handleMove(env, b.path, b.target); }
-          if (p === '/api/search') return await handleSearch(env, url.searchParams.get('q') || '', url.searchParams.get('path') || '/');
-          if (p === '/api/tree') return await handleTree(env);
-          if (p === '/api/zip') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handleZip(env, url.searchParams.get('path') || '/'); }
+          if (p === '/api/rename' && req.method === 'PUT') { const b = await req.json(); const np = '/' + String(b.path || '').replace(/^\/+/, ''); const g = await guard(env, req, np, parentOf(np)); if (g) return g; return await handleRename(env, b.path, b.newName); }
+          if (p === '/api/move' && req.method === 'PUT') { const b = await req.json(); const np = '/' + String(b.path || '').replace(/^\/+/, ''); const g = await guard(env, req, np, parentOf(np), b.target); if (g) return g; return await handleMove(env, b.path, b.target); }
+          if (p === '/api/search') return await handleSearch(env, url.searchParams.get('q') || '', url.searchParams.get('path') || '/', url.searchParams.get('token') || '');
+          if (p === '/api/tree') return await handleTree(env, url.searchParams.get('token') || '');
+          if (p === '/api/zip') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handleZip(env, url.searchParams.get('path') || '/', url.searchParams.get('token') || ''); }
           if (p === '/api/unzip' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, parentOf(b.path)); if (g) return g; return await handleUnzip(env, b.path); }
           if (p === '/api/versions' && req.method === 'GET') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handleListVersions(env, url.searchParams.get('path') || ''); }
           if (p === '/api/versions/restore' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.path); if (g) return g; return await handleRestoreVersion(env, b.path, b.ts); }
           if (p === '/api/share' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.path); if (g) return g; return await handleShare(env, b.path, b.days, b.max, b.password, b.dir); }
           if (p === '/api/zip-multi' && req.method === 'POST') { const b = await req.json(); const parents = Array.isArray(b.paths) ? b.paths.map(x => parentOf('/' + String(x || '').replace(/^\/+/, ''))) : []; const g = await guard(env, req, ...parents); if (g) return g; return await handleZipPaths(env, b.paths); }
           if (p === '/api/fetch-url' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.dir || '/'); if (g) return g; return await handleFetchUrl(req, env, b); }
-          if (p === '/api/shares' && req.method === 'GET') return await handleListShares(env);
+          if (p === '/api/shares' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleListShares(env); }
           if (p === '/api/share' && req.method === 'DELETE') { const b = await req.json(); return await handleDeleteShare(env, b.token); }
           if (p === '/api/upload-link-create' && req.method === 'POST') { const b = await req.json(); return await handleCreateUploadLink(env, b.path, b.days, b.max); }
-          if (p === '/api/upload-links' && req.method === 'GET') return await handleListUploadLinks(env);
+          if (p === '/api/upload-links' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleListUploadLinks(env); }
           if (p === '/api/upload-link' && req.method === 'DELETE') { const b = await req.json(); return await handleDeleteUploadLink(env, b.token); }
           if (p === '/api/folder-pass' && req.method === 'POST') { const b = await req.json(); return await handleSetFolderPass(env, b.path, b.password); }
           if (p === '/api/folder-pass' && req.method === 'GET') return json({ has: !!(await env.STORE.get('dirpass:' + normPath(url.searchParams.get('path') || '/'), 'json')) });
@@ -6177,25 +6306,25 @@ export default {
           if (p === '/api/batch-purge' && req.method === 'POST') { const b = await req.json(); return await handleBatchPurge(env, b.ids); }
           if (p === '/api/usage') { const u = await getUsage(env); return json({ used: u.used, files: u.files, total: quotaTotal(env) }); }
           if (p === '/api/recalc-usage' && req.method === 'POST') { const u = await recalcUsage(env); return json({ ok: true, used: u.used, files: u.files }); }
-          if (p === '/api/log' && req.method === 'GET') return json({ logs: await getLogs(env) });
-          if (p === '/api/dl-stats' && req.method === 'GET') return await handleDlStats(env);
+          if (p === '/api/log' && req.method === 'GET') { if (!requireRw) return denyRo(); return json({ logs: await getLogs(env) }); }
+          if (p === '/api/dl-stats' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleDlStats(env); }
           if (p === '/api/clear-dl-stats' && req.method === 'POST') return await handleClearDlStats(env);
           if (p === '/api/public-upload-info') return json({ enabled: !!publicUploadDir(env), dir: publicUploadDir(env) || '', max: publicUploadMax(env), turnstile: !!turnstileSecret(env) });
-          if (p === '/api/backends' && req.method === 'GET') return await handleListBackends(env);
+          if (p === '/api/backends' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleListBackends(env); }
           if (p === '/api/backends/check' && req.method === 'POST') return await handleCheckBackends(env);
-          if (p === '/api/tokens' && req.method === 'GET') return json({ tokens: (await getAccessTokens(env)).map(t => ({ id: t.token, name: t.name, perm: t.perm, exp: t.exp || null })) });
+          if (p === '/api/tokens' && req.method === 'GET') { if (!requireRw) return denyRo(); return json({ tokens: (await getAccessTokens(env)).map(t => ({ id: t.token.substring(0, 6) + '****', name: t.name, perm: t.perm, exp: t.exp || null })) }); }
           if (p === '/api/tokens' && req.method === 'POST') { const b = await req.json(); const tokens = await getAccessTokens(env); const nt = { name: b.name || 'Token', token: randToken(), perm: b.perm === 'rw' ? 'rw' : 'ro', exp: b.exp || null }; tokens.push(nt); await saveAccessTokens(env, tokens); return json({ ok: true, token: nt.token }); }
-          if (p === '/api/tokens' && req.method === 'DELETE') { const b = await req.json(); const id = b.id || b.token; const tokens = (await getAccessTokens(env)).filter(t => t.token !== id); await saveAccessTokens(env, tokens); return json({ ok: true }); }
-          if (p === '/api/stats') return await handleStatsFull(env);
+          if (p === '/api/tokens' && req.method === 'DELETE') { const b = await req.json(); const id = String(b.id || b.token || ''); const mask = id.replace(/\*+$/, ''); const tokens = (await getAccessTokens(env)).filter(t => t.token !== id && !(mask.length >= 6 && t.token.startsWith(mask))); await saveAccessTokens(env, tokens); return json({ ok: true }); }
+          if (p === '/api/stats') { if (!requireRw) return denyRo(); return await handleStatsFull(env); }
           if (p === '/api/stats-trend') return await handleStatsTrend(env, url.searchParams.get('days') || '30');
           if (p === '/api/backup' && req.method === 'POST') return json(await createBackup(env, 'manual'));
-          if (p === '/api/backups' && req.method === 'GET') return await handleBackupList(env);
-          if (p === '/api/backup-download') { const bk = url.searchParams.get('key') || ''; if (bk.indexOf(BACKUP_PREFIX) !== 0) return json({ error: 'Bad key' }, 400); return await serveObject(env, req, bk, { disposition: 'attachment; filename="' + encodeURIComponent(String(bk).split('/').pop()) + '"' }); }
+          if (p === '/api/backups' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleBackupList(env); }
+          if (p === '/api/backup-download') { if (!requireRw) return denyRo(); const bk = url.searchParams.get('key') || ''; if (bk.indexOf(BACKUP_PREFIX) !== 0) return json({ error: 'Bad key' }, 400); return await serveObject(env, req, bk, { disposition: 'attachment; filename="' + encodeURIComponent(String(bk).split('/').pop()) + '"' }); }
           if (p === '/api/backup-restore' && req.method === 'POST') { const b = await req.json(); return await handleBackupRestore(env, b.key, b.password); }
-          if (p === '/api/health' && req.method === 'GET') return await handleHealth(env);
+          if (p === '/api/health' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleHealth(env); }
           if (p === '/api/scan-orphans' && req.method === 'POST') return await handleScanOrphans(env);
           if (p === '/api/purge-orphans' && req.method === 'POST') { const b = await req.json(); return await handlePurgeOrphans(env, b.mode || 'objects'); }
-          if (p === '/api/webhook' && req.method === 'GET') return await handleGetWebhook(env);
+          if (p === '/api/webhook' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleGetWebhook(env); }
           if (p === '/api/webhook' && req.method === 'POST') { const b = await req.json(); return await handleSetWebhook(env, b); }
           if (p === '/api/webhook-test' && req.method === 'POST') return await handleWebhookTest(env);
           if (p === '/api/albums' && req.method === 'GET') return await handleListAlbums(env);
@@ -6223,7 +6352,8 @@ export default {
         const keep = [];
         let purged = 0, totalSize = 0;
         for (const item of trash) {
-          const deletedTime = new Date(item.deletedAt).getTime();
+          const deletedTime = item.deletedAt ? new Date(item.deletedAt).getTime() : 0;
+          if (!Number.isFinite(deletedTime) || deletedTime <= 0) { keep.push(item); continue; }
           if (now - deletedTime > 30 * 86400 * 1000) {
             const k = item.originalPath.replace(/^\//, '');
             await deleteAndMirror(env, k);
