@@ -1,443 +1,335 @@
-<div align="center">
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 920b985d2f5d9c3397e2be237fdb8e96_1a946b2bbfcb11f197eb525400393706
+    ReservedCode1: 1zEOG4z8FagIdz/tRUMYl8/D9b3105Y228gYfeL7gXV2g96R9Jz05ZwECUpIGZ0mLWDodiTzTHAjAIRBsi0S7ytee2gzS9RjBMUx/Tp7XSj4ga3Ja64J8xcYN35AXozBasbhH4AEdJF0r3MLZA3tjTaY6wv09VwGy5DQCV3UtAEhCg5FejD+islb9dw=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 920b985d2f5d9c3397e2be237fdb8e96_1a946b2bbfcb11f197eb525400393706
+    ReservedCode2: 1zEOG4z8FagIdz/tRUMYl8/D9b3105Y228gYfeL7gXV2g96R9Jz05ZwECUpIGZ0mLWDodiTzTHAjAIRBsi0S7ytee2gzS9RjBMUx/Tp7XSj4ga3Ja64J8xcYN35AXozBasbhH4AEdJF0r3MLZA3tjTaY6wv09VwGy5DQCV3UtAEhCg5FejD+islb9dw=
+---
 
-# ☁️ CF-KVR2-NetworkCloud
+# PersonalDrive
 
-**一个文件，一个 Worker，一个属于你自己的云。**
+> 部署在 Cloudflare Workers 上的私人网盘，单文件 Worker（约 6500 行），R2 + KV + Durable Object 架构，内置完整 Web 前端（Apple / macOS Sonoma 风格，PWA 支持）。
+> 当前版本：**v5.1.2**（v5.1.1 代码审查全量修复版）。
 
-`~3400 行 JavaScript` · `零构建` · `零服务器` · `全球边缘部署`
-
-[![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Cloudflare](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com)
-[![Dependencies](https://img.shields.io/badge/Dependencies-0-green)]()
-[![File Size](https://img.shields.io/badge/Size-~190KB-yellow)]()
-
-[功能](#-功能全景) · [部署](#-快速部署) · [架构](#-技术架构) · [API](#-api-端点) · [WebDAV](#-webdav-挂载) · [FAQ](#-常见问题)
-
-
-
-</div>
+PersonalDrive 是一个开箱即用的自托管云盘：把一份 Worker 脚本部署到 Cloudflare，即可获得登录鉴权、目录管理、文件分享、WebDAV 挂载、版本管理、备份恢复等能力。全部代码（前端 + 后端）内嵌在单个 JavaScript 文件中，无需额外构建步骤。
 
 ---
 
-## 💡 为什么做这个
+## 功能特性
 
-市面上的网盘要么贵（iCloud 200GB 要 ¥21/月），要么慢（国内某盘限速到 KB/s），要么不放心（你的照片别人也能看）。
+以下功能均来自 v5.1.2 源码实际实现。
 
-Cloudflare 免费层给你：
+### 认证与访问控制
 
-| 资源 | 免费额度 |
-|------|----------|
-| Worker 请求 | 10 万次/天 |
-| R2 存储 | 10 GB |
-| R2 写入操作 | 100 万/月 |
-| R2 读取操作 | 1000 万/月 |
-| 出口流量 | **$0**（R2 无出口费） |
-| KV 读取 | 10 万/天 |
+- **管理员密码登录**：使用环境变量 `DRIVE_PASSWORD` 或 KV 中自定义密码（`meta:adminpass`）；无盐历史记录自动迁移为带盐哈希。
+- **会话管理**：登录后生成会话 Token（有效期 7 天），支持会话列表查看与按会话撤销。
+- **可选 TOTP 两步验证**：登录时额外校验动态验证码（主版本支持，详见"已知限制"中的 nototp 变体说明）。
+- **访问令牌**：可生成只读（ro）/ 读写（rw）令牌，用于 API 调用与 WebDAV 认证；Token 通过 `Authorization: Bearer` 请求头传递（兼容 URL 参数）。
+- **目录锁**：目录可设置独立密码，解锁后才能访问其内容；分享链路同样受目录锁约束。
+- **IP 黑白名单**：可选环境变量 `IP_DENY` / `IP_ALLOW`，基于 `CF-Connecting-IP` 过滤。
+- **登录限频**：IP 与用户名双维度限频（5 次失败 / 5 分钟），防密码爆破。
+- **Turnstile 人机验证**：可选，需同时配置 `TURNSTILE_SITE_KEY` 与 `TURNSTILE_SECRET`。
 
-个人使用绑绑有余。全球 300+ 边缘节点，从东京到纽约都是毫秒级响应。数据完全在你手里，没人审查、没人限速、没人删你文件。
+### 文件管理
 
-**适合场景：** 个人文件备份、跨设备同步、给家人分享照片、WebDAV 挂载当本地盘、代码项目存档、临时文件交换。
+- 上传 / 下载 / 在线预览 / 删除 / 重命名 / 移动（含递归移动目录）。
+- 批量操作：批量删除、批量重命名（模式替换）、批量移动、批量分享。
+- 回收站：删除进回收站，支持单个/批量恢复与永久清理。
+- 目录树、关键词搜索、标签搜索与标签管理、最近访问、收藏夹。
+- 文件备注（Note）、客户端加密文件（浏览器端派生密钥加密）。
+- 文本在线编辑保存（上限 2MB）。
 
----
+### 传输与上传增强
 
-## 🎯 功能全景
+- **分片上传与断点续传**：`chunk-init / chunk-upload / chunk-complete`，失败任务保存在浏览器 localStorage，可续传。
+- **秒传**：按文件 SHA-256 哈希去重，命中直接生成对象。
+- **URL 抓取**：输入远程 URL 直接保存到网盘（10s 超时、最多 5 跳重定向、逐跳 host 校验、`FETCH_MAX_BYTES` 限额、超限回滚）。
+- **上传链接**：生成 `{域名}/u/<token>` 匿名上传页，可设有效期与文件数上限。
+- **公开上传**：配置 `PUBLIC_UPLOAD_DIR` 后开放 `/upload` 匿名上传页（默认单文件 100MB，可配合 Turnstile 保护）。
+- 拖拽上传（含整个目录结构）、上传前图片压缩、缩略图生成。
 
-### 📁 文件管理
+### 分享与协作
 
-| 功能 | 说明 |
-|------|------|
-| 上传 | 拖拽 / 点击 / `Ctrl+V` 粘贴截图 / 整个文件夹上传 / 大文件自动分片 (5MB chunks) |
-| 预览 | 图片 / 视频 / 音频 / 文本 / Markdown 渲染 / PDF 在线 / 代码高亮 (hljs) |
-| 编辑 | 文本文件在线编辑，保存即覆盖，自动保留最多 5 个历史版本 |
-| 操作 | 重命名 / 移动 / 复制 / 删除 / 批量操作 / 批量重命名 (`{n}` 序号 `{d}` 日期) |
-| 压缩 | 上传前客户端图片压缩 (>2048px 自动缩放) / ZIP 打包下载 / ZIP 在线解压 |
-| 去重 | 上传时自动检测同名同大小文件，跳过重复 |
-| 加密 | 客户端 AES-256-GCM，密钥只在你浏览器里，服务端只看到密文 `.enc` |
-| 回收站 | 删除进回收站，30 天自动清理，支持恢复 / 批量彻底删除 |
+- **分享链接**：文件/目录生成 `{域名}/s/<token>`，支持分享密码、有效期（TTL）、最大访问次数、目录分享；支持批量分享。
+- 分享访问受目录锁约束（锁定目录不可分享、分享访问实时校验锁）。
+- **相册**：从目录收集图片/视频生成相册页（`/a/<id>`），支持幻灯片放映、播放列表、EXIF 信息与截图。
+- 下载统计（按文件维度记录下载次数与明细）。
 
-### 🔗 分享与协作
+### 内容处理
 
-| 功能 | 说明 |
-|------|------|
-| 分享链接 | 设定有效天数 + 最大访问次数 + 可选密码，自动生成二维码 |
-| 上传链接 | 让别人往你的文件夹上传文件，不需要登录你的网盘 |
-| 文件夹加密 | 给任意文件夹设独立密码，访问需解锁 |
-| 访问令牌 | 生成独立 Token（只读 / 读写权限），用于 API 或 WebDAV |
-| 文件备注 | 给任意文件添加文字说明，KV 存储 |
+- 在线预览：图片 / 视频 / 音频 / PDF / 文本，含 PDF 预览、音频播放列表、图片幻灯片。
+- **ZIP 打包与解压**：目录打包下载、多选文件打包、ZIP 解压（上限 50MB）；支持按 MIME 类型的自动解压归档规则。
+- **版本管理**：覆盖写入保留历史版本（最多 5 个），可查看与恢复任意历史版本。
+- **重复文件检测**：按哈希找出重复文件（哈希组上限 2000）。
 
-### 🎵 媒体增强
+### 数据保护与运维
 
-| 功能 | 说明 |
-|------|------|
-| 音乐播放 | 连续播放列表，自动切歌，上一首/下一首，进度条 |
-| 图片幻灯片 | 全屏轮播 (4s 间隔) + EXIF 信息（相机/光圈/快门/ISO/焦距/尺寸） |
-| 视频截图 | 播放中一键截取当前帧保存为 PNG |
-| Markdown | 实时渲染 + 原文切换，支持表格/代码块/引用/图片 |
-| PDF | PDF.js 在线渲染（最多 50 页），无需下载即可查看 |
+- **全量备份**：一键创建备份、备份列表、下载备份、密码保护恢复。
+- **健康检查**：`/api/health` 返回各项绑定/存储检查状态（错误信息已脱敏）。
+- **孤儿对象扫描与清理**：扫描未被元数据引用的对象，截断时拒绝清理（防误删）。
+- 用量统计与重算、下载统计、访问趋势、操作日志。
+- **Webhook 通知**：配置 URL 后触发事件通知（发送前二次校验目标 host）。
+- **多后端 S3 镜像**：配置 `DRIVE_BACKENDS` 后，写入对象同步镜像到多个 S3 兼容存储（默认镜像 ≤25MB 文件）。
 
-### 📊 管理面板
+### WebDAV
 
-| 功能 | 说明 |
-|------|------|
-| 目录树 | 侧栏递归展示，支持拖拽文件到目录树直接移动 |
-| 标签系统 | 给文件打彩色标签，侧栏按标签筛选 |
-| 收藏 / 最近 | 快速访问常用文件 |
-| 活动日志 | 记录最近 200 条操作（上传/删除/分享），带时间线 |
-| 存储统计 | 用量环形图 (Chart.js) + 文件数 + 剩余空间 |
-| 重复检测 | 按文件 hash 查找重复文件，分组展示 |
-
-### 🎨 界面体验
-
-| 特性 | 说明 |
-|------|------|
-| 设计风格 | Apple / macOS Sonoma 风格，毛玻璃卡片，SF Pro 字体 |
-| 主题 | 深色 / 浅色 / 跟随系统 三档，一键切换 |
-| 视图 | 列表 / 网格 两种布局 |
-| 语言 | 中文 / English 双语，自动记忆偏好 |
-| 响应式 | 移动端完全适配，侧栏折叠为汉堡菜单 |
-| 快捷键 | `Ctrl+A` 全选 · `Delete` 删除 · `F2` 重命名 · `Backspace` 返回 · `Ctrl+F` 搜索 |
-| 右键菜单 | 下载 / 分享 / 标签 / 备注 / 加密 / 历史 / 重命名 / 移动 / 删除 |
-| PWA | 支持添加到手机桌面 |
+- 端点 `{域名}/dav/`，支持挂载到 Windows / macOS / 手机等 WebDAV 客户端。
+- 认证方式：用户名任意，密码填 rw 访问令牌。
+- WebDAV PUT 单文件上限 100MB，执行配额前置检查与流式写入；GET 返回文件名净化与 `attachment` 语义。
 
 ---
 
-## 🚀 快速部署
+## 架构与技术栈
 
-> 从零到上线，5 分钟。
+| 组成 | 说明 |
+|---|---|
+| 运行环境 | Cloudflare Workers（单文件 `export default { fetch }`） |
+| 对象存储 | **R2 = DRIVE**：文件内容、缩略图（`.thumb/`）、版本（`.versions/`）、备份（`.backup/`） |
+| 元数据存储 | **KV = STORE**：目录列表、会话、分享、上传链接、目录密码、标签、统计、日志、备份索引等 |
+| 计数器/目录镜像 | **DO = DIR（可选）**：原子计数（`__counter__:<id>`）、用量统计（`__usage__`）；未配置时自动回退本地/KV 累加 |
+| 前端 | 内嵌原生 JavaScript SPA（Apple / macOS Sonoma 风格 UI），支持中英文、明暗主题、PWA（manifest / icon / sw.js） |
 
-### 前提
+### Bindings（wrangler.toml 参考）
 
-- Cloudflare 账号（免费注册）
-- 可选：一个托管在 CF DNS 的域名
-
-### Step 1 — 创建存储
-
-```
-Dashboard → R2 → Create Bucket → 命名 "drive"
-Dashboard → Workers → KV → Create Namespace → 命名 "STORE"
-```
-
-### Step 2 — 创建 Worker
-
-```
-Dashboard → Workers → Create Worker → 粘贴 _workers.js → Deploy
-```
-
-### Step 3 — 绑定资源
-
-Worker Settings → Bindings → Add：
-
-| 类型 | 变量名 | 绑定到 | 必须 |
-|------|--------|--------|------|
-| R2 Bucket | `DRIVE` | drive | ✅ |
-| KV Namespace | `STORE` | STORE | ✅ |
-| Durable Object | `DIR` | DirStore | ⬜ 可选 |
-
-### Step 4 — 设置密码
-
-Settings → Variables and Secrets → Add：
-
-```
-DRIVE_PASSWORD = 你的密码
-DRIVE_TITLE    = 我的网盘        (可选)
-DRIVE_LOGO     = ☁️              (可选)
-```
-
-### Step 5 — 绑定域名（可选）
-
-Settings → Domains & Routes：
-
-```
-drive.yourdomain.com → your-worker-name
-```
-
-### Step 6 — 定时清理（推荐）
-
-Settings → Triggers → Cron：
-
-```
-0 3 * * *    ← 每天凌晨3点清理回收站超期文件
-```
-
-**完成。** 打开域名，输入密码，开始用。
-
-### Wrangler CLI 部署（进阶）
-
-```bash
-# wrangler.toml
-name = "network-cloud"
-main = "_workers.js"
-
-[vars]
-DRIVE_TITLE = "我的网盘"
+```toml
+name = "personal-drive"
+main = "PersonalDrive_v5.1.2.js"
+compatibility_date = "2024-11-01"
 
 [[r2_buckets]]
 binding = "DRIVE"
-bucket_name = "drive"
+bucket_name = "personal-drive"
 
 [[kv_namespaces]]
 binding = "STORE"
-id = "your-kv-namespace-id"
+id = "<你的 KV namespace id>"
 
-[durable_objects]
-bindings = [{ name = "DIR", class_name = "DirStore" }]
+# DO 可选；如启用需声明 migration
+[[durable_objects.bindings]]
+name = "DIR"
+class_name = "DirObject"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["DirStore"]
-
-[triggers]
-crons = ["0 3 * * *"]
+new_sqlite_classes = ["DirObject"]
 ```
+
+### 环境变量与 Secret
+
+| 变量 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `DRIVE_PASSWORD` | Secret | 推荐 | 管理员登录密码（未配置时首次需通过 KV `meta:adminpass` 设置） |
+| `DRIVE_QUOTA` | 变量 | 否 | 总配额字节数，默认 10GB |
+| `DRIVE_TITLE` | 变量 | 否 | 站点标题 |
+| `DRIVE_LOGO` | 变量 | 否 | 站点 Logo（URL） |
+| `PUBLIC_UPLOAD_DIR` | 变量 | 否 | 设置后开启公开上传，值为目标目录路径 |
+| `PUBLIC_UPLOAD_MAX` | 变量 | 否 | 公开上传单文件上限（字节），默认 100MB |
+| `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET` | 变量 / Secret | 否 | Turnstile 人机验证，两者必须同时配置才生效 |
+| `FETCH_MAX_BYTES` | 变量 | 否 | URL 抓取单文件上限（字节） |
+| `IP_ALLOW` / `IP_DENY` | 变量 | 否 | IP 白名单 / 黑名单（基于 `CF-Connecting-IP`） |
+| `DRIVE_BACKENDS` | Secret | 否 | S3 兼容镜像配置 JSON（数组，字段见下） |
+
+`DRIVE_BACKENDS` 示例（数组或对象均可）：
+
+```json
+[
+  {
+    "id": "backup-s3",
+    "endpoint": "https://s3.example.com",
+    "bucket": "drive-mirror",
+    "accessKey": "AKIA...",
+    "secretKey": "xxxx",
+    "region": "auto",
+    "pathStyle": true,
+    "prefix": "mirror/",
+    "mirrorMaxBytes": 26214400
+  }
+]
+```
+
+### 关键常量（源码内置）
+
+| 常量 | 值 | 说明 |
+|---|---|---|
+| `MAX_UPLOAD_SIZE` | 500MB | 单文件上传上限 |
+| `UNZIP_MAX_BYTES` | 50MB | ZIP 解压上限 |
+| `MAX_VERSIONS` | 5 | 文件历史版本保留数 |
+| `SESSION_TTL` | 7 天 | 会话有效期 |
+| WebDAV PUT | 100MB | WebDAV 单文件上限（H1 修复） |
+| 分片内存拼装 | 50MB | 分片组装内存上限（R5 修复） |
+| 文本保存 | 2MB | 在线文本编辑上限（R8 修复） |
+
+---
+
+## 安全特性与 v5.1.2 修复记录
+
+v5.1.2 基于 v5.1.1 代码审查报告（审查范围覆盖认证/授权、路径安全、XSS、SSRF、注入、敏感信息、上传/下载边界、分享链路、分片并发、ZIP 解压、WebDAV、配额与版本、错误处理）完成 **33 处代码替换**，覆盖 H1-H4 / M1-M7 / L1-L5 / R1-R8 全部问题项，修复原则为 **fail-closed、原子计数、流式限额、锁定边界全覆盖**。修复后接口保持兼容，前端与既有 API 调用无需改动。
+
+### 高危（H1-H4）
+
+| 问题项 | 修复内容 |
+|---|---|
+| H1 WebDAV PUT 无大小/配额检查 | PUT 增加 100MB 上限与配额前置检查；带 Content-Length 时流式写入（`req.body`），避免整块入内存；重名时增量计算配额、保留旧版本 |
+| H2 URL 抓取无 Content-Length 时绕过限额 | 无 Content-Length 先 HEAD 探测体积；写后校验实际 size，超限/超配额时删除已写对象并返回 413 |
+| H3 分享链接绕过目录锁 | 创建分享前校验目录/父目录锁；分享访问链路（目录分享查目录、文件分享查父目录）实时校验锁，锁定结果转为 423 |
+| H4 分享密码可无限爆破 | 密码校验失败分支增加 `share:pw:<token>` 计数限频（5 次 / 5 分钟） |
+
+### 中危（M1-M7）
+
+| 问题项 | 修复内容 |
+|---|---|
+| M1 登录仅 IP 限频 | 增加用户名级限频（`login:u:<username>`，5 次 / 5 分钟），预检、密码失败、TOTP 失败均计数，登录成功清空；与 IP 限频并存 |
+| M2 Turnstile 缺 secret 静默放行 | 配置了 site key 但缺 secret 视为配置不完整返回 false；完全未配置保持跳过（向后兼容） |
+| M3 WebDAV GET 无净化 | GET 响应增加文件名净化与 `Content-Disposition: attachment` 语义 |
+| M4 删除目录不查子孙锁 | 新增 `hasLockedSubtree` 递归探测；删除目录前预检（返回 423），递归删除时跳过锁定子树 |
+| M5 chunks/ 被误判孤儿 | `listAllKeys` 采集上传时间；chunks/ 24 小时内视为活跃不归孤儿 |
+| M6 分享上传计数非原子 | 上传计数改用 `counterAdd` 原子累加（KV 退化时回退本地累加） |
+| M7 分享 TTL 与 exp 偏差 | 访问检测到过期即删除分享记录；列表接口过滤过期项并同步清理 |
+
+### 低危（L1-L5）
+
+| 问题项 | 修复内容 |
+|---|---|
+| L1 密码无盐回退 | 管理员密码与目录密码无盐验证通过后自动写入带盐哈希（迁移式修复，不改变接口） |
+| L2 token 明文拼 URL | 前端 `api()` 改为 `Authorization: Bearer` 请求头传输 |
+| L3 前端属性注入 | 面包屑累积路径 `data-p` 用 `esc()` 转义 |
+| L4 Webhook 未二次校验 host | 发送前用 URL 解析 + `resolveAndCheckHost` 二次校验目标 host，失败跳过 |
+| L5 错误响应泄露内部细节 | 健康检查错误信息统一脱敏为 `check failed` |
+
+### 逻辑/健壮性（R1-R8）
+
+| 问题项 | 修复内容 |
+|---|---|
+| R1 抓取/重定向无超时 | fetch 增加 10s 超时（`AbortSignal.timeout`），保留 5 跳上限与每跳 host 校验 |
+| R2 扫描无上限 | 标签过滤结果上限 500；重复检测哈希组上限 2000 |
+| R3 孤儿截断误判 | 扫描截断（capped）时拒绝清理并返回 409 |
+| R4 目录删除非幂等 | 删除后残留检查 + 最多 3 次重试（间隔递增），规避 KV 最终一致残留 |
+| R5 分片内存 OOM | 分片内存拼装上限由 100MB 收紧至 50MB |
+| R6 前端目录渲染无上限 | 普通目录渲染截断至 500 项并提示；解锁弹窗由 `prompt()` 改为内联表单 |
+| R7 递归移动（无需修改） | 已具备批次/锁检查，保留原实现 |
+| R8 文本写入无限制 | `handleSaveText` 增加 2MB 上限与类型校验 |
+
+---
+
+## 部署方式
+
+### 前置条件
+
+- Cloudflare 账号（免费版可用 R2 10GB / KV / DO）
+- 已创建 R2 存储桶与 KV Namespace（名称任意，绑定名分别为 `DRIVE`、`STORE`）
+
+### 方式一：Wrangler CLI
+
+1. 安装 Wrangler 并登录：`npm i -g wrangler`、`wrangler login`。
+2. 创建存储资源：
 
 ```bash
-npx wrangler deploy
+wrangler r2 bucket create personal-drive
+wrangler kv namespace create STORE
 ```
 
----
+3. 将 `PersonalDrive_v5.1.2.js` 放入项目目录，按上文"Bindings 参考"编写 `wrangler.toml`（填入 KV id；DO 可选）。
+4. 设置 Secret 与变量：
 
-## 🏗️ 技术架构
-
-```
-┌────────────────────────────────────────────────────────────┐
-│                    Cloudflare Edge Network                   │
-│                     300+ PoP 全球节点                        │
-├────────────────────────────────────────────────────────────┤
-│                                                              │
-│   _workers.js (单文件 ~3400 行，~190KB)                      │
-│                                                              │
-│   ┌────────────────────────────────────────────────────┐    │
-│   │  Router: fetch() + scheduled()                      │    │
-│   ├────────────────────────────────────────────────────┤    │
-│   │  API Handlers (30+ endpoints)                       │    │
-│   │  upload / download / zip / share / tags / notes /   │    │
-│   │  versions / duplicates / WebDAV / tokens / stats    │    │
-│   ├────────────────────────────────────────────────────┤    │
-│   │  Storage Abstraction Layer                          │    │
-│   │  DO 优先 (3s 超时) → KV 兜底 → R2 读写              │    │
-│   ├────────────────────────────────────────────────────┤    │
-│   │  Frontend: HTML Template Literal                    │    │
-│   │  内联 CSS (Apple 风格) + 内联 JS (SPA)              │    │
-│   │  外部 CDN: marked / hljs / pdfjs / chart / qrcode   │    │
-│   └────────────────────────────────────────────────────┘    │
-│                                                              │
-├──────────────────────────────────┬─────────────────────────┤
-│   R2 Bucket    │   Workers KV     │  Durable Object         │
-│   文件二进制    │   元数据/索引     │  (可选) 目录缓存        │
-│   无出口流量费  │   会话/标签/日志  │  原子用量计数           │
-└──────────────────────────────────┴─────────────────────────┘
+```bash
+wrangler secret put DRIVE_PASSWORD
+wrangler secret put DRIVE_BACKENDS   # 可选
+wrangler secret put TURNSTILE_SECRET # 可选
+wrangler deploy
 ```
 
-### KV 存储结构
+5. 访问部署后的 Worker 域名，使用 `DRIVE_PASSWORD` 登录。
 
-| Key 模式 | 内容 |
-|----------|------|
-| `dir:/path/` | 目录索引 JSON 数组 |
-| `session:<ts>:<random>` | 登录会话 |
-| `share:<token>` | 分享链接配置 |
-| `tags:<filepath>` | 文件标签 |
-| `note:<filepath>` | 文件备注 |
-| `dirpass:<path>` | 文件夹密码 hash |
-| `meta:usage` | 用量统计 |
-| `meta:log` | 活动日志 (max 200) |
-| `meta:tags` | 全局标签注册表 |
-| `meta:tokens` | 访问令牌列表 |
-| `.thumb/<key>` | 缩略图 |
-| `.versions/<key>/<ts>` | 历史版本 |
+### 方式二：控制台粘贴部署
+
+1. 登录 Cloudflare Dashboard → Workers & Pages → 创建 Worker。
+2. 打开代码编辑器，将 `PersonalDrive_v5.1.2.js` 全部内容粘贴到 `worker.js`，点击"部署"。
+3. 在 Worker 设置 → 绑定中依次添加：
+   - R2 存储桶绑定：变量名 `DRIVE`
+   - KV Namespace 绑定：变量名 `STORE`
+   - Durable Object 绑定（可选）：变量名 `DIR`，类名按你创建的 DO 类填写，并添加对应 migration
+4. 在"设置 → 变量与机密"中添加环境变量与 Secret（见上表）。
+5. 访问 Worker 域名完成首次登录。
+
+> 提示：Durable Object 为可选组件。未配置时计数器与用量功能自动降级为 KV/本地累加，其余功能不受影响。
 
 ---
 
-## 📡 API 端点
+## 使用说明
 
-所有 API 需 `?token=<session>` 认证（分享和上传链接除外）。
+### 登录
 
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| POST | `/api/login` | 密码登录，返回 token |
-| GET | `/api/list?path=` | 列目录 |
-| POST | `/api/upload?path=` | 上传文件 |
-| GET | `/api/download?path=` | 下载文件 |
-| GET | `/api/preview?path=` | 预览（inline） |
-| GET | `/api/thumb?path=` | 缩略图 |
-| POST | `/api/save?path=` | 保存文本 |
-| DELETE | `/api/delete?path=` | 删除（进回收站） |
-| POST | `/api/batch-delete` | 批量删除 |
-| PUT | `/api/rename` | 重命名 |
-| PUT | `/api/move` | 移动 |
-| POST | `/api/mkdir?path=` | 创建目录 |
-| GET | `/api/search?q=&path=` | 搜索 |
-| GET | `/api/tree` | 目录树 |
-| GET | `/api/zip?path=` | 打包下载 |
-| POST | `/api/unzip` | 解压 |
-| POST | `/api/share` | 创建分享链接 |
-| POST | `/api/upload-link-create` | 创建上传链接 |
-| POST | `/api/folder-pass` | 设置/移除文件夹密码 |
-| GET | `/api/trash` | 回收站列表 |
-| POST | `/api/restore` | 恢复文件 |
-| DELETE | `/api/purge` | 彻底删除 |
-| GET | `/api/versions?path=` | 历史版本列表 |
-| POST | `/api/versions/restore` | 恢复版本 |
-| POST | `/api/tag` | 设置文件标签 |
-| GET | `/api/tags` | 标签列表/筛选 |
-| GET/POST | `/api/note` | 文件备注 |
-| GET | `/api/duplicates` | 重复检测 |
-| GET | `/api/usage` | 用量统计 |
-| GET | `/api/log` | 活动日志 |
-| GET/POST/DELETE | `/api/tokens` | 令牌管理 |
-| GET | `/api/stats` | 统计数据 |
-| POST | `/api/chunk-init` | 分片上传初始化 |
-| POST | `/api/chunk-upload/:id/:idx` | 上传分片 |
-| POST | `/api/chunk-complete` | 完成分片组装 |
+- 访问站点首页，输入管理员密码登录（用户名可任意，用于限频维度；如启用 TOTP 需额外输入动态码）。
+- 会话有效期 7 天；可在"会话管理"中查看并撤销任意会话。
 
----
+### 目录锁
 
-## 🔌 WebDAV 挂载
+- 对目录设置独立密码后，该目录内容需解锁才能访问（列表、下载、预览均校验）。
+- 被锁定目录不可生成分享链接；已存在的分享在访问时也会实时校验锁状态。
 
-把网盘变成本地磁盘。
+### 分享链接
 
-### 配置方法
+- 文件/目录右键或选中后"分享"：可设置密码、有效期（天）、最大访问次数，生成 `{域名}/s/<token>`。
+- 目录分享为可浏览页面，文件分享为下载/预览页。
+- 分享密码错误 5 次后该分享锁定 5 分钟。
 
-1. 打开网盘 → 点 **🔑 令牌** → 创建一个 Token（权限选 Read+Write）
-2. 复制生成的 Token
-3. 在你的 WebDAV 客户端配置：
+### 上传链接
 
-| 参数 | 值 |
-|------|----|
-| URL | `https://yourdomain.com/dav/` |
-| 认证方式 | Bearer Token |
-| Token | 你复制的那个 |
+- 选中目录生成上传链接 `{域名}/u/<token>`，可设有效期与文件数上限；任何人可打开该链接向对应目录上传文件。
 
-### 各平台挂载
+### 公开上传
 
-**Windows：** 此电脑 → 映射网络驱动器 → 输入 URL + Token
+- 配置 `PUBLIC_UPLOAD_DIR` 后，`{域名}/upload` 开放匿名上传页；如需防机器人，同时配置 Turnstile 两键。
 
-**macOS：** Finder → 前往 → 连接服务器 → `https://yourdomain.com/dav/`
+### WebDAV 挂载
 
-**Raidrive（推荐）：** 添加云存储 → WebDAV → 填 URL + Bearer Token
+- 地址：`https://<你的域名>/dav/`
+- 账号：任意用户名；密码：**rw 访问令牌**（在"访问令牌"中生成，不要使用登录密码）
+- 单文件 PUT 上限 100MB；不支持部分 WebDAV 扩展操作，以实际响应为准。
 
-**Cyberduck：** 打开连接 → 协议选 WebDAV → 填信息
+### 访问令牌与 API
 
-### 支持的操作
+- 在"访问令牌"中生成 rw / ro 令牌；ro 令牌仅允许 GET/HEAD 请求。
+- 所有 `/api/*` 接口支持 `Authorization: Bearer <token>` 认证；部分管理接口要求 rw 权限。
 
-- ✅ 浏览目录 (PROPFIND)
-- ✅ 下载文件 (GET)
-- ✅ 上传文件 (PUT)
-- ✅ 创建文件夹 (MKCOL)
-- ✅ 删除文件/目录 (DELETE)
-- ⬜ 重命名/移动 (MOVE) — 未来版本
+### 备份与恢复
+
+- "备份"页可一键创建全量备份（元数据 + 对象索引），备份记录保留在 `.backup/`；可下载备份文件并在恢复时输入备份密码。
+- 建议定期备份并在重大变更前手动创建。
 
 ---
 
-## 🛡️ 安全设计
+## 已知限制与注意事项
 
-| 层面 | 措施 |
-|------|------|
-| 认证 | 密码 → Session Token (7天有效) → sessionStorage 存储 |
-| XSS 防护 | 所有用户输入 `escHtml()` 转义后拼入 DOM |
-| 路径穿越 | `normPath()` 解析 `..`，限制在根目录内 |
-| 文件名注入 | `sanitizeName()` 过滤 `\ / : * ? " < > | \x00-\x1f` |
-| 文件夹锁 | SHA-256 hash 存储，解锁后 session 内免密 |
-| 分享安全 | 链接可设密码 + 访问次数上限 + 过期自动失效 |
-| 客户端加密 | PBKDF2 (100K iterations) → AES-256-GCM，服务端零知识 |
-| WebDAV | 独立 Bearer Token，可设只读，不暴露主密码 |
-| 令牌管理 | 可随时撤销，支持过期时间 |
-
----
-
-## ❓ 常见问题
-
-**Q: 免费版够用吗？**
-A: 10GB R2 + 10万请求/天，日常存文档、照片完全够用。视频多了可能超存储，但请求量很难超。
-
-**Q: 为什么 R2 不要出口流量费？**
-A: Cloudflare R2 的设计就是零 egress 费。这是它比 S3 + CloudFront 便宜的核心原因。
-
-**Q: 不配 Durable Object 能用吗？**
-A: 完全可以。DO 只是缓存加速层，不配的话所有操作走 KV，功能不受影响，只是大目录加载稍慢。
-
-**Q: 怎么备份数据？**
-A: R2 控制台可以直接浏览和下载文件。或者用 WebDAV 挂载后 `rsync`。
-
-**Q: 上传大文件限制？**
-A: Worker 请求体上限 100MB（付费版）。超过 5MB 的文件自动走分片上传，理论无上限。
-
-**Q: 为什么用 AGPL 而不是 MIT？**
-A: 如果你 fork 了这个项目部署给别人用，你需要开源你的修改。自用不限。
-
-**Q: 能多用户吗？**
-A: 当前是单密码模式。可以通过创建多个只读令牌实现"分享访问"，但没有独立用户空间。
+- **去 TOTP 变体**：`PersonalDrive_v5.1.2-nototp.js` 为移除 TOTP 动态验证码功能的变体（删除 TOTP 接口、登录分支与前端两步验证，其余功能不变）。使用该变体时登录仅依赖密码 + 限频保护。
+- **上传上限**：常规上传单文件 500MB；WebDAV PUT 100MB；公开上传默认 100MB（`PUBLIC_UPLOAD_MAX` 可调）；ZIP 解压 50MB；文本编辑 2MB；分片内存拼装 50MB。
+- **结果截断**：目录渲染、标签过滤结果上限 500 项；重复检测哈希组上限 2000 组；孤儿扫描截断时拒绝清理（返回 409）。
+- **KV 最终一致**：目录删除依赖残留检查与重试（最多 3 次）；极端情况下元数据与对象可能存在短暂不一致。
+- **限频固定值**：登录与分享密码限频均为 5 次 / 5 分钟，源码内置不可配置。
+- **Turnstile**：必须同时配置 site key 与 secret 才生效；只配其一视为配置不完整，验证会拒绝放行（fail-closed）。
+- **镜像同步**：`DRIVE_BACKENDS` 默认仅同步 ≤25MB 文件（每后端 `mirrorMaxBytes` 可调）；镜像为尽力同步，异常记录在镜像检查结果中。
+- **IP 过滤**：依赖 `CF-Connecting-IP` 请求头，仅对经 Cloudflare 代理的请求有效。
+- **系统前缀对象**：`.thumb/`（缩略图）、`.versions/`（历史版本）、`.backup/`（备份）对象不建议手动删除，否则对应功能数据丢失。
+- **PWA 缓存**：Service Worker 启用离线缓存，更新版本后请刷新或重新加载以获取最新前端资源。
 
 ---
 
-## 📝 更新日志
+## 版本历史
 
-### v5.1 — 2026.09.11
-
-- ✨ 新增 WebDAV 协议支持 (`/dav/`)
-- ✨ 新增多令牌管理（只读/读写权限）
-- ✨ 新增音乐播放列表（连续播放 + 上下曲）
-- ✨ 新增图片幻灯片 + EXIF 信息展示
-- ✨ 新增视频帧截图
-- ✨ 新增 PDF 在线预览 (PDF.js ESM)
-- ✨ 新增上传前图片压缩（客户端 Canvas）
-- ✨ 新增上传去重检测
-- ✨ 新增批量重命名 UI (`{n}` `{d}` 模式)
-- ✨ 新增活动日志面板
-- ✨ 新增存储统计图表 (Chart.js)
-- ✨ 新增树目录拖拽移动文件
-- ✨ 新增 PWA 支持（添加到桌面）
-- 🎨 工具栏重新分组排版（浏览/操作/管理三组）
-
-### v5.0 — 2026.09.11
-
-- ✨ 标签系统完整 UI + 侧栏筛选
-- ✨ Markdown 渲染 + 代码语法高亮
-- ✨ 粘贴上传 (`Ctrl+V`)
-- ✨ 键盘快捷键体系
-- ✨ 右键菜单增强（标签/备注/加密）
-- ✨ 客户端 AES-256-GCM 加密
-- ✨ 文件备注功能
-- ✨ 重复文件检测 UI
-
-### v4.4
-
-- 🔧 分享链接访问计数修复（覆盖打开页面而非仅下载）
-- 🎨 工具栏布局优化
+| 版本 | 说明 |
+|---|---|
+| v5.1.1 | 基线版本（单文件 Worker，R2 + KV + DO）。 |
+| **v5.1.2** | 基于代码审查报告完成全量安全修复：33 处替换，覆盖 H1-H4 / M1-M7 / L1-L5 / R1-R8；接口兼容，前端无需改动；验证通过（括号/圆括号平衡校验、替换锚点全部唯一命中）。 |
+| v5.1.2-nototp | v5.1.2 的变体：移除 TOTP 两步验证功能，其余功能与 v5.1.2 一致。 |
 
 ---
 
-## 🗺️ Roadmap
+## 文件清单
 
-- [ ] 多用户空间（独立文件夹 + 配额）
-- [ ] 文件版本 diff 对比
-- [ ] 全局搜索增强（文件内容搜索）
-- [ ] 移动端手势操作（滑动删除、长按多选）
-- [ ] 自定义文件图标
-- [ ] 批量下载为 ZIP（跨目录选择）
-- [ ] 回收站预览
-- [ ] 分享页面自定义样式
-- [ ] 文件夹排序（拖拽调整目录树顺序）
-- [ ] 国际化扩展（日语、韩语）
-
----
-
-## 🙏 Acknowledgments
-
-- [Cloudflare Workers](https://workers.cloudflare.com) — 免费全球边缘计算
-- [marked.js](https://marked.js.org) — Markdown 渲染
-- [highlight.js](https://highlightjs.org) — 代码高亮
-- [PDF.js](https://mozilla.github.io/pdf.js/) — PDF 渲染
-- [Chart.js](https://www.chartjs.org) — 数据可视化
-- [ExifReader](https://exifreader.org) — EXIF 解析
-
----
-
-<div align="center">
-
-## ☕ 联系
-
-[GitHub](https://github.com/BlueDriftHK) · [X @BlueDriftHK](https://x.com/BlueDriftHK) · [Telegram @BlueDriftHK](https://t.me/BlueDriftHK)
-
-**Made with ☁️ by BlueDriftHK**
-
-</div>
+- `PersonalDrive_v5.1.2.js`：主部署文件（单文件 Worker）。
+- `PersonalDrive_v5.1.1_代码审查报告.md`：v5.1.1 代码审查报告（问题项与修复建议来源）。
+- `PersonalDrive_v5.1.2_修复对照清单.md`：v5.1.2 修复对照清单（问题项 → 修复方式 → 行号）。
+*（内容由AI生成，仅供参考）*
