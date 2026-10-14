@@ -539,7 +539,8 @@ export class DirStore {
       return json({ value: v });
     }
     if (op === 'counterDel' && req.method === 'POST') {
-      await this.state.storage.deleteAll();
+      // 只清计数器自身，避免误删同 DO 实例里的其它键
+      await this.state.storage.delete('v');
       return json({ ok: true });
     }
 
@@ -1675,7 +1676,7 @@ async function handleRestoreVersion(env, filePath, ts) {
 }
 
 // ===== Chunked Upload =====
-async function handleChunkInit(env, fileName, totalSize, hash, dirPath) {
+async function handleChunkInit(env, fileName, totalSize, hash, dirPath, mime) {
   const uploadId = randToken().substring(0, 16);
   dirPath = normPath(dirPath);
   const size = parseInt(totalSize, 10) || 0;
@@ -1684,7 +1685,7 @@ async function handleChunkInit(env, fileName, totalSize, hash, dirPath) {
     const u = await getUsage(env);
     if ((u.used || 0) + size > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413);
   }
-  await env.STORE.put('chunk:' + uploadId, JSON.stringify({ fileName: sanitizeName(fileName), totalSize: size, hash: hash || '', dirPath, chunks: 0, created: Date.now() }), { expirationTtl: 86400 });
+  await env.STORE.put('chunk:' + uploadId, JSON.stringify({ fileName: sanitizeName(fileName), totalSize: size, hash: hash || '', dirPath, mime: String(mime || ''), chunks: 0, created: Date.now() }), { expirationTtl: 86400 });
   if (isHex64(hash)) {
     try {
       const r = await instantStore(env, hash, fileName, dirPath, size);
@@ -1747,7 +1748,7 @@ async function handleChunkComplete(req, env, uploadId) {
   let done = false;
   if (total > 1) {
     try {
-      const multipart = await env.DRIVE.createMultipartUpload(key, { httpMetadata: { contentType: 'application/octet-stream' } });
+      const multipart = await env.DRIVE.createMultipartUpload(key, { httpMetadata: { contentType: meta.mime || 'application/octet-stream' } });
       try {
         const uploaded = [];
         for (let i = 0; i < total; i += 10) {
@@ -1785,7 +1786,7 @@ async function handleChunkComplete(req, env, uploadId) {
     }
     const buf = new Uint8Array(totalLen); let offset = 0;
     for (const p of parts) { buf.set(p, offset); offset += p.byteLength; }
-    try { await env.DRIVE.put(key, buf, { httpMetadata: { contentType: 'application/octet-stream' } }); }
+    try { await env.DRIVE.put(key, buf, { httpMetadata: { contentType: meta.mime || 'application/octet-stream' } }); }
     catch (e) { return json({ error: 'Assembly failed' }, 500); }
   }
   try { await mirrorPut(env, key); } catch (e) {}
@@ -1806,7 +1807,7 @@ async function handleChunkComplete(req, env, uploadId) {
   if (meta.hash) { try { await env.STORE.put('hash:' + meta.hash, JSON.stringify({ key, time: Date.now() })); } catch (e) {} }
 
   const finalSize = meta.totalSize || 0;
-  const entry = { name, type: 'file', size: finalSize, mime: '', time: new Date().toISOString(), hash: meta.hash || '' };
+  const entry = { name, type: 'file', size: finalSize, mime: meta.mime || '', time: new Date().toISOString(), hash: meta.hash || '' };
   await upsertDirItem(env, outDir, entry);
   if (oldItem) await addUsage(env, finalSize - (oldItem.size || 0), 0);
   else await addUsage(env, finalSize, 1);
@@ -1918,18 +1919,33 @@ async function shareGuard(env, shareToken, req, countHit, needPw) {
   return { data };
 }
 // 分享 /data：密码未通过前不返回真实元数据（仅返回 needPassword + hits/max）
+// 计入一次分享访问（仅当密码（如有）已通过时调用），同时校验访问上限
+async function shareCount(env, shareToken, data) {
+  if (data.max > 0) {
+    const before = data.hits || 0;
+    if (before >= data.max) return { resp: json({ error: 'Access limit reached', hits: data.max, max: data.max, name: data.name }, 403) };
+    const atom = await counterAdd(env, 'share:' + shareToken, 1);
+    const hits = (atom == null) ? (before + 1) : atom;
+    data.hits = hits;
+    try { await env.STORE.put('share:' + shareToken, JSON.stringify(data), { expirationTtl: Math.max(60, Math.ceil((data.exp - Date.now()) / 1000) + 60) }); } catch (e) {}
+    if (data.max > 0 && hits > data.max) return { resp: json({ error: 'Access limit reached', hits: data.max, max: data.max, name: data.name }, 403) };
+  }
+  return { ok: true };
+}
 async function handleShareData(env, shareToken, req) {
   try {
     const pw = new URL(req.url).searchParams.get('pw') || '';
-    const hasPw = pw !== '';
-    // 未带 pw 视为"首次打开"，计一次访问；带 pw 视为"验证尝试"，不重复计数
-    const g = await shareGuard(env, shareToken, req, !hasPw, false);
+    // 先取分享数据（不计数、不要求密码）。仅在密码（若设置）验证通过后才计入访问次数，
+    // 否则密码保护链接会在尚未认证时就被匿名消耗掉访问配额（修复：未授权即扣减访问次数）
+    const g = await shareGuard(env, shareToken, req, false, false);
     if (g.resp) return g.resp;
     const d = g.data;
     const stats = { hits: d.max > 0 ? Math.min(d.hits || 0, d.max) : (d.hits || 0), max: d.max || 0 };
     if (d.pwHash && !await verifyPassword(pw, { hash: d.pwHash, salt: d.pwSalt })) {
       return json(Object.assign({ needPassword: true, hasPassword: true }, stats));
     }
+    const c = await shareCount(env, shareToken, d);
+    if (c.resp) return c.resp;
     return json(Object.assign({
       type: d.type || 'file', name: d.name, size: d.size || 0, mime: d.mime || ''
     }, stats));
@@ -5155,7 +5171,7 @@ async function uploadChunked(file,div,thumb){
       }catch(e){}
     }
     if(!uploadId){
-      var init=await api('/api/chunk-init',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fileName:file.name,totalSize:file.size,hash:hash,path:cur})});
+      var init=await api('/api/chunk-init',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fileName:file.name,totalSize:file.size,hash:hash,path:cur,mime:file.type})});
       if(init.instant){setDone(div);return}
       if(!init.uploadId){setFail(div,t('upFail'));return}
       uploadId=init.uploadId;
@@ -6273,7 +6289,7 @@ export default {
             if (f) return await handleTagFilter(env, f);
             return await handleGetTags(env);
           }
-          if (p === '/api/chunk-init' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.path || '/'); if (g) return g; return await handleChunkInit(env, b.fileName, b.totalSize, b.hash, b.path || '/'); }
+          if (p === '/api/chunk-init' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.path || '/'); if (g) return g; return await handleChunkInit(env, b.fileName, b.totalSize, b.hash, b.path || '/', b.mime); }
           if (p.startsWith('/api/chunk-upload/') && req.method === 'POST') { const parts = p.split('/'); return await handleChunkUpload(req, env, parts[3], parts[4]); }
           if (p === '/api/chunk-complete' && req.method === 'POST') { const b = await req.json(); return await handleChunkComplete(req, env, b.uploadId); }
           if (p === '/api/chunk-status') return await handleChunkStatus(env, url.searchParams.get('id') || '');
