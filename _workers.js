@@ -21,10 +21,10 @@ const USAGE_DO_NAME = '__usage__';
 
 // ===== Helpers =====
 function json(data, status) {
-  return new Response(JSON.stringify(data), { status: status || 200, headers: { 'Content-Type': 'application/json' } });
+  return new Response(JSON.stringify(data), { status: status || 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
 }
 function html(body, status) {
-  return new Response(body, { status: status || 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  return new Response(body, { status: status || 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' } });
 }
 function randToken() {
   return Array.from(crypto.getRandomValues(new Uint8Array(24))).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -1299,7 +1299,13 @@ async function handleDelete(env, path) {
     // M4: 删除目录前检查子孙锁定子树，防止绕过锁定
     const lockedSub = await hasLockedSubtree(env, path + '/');
     if (lockedSub) return json({ error: 'Locked', path: lockedSub }, 423);
-    await recursiveDeleteDir(env, path + '/');
+    // 目录删除改为进入回收站（与文件一致，可恢复）：整体搬入 /trash/<id>/，不再永久销毁
+    const tid = 'd' + randToken().substring(0, 8);
+    await recursiveMoveDir(env, path + '/', '/.trash/' + tid + '/');
+    const trash = await getDir(env, '/.trash/');
+    trash.push({ name, type: 'dir', size: entry.dirSize || 0, mime: '', originalPath: path + '/', deletedAt: new Date().toISOString(), id: tid });
+    await putDir(env, '/.trash/', trash);
+    try { await addLog(env, 'del', path + '/', '目录 → 回收站'); } catch (e) {}
     return json({ ok: true });
   }
   await deleteThumb(env, path.replace(/^\//, ''));
@@ -1376,7 +1382,19 @@ async function handleRestore(env, id) {
   let idx = trash.findIndex(i => i.id === id);
   if (idx < 0) idx = trash.findIndex(i => i.name === id);
   if (idx < 0) return { error: 'Not in trash', status: 404 };
-  const entry = trash[idx]; const dir = parentOf(entry.originalPath);
+  const entry = trash[idx];
+  if (entry.type === 'dir') {
+    // 恢复目录：把 /trash/<id>/ 整体搬回 originalPath，并重建父目录引用
+    const pdir = parentOf(entry.originalPath);
+    const existing = await findDirItem(env, pdir, entry.name);
+    if (existing.item) return { error: 'Name exists', status: 409 };
+    if (entry.id) await recursiveMoveDir(env, '/.trash/' + entry.id + '/', entry.originalPath);
+    await upsertDirItem(env, pdir, { name: entry.name, type: 'dir', time: entry.deletedAt, size: entry.size });
+    trash.splice(idx, 1); await putDir(env, '/.trash/', trash);
+    try { await addLog(env, 'res', entry.originalPath, '从回收站恢复目录'); } catch (e) {}
+    return { ok: true };
+  }
+  const dir = parentOf(entry.originalPath);
   const existing = await findDirItem(env, dir, entry.name);
   if (existing.item) return { error: 'Name exists', status: 409 };
   await upsertDirItem(env, dir, { name: entry.name, type: entry.type, size: entry.size, mime: entry.mime, time: entry.deletedAt });
@@ -1398,11 +1416,15 @@ async function handlePurge(env, id) {
   if (id === 'ALL') {
     let sz = 0, ct = 0;
     for (const item of trash) {
-      const k = item.originalPath.replace(/^\//, '');
-      await deleteAndMirror(env, k);
-      await deleteThumb(env, k);
-      await deleteVersions(env, k);
-      sz += item.size || 0; ct++;
+      if (item.type === 'dir' && item.id) {
+        await recursiveDeleteDir(env, '/.trash/' + item.id + '/');  // 内部已扣减用量
+      } else {
+        const k = item.originalPath.replace(/^\//, '');
+        await deleteAndMirror(env, k);
+        await deleteThumb(env, k);
+        await deleteVersions(env, k);
+        sz += item.size || 0; ct++;
+      }
     }
     await putDir(env, '/.trash/', []); await addUsage(env, -sz, -ct); return json({ ok: true });
   }
@@ -1410,6 +1432,10 @@ async function handlePurge(env, id) {
   if (idx < 0) idx = trash.findIndex(i => i.name === id);
   if (idx < 0) return json({ error: 'Not in trash' }, 404);
   const entry = trash[idx];
+  if (entry.type === 'dir' && entry.id) {
+    await recursiveDeleteDir(env, '/.trash/' + entry.id + '/');  // 内部已扣减用量
+    trash.splice(idx, 1); await putDir(env, '/.trash/', trash); return json({ ok: true });
+  }
   const k = entry.originalPath.replace(/^\//, '');
   await deleteAndMirror(env, k);
   await deleteThumb(env, k);
@@ -1787,6 +1813,13 @@ async function handleChunkComplete(req, env, uploadId) {
   const key = outDir.replace(/^\//, '') + name;
   const total = Math.max(0, parseInt(meta.chunks, 10) || 0);
   if (!total) return json({ error: 'No chunks uploaded' }, 400);
+
+  // 容错：以"已收到分片清单"为准校验完整性（不再单一依赖 meta.chunks），缺失则返回缺失下标便于前端续传
+  const got = await listGotChunks(env, uploadId);
+  const gotSet = new Set(got);
+  const missing = [];
+  for (let i = 0; i < total; i++) if (!gotSet.has(i)) missing.push(i);
+  if (missing.length) return json({ error: 'Chunks incomplete', missing, total, canResume: true }, 400);
 
   const oldRes = await findDirItem(env, outDir, name);
   const oldItem = oldRes.item;
@@ -3964,14 +3997,14 @@ body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;ba
 .input-addon,.search-box button{border-left:1px solid var(--sys-separator);background:transparent;color:var(--sys-blue)}
 .input-addon:hover,.search-box button:hover{background:var(--sys-fill-2);color:var(--sys-blue-hover)}
 
-/* 工具栏 */
-.toolbar-card{padding:16px 18px}
+/* 工具栏（z-index 提升，避免毛玻璃建立的层叠上下文被内容卡片盖住导致下拉穿模） */
+.toolbar-card{padding:16px 18px;position:relative;z-index:5}
 .toolbar-row.main{margin-bottom:14px;position:relative;gap:10px}
 .toolbar-row.main .btn.primary{padding:10px 20px}
 .toolbar-row.main #btnMore{margin-left:auto;min-width:42px;font-size:18px;line-height:1;padding:7px 12px;border-radius:980px}
 
 /* ⋯ 下拉 */
-.hdr-menu{position:absolute;top:calc(100% + 8px);right:0;z-index:600;width:280px;max-height:74vh;overflow:auto;
+.hdr-menu{position:absolute;top:calc(100% + 8px);right:0;z-index:600;width:280px;max-height:74vh;overflow:auto;display:none;
   background:rgba(255,255,255,0.82);border:1px solid rgba(0,0,0,0.08);
   box-shadow:0 20px 50px rgba(31,35,40,0.22);padding:6px;border-radius:16px}
 :root.dark .hdr-menu{background:rgba(22,27,34,0.80);border-color:rgba(255,255,255,0.12);box-shadow:0 24px 60px rgba(0,0,0,0.6)}
@@ -6496,11 +6529,15 @@ export default {
           const deletedTime = item.deletedAt ? new Date(item.deletedAt).getTime() : 0;
           if (!Number.isFinite(deletedTime) || deletedTime <= 0) { keep.push(item); continue; }
           if (now - deletedTime > 30 * 86400 * 1000) {
-            const k = item.originalPath.replace(/^\//, '');
-            await deleteAndMirror(env, k);
-            await deleteThumb(env, k);
-            await deleteVersions(env, k);
-            totalSize += item.size || 0; purged++;
+            if (item.type === 'dir' && item.id) {
+              await recursiveDeleteDir(env, '/.trash/' + item.id + '/');  // 内部已扣减用量
+            } else {
+              const k = item.originalPath.replace(/^\//, '');
+              await deleteAndMirror(env, k);
+              await deleteThumb(env, k);
+              await deleteVersions(env, k);
+              totalSize += item.size || 0; purged++;
+            }
           } else { keep.push(item); }
         }
         if (purged > 0) { await putDir(env, '/.trash/', keep); await addUsage(env, -totalSize, -purged); }
