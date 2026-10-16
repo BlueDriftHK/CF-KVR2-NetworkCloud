@@ -3,690 +3,1347 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Personal Drive · 你的私有云盘，部署在 Cloudflare 边缘</title>
-<meta name="description" content="Personal Drive v5.1.2 —— 基于 Cloudflare R2 + KV + Durable Object 的私有网盘。Apple 风界面、分片续传、回收站、分享管控、端到端加密可选、WebDAV 与边缘加速。" />
+<title>CF-KVR2-NetworkCloud · 把整个网盘装进一个文件</title>
+<meta name="description" content="单文件 Cloudflare Worker 网盘（v5.2.0）：R2 + KV + 可选 Durable Object。零依赖、无构建、粘贴即用；内置二次验证、目录锁、细粒度分享、备份恢复、WebDAV、PWA 与防配额耗尽预算。" />
+<meta name="theme-color" content="#0071e3" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#0b0b0d" media="(prefers-color-scheme: dark)" />
+<meta name="color-scheme" content="light dark" />
+
+<!-- 社交分享卡片（OG/Twitter）：当前为纯文字卡片，不依赖任何图片。
+     若以后想加缩略图，把图片放到 docs/og.png（1200×630）后取消下面两行的注释即可。 -->
+<meta property="og:type" content="website" />
+<meta property="og:title" content="CF-KVR2-NetworkCloud · 把整个网盘装进一个文件" />
+<meta property="og:description" content="单文件 Cloudflare Worker 网盘：R2 + KV + 可选 DO，零依赖零构建，粘贴即用。四视图、分享管控、目录锁、二次验证、备份恢复、WebDAV、PWA。" />
+<!-- <meta property="og:image" content="docs/og.png" /> -->
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="CF-KVR2-NetworkCloud · 单文件网盘" />
+<meta name="twitter:description" content="粘贴到 Cloudflare Worker 就能跑的私有网盘：零依赖、无构建、444 项断言全绿。" />
+<!-- <meta name="twitter:image" content="docs/og.png" /> -->
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230071e3'/%3E%3Cpath d='M20 41a8 8 0 0 1 .9-15.9A11 11 0 0 1 41.5 28 7.5 7.5 0 0 1 44 41z' fill='%23fff'/%3E%3C/svg%3E" />
+
 <style>
+  /* ================= 设计 token（收敛版 Apple 风） ================= */
   :root {
-    --blue: #0071e3; --blue-2: #6c5ce7; --green: #34c759; --red: #ff3b30; --orange: #ff9f0a; --pink:#ff2d92;
-    --bg: #fbfbfd; --bg-2: #f5f5f7; --card: rgba(255,255,255,0.72); --card-solid: #ffffff;
-    --text: #1d1d1f; --text-2: #515154; --text-3: #86868b;
-    --sep: rgba(0,0,0,0.08); --sep-op: rgba(0,0,0,0.16);
-    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06), 0 6px 18px rgba(0,0,0,0.05);
-    --shadow-lg: 0 20px 60px rgba(0,0,0,0.14);
-    --glow-1: rgba(0,113,227,0.35); --glow-2: rgba(108,92,231,0.30);
-    --radius: 22px; --radius-sm: 14px;
+    --blue: #0071e3; --blue-hi: #0077ed; --violet: #6c5ce7;
+    --green: #34c759; --red: #ff3b30; --orange: #ff9f0a;
+    --bg: #ffffff; --bg-2: #f6f6f8; --card: #ffffff; --card-2: #fbfbfd;
+    --text: #1d1d1f; --text-2: #4d4d52; --text-3: #86868b;
+    --sep: rgba(0,0,0,.09); --sep-2: rgba(0,0,0,.16);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.05), 0 4px 14px rgba(0,0,0,.04);
+    --shadow-md: 0 10px 34px rgba(0,0,0,.09);
+    --radius: 16px; --radius-sm: 11px; --radius-pill: 980px;
+    --wrap: 1080px;
+    --ease: cubic-bezier(.22,.61,.36,1);
+    --t-fast: .16s var(--ease); --t: .28s var(--ease); --t-slow: .6s var(--ease);
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, "Liberation Mono", monospace;
   }
   :root.dark {
-    --bg: #000000; --bg-2: #0a0a0c; --card: rgba(22,22,26,0.66); --card-solid: #16161a;
-    --text: #f5f5f7; --text-2: #aeaeb2; --text-3: #8e8e93;
-    --sep: rgba(255,255,255,0.10); --sep-op: rgba(255,255,255,0.20);
-    --shadow-sm: 0 1px 3px rgba(0,0,0,0.4), 0 8px 24px rgba(0,0,0,0.45);
-    --shadow-lg: 0 30px 80px rgba(0,0,0,0.7);
-    --glow-1: rgba(0,113,227,0.45); --glow-2: rgba(108,92,231,0.40);
+    --bg: #0b0b0d; --bg-2: #121216; --card: #16161a; --card-2: #1b1b20;
+    --text: #f5f5f7; --text-2: #b6b6bc; --text-3: #8e8e93;
+    --sep: rgba(255,255,255,.10); --sep-2: rgba(255,255,255,.20);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.5), 0 6px 18px rgba(0,0,0,.35);
+    --shadow-md: 0 16px 44px rgba(0,0,0,.55);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html { scroll-behavior: smooth; }
+  html { scroll-behavior: smooth; scroll-padding-top: 76px; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: var(--bg); color: var(--text); line-height: 1.6; -webkit-font-smoothing: antialiased; overflow-x: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.62;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; overflow-x: hidden;
   }
   a { color: inherit; text-decoration: none; }
-  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 22px; }
-  .grad-text { background: linear-gradient(120deg, var(--blue), var(--blue-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
-  code { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: .9em; background: var(--bg-2); padding: 1px 6px; border-radius: 6px; border: 1px solid var(--sep); }
+  img { max-width: 100%; display: block; }
+  code { font-family: var(--mono); font-size: .88em; background: var(--bg-2); padding: 1px 6px; border-radius: 6px; border: 1px solid var(--sep); }
+  .wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 22px; }
+  .grad-text { background: linear-gradient(100deg, var(--blue), var(--violet)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .muted { color: var(--text-3); }
+  .small { font-size: 13px; }
 
-  /* ---------- Nav ---------- */
-  nav { position: sticky; top: 0; z-index: 100; backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px); background: color-mix(in srgb, var(--bg) 68%, transparent); border-bottom: 1px solid var(--sep); }
-  .nav-in { display: flex; align-items: center; gap: 18px; height: 56px; }
-  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; letter-spacing: .2px; }
-  .brand .logo { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; font-size: 17px; background: linear-gradient(140deg, var(--blue), var(--blue-2)); color: #fff; box-shadow: 0 6px 16px var(--glow-1); }
-  .nav-links { display: flex; gap: 4px; margin-left: auto; }
-  .nav-links a { font-size: 14px; color: var(--text-2); padding: 8px 12px; border-radius: 980px; transition: .2s; }
+  /* 顶部滚动进度 */
+  #progress { position: fixed; top: 0; left: 0; height: 2px; width: 0; background: linear-gradient(90deg, var(--blue), var(--violet)); z-index: 200; transition: width .08s linear; }
+
+  /* ================= 导航 ================= */
+  nav {
+    position: sticky; top: 0; z-index: 100;
+    backdrop-filter: saturate(180%) blur(18px); -webkit-backdrop-filter: saturate(180%) blur(18px);
+    background: var(--bg);
+    background: color-mix(in srgb, var(--bg) 80%, transparent);
+    border-bottom: 1px solid var(--sep);
+  }
+  .nav-in { display: flex; align-items: center; gap: 14px; height: 58px; }
+  .brand { display: flex; align-items: center; gap: 9px; font-weight: 650; font-size: 16px; letter-spacing: .1px; white-space: nowrap; }
+  .brand .logo { width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center; background: linear-gradient(140deg, var(--blue), var(--violet)); color: #fff; font-size: 15px; }
+  .brand small { font-size: 11px; color: var(--text-3); font-weight: 500; }
+  .nav-links { display: flex; gap: 2px; margin-left: auto; }
+  .nav-links a { font-size: 13.5px; color: var(--text-2); padding: 7px 11px; border-radius: var(--radius-pill); transition: color var(--t-fast), background var(--t-fast); }
   .nav-links a:hover { color: var(--text); background: var(--sep); }
-  .nav-cta { display: flex; align-items: center; gap: 10px; }
-  .ico-btn { width: 38px; height: 38px; border-radius: 980px; border: 1px solid var(--sep); background: var(--card); color: var(--text); cursor: pointer; font-size: 16px; display: grid; place-items: center; transition: .2s; }
-  .ico-btn:hover { background: var(--sep-op); }
-  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 22px; border-radius: 980px; font-size: 15px; font-weight: 600; cursor: pointer; border: none; transition: transform .15s, box-shadow .2s, background .2s; }
-  .btn.primary { background: var(--blue); color: #fff; box-shadow: 0 8px 22px var(--glow-1); }
-  .btn.primary:hover { transform: translateY(-1px); background: #0077ed; }
-  .btn.ghost { background: var(--card-solid); color: var(--text); border: 1px solid var(--sep); }
-  .btn.ghost:hover { background: var(--sep); }
+  .nav-links a.on { color: var(--blue); background: color-mix(in srgb, var(--blue) 12%, transparent); }
+  .nav-cta { display: flex; align-items: center; gap: 8px; }
+  .ico-btn { width: 36px; height: 36px; border-radius: var(--radius-pill); border: 1px solid var(--sep); background: var(--card); color: var(--text); cursor: pointer; font-size: 15px; display: grid; place-items: center; transition: background var(--t-fast), transform var(--t-fast); }
+  .ico-btn:hover { background: var(--bg-2); transform: translateY(-1px); }
+  .btn { display: inline-flex; align-items: center; gap: 7px; padding: 10px 19px; border-radius: var(--radius-pill); font-size: 14.5px; font-weight: 600; cursor: pointer; border: 1px solid transparent; transition: transform var(--t-fast), box-shadow var(--t-fast), background var(--t-fast), border-color var(--t-fast); }
+  .btn.primary { background: var(--blue); color: #fff; }
+  .btn.primary:hover { background: var(--blue-hi); transform: translateY(-1px); box-shadow: 0 8px 20px color-mix(in srgb, var(--blue) 30%, transparent); }
+  .btn.ghost { background: var(--card); color: var(--text); border-color: var(--sep-2); }
+  .btn.ghost:hover { background: var(--bg-2); transform: translateY(-1px); }
+  .btn.sm { padding: 7px 13px; font-size: 13px; }
 
-  /* ---------- Hero ---------- */
-  .hero { position: relative; padding: 84px 0 60px; text-align: center; overflow: hidden; }
-  .hero .orb { position: absolute; border-radius: 50%; filter: blur(70px); opacity: .5; z-index: 0; pointer-events: none; }
-  .orb.a { width: 440px; height: 440px; background: var(--glow-1); top: -130px; left: 4%; }
-  .orb.b { width: 380px; height: 380px; background: var(--glow-2); top: -50px; right: 3%; }
-  .orb.c { width: 300px; height: 300px; background: rgba(255,45,146,0.22); top: 120px; left: 46%; }
-  .hero .inner { position: relative; z-index: 1; }
-  .eyebrow { display: inline-block; font-size: 13px; font-weight: 600; color: var(--blue); background: color-mix(in srgb, var(--blue) 12%, transparent); padding: 6px 14px; border-radius: 980px; margin-bottom: 20px; }
-  .hero h1 { font-size: clamp(38px, 6vw, 68px); line-height: 1.05; font-weight: 700; letter-spacing: -.02em; }
-  .hero p.sub { font-size: clamp(17px, 2.4vw, 21px); color: var(--text-2); max-width: 660px; margin: 20px auto 32px; }
-  .hero-cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
-  .hero-meta { margin-top: 26px; font-size: 13px; color: var(--text-3); }
+  /* ================= Hero ================= */
+  .hero { padding: 74px 0 46px; text-align: center; }
+  .hero .tag {
+    display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-2);
+    border: 1px solid var(--sep); background: var(--card); padding: 6px 13px; border-radius: var(--radius-pill);
+  }
+  .hero .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 22%, transparent); }
+  .hero h1 { margin: 20px auto 14px; font-size: clamp(32px, 5.4vw, 56px); line-height: 1.1; letter-spacing: -.02em; font-weight: 700; max-width: 15em; }
+  .hero p.sub { margin: 0 auto; max-width: 44em; font-size: clamp(15px, 1.5vw, 17.5px); color: var(--text-2); }
+  .hero-cta { display: flex; gap: 11px; justify-content: center; flex-wrap: wrap; margin: 26px 0 8px; }
+  .hero-meta { font-size: 13px; color: var(--text-3); margin-top: 10px; }
+  .kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin: 34px 0 0; }
+  .kpi { border: 1px solid var(--sep); background: var(--card); border-radius: var(--radius-sm); padding: 13px 12px; text-align: center; transition: transform var(--t), border-color var(--t), box-shadow var(--t); }
+  .kpi:hover { transform: translateY(-3px); border-color: var(--sep-2); box-shadow: var(--shadow-sm); }
+  .kpi b { display: block; font-size: 21px; font-weight: 700; letter-spacing: -.01em; }
+  .kpi span { font-size: 11.5px; color: var(--text-3); }
 
-  /* stats */
-  .stats { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; margin-top: 40px; }
-  .stat { background: var(--card); border: 1px solid var(--sep); border-radius: 18px; padding: 18px 26px; min-width: 150px; box-shadow: var(--shadow-sm); }
-  .stat .num { font-size: 30px; font-weight: 700; letter-spacing: -.02em; }
-  .stat .lab { font-size: 13px; color: var(--text-3); margin-top: 2px; }
+  /* ================= 通用区块 ================= */
+  section { padding: 66px 0; }
+  section.alt { background: var(--bg-2); }
+  .sec-head { max-width: 46em; margin-bottom: 30px; }
+  .sec-head.center { margin-left: auto; margin-right: auto; text-align: center; }
+  .tag-label { display: inline-block; font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--blue); margin-bottom: 10px; }
+  h2 { font-size: clamp(24px, 3.2vw, 34px); line-height: 1.22; letter-spacing: -.015em; font-weight: 700; }
+  .sec-head p { margin-top: 11px; color: var(--text-2); font-size: 15.5px; }
+  .grid { display: grid; gap: 12px; }
+  .g-2 { grid-template-columns: repeat(2, 1fr); }
+  .g-3 { grid-template-columns: repeat(3, 1fr); }
+  .g-4 { grid-template-columns: repeat(4, 1fr); }
+  .card { border: 1px solid var(--sep); background: var(--card); border-radius: var(--radius); padding: 18px; transition: transform var(--t), border-color var(--t), box-shadow var(--t); }
+  .card:hover { transform: translateY(-3px); border-color: var(--sep-2); box-shadow: var(--shadow-sm); }
+  .card h3 { font-size: 15.5px; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+  .card h3 .ci { width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; font-size: 14px; background: var(--bg-2); flex: 0 0 auto; }
+  .card p { margin-top: 8px; font-size: 13.5px; color: var(--text-2); }
+  .card ul { margin: 9px 0 0 0; padding-left: 0; list-style: none; }
+  .card ul li { font-size: 13px; color: var(--text-2); padding: 3px 0 3px 16px; position: relative; }
+  .card ul li::before { content: "·"; position: absolute; left: 5px; color: var(--blue); font-weight: 700; }
+  .note { font-size: 13px; color: var(--text-3); margin-top: 14px; }
 
-  /* ---------- App mockup ---------- */
-  .mock { margin: 54px auto 0; max-width: 900px; border-radius: 20px; overflow: hidden; text-align: left; background: var(--card-solid); border: 1px solid var(--sep); box-shadow: var(--shadow-lg); }
-  .mock-bar { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--sep); background: var(--bg-2); }
-  .dot { width: 11px; height: 11px; border-radius: 50%; } .dot.r { background: #ff5f57; } .dot.y { background: #febc2e; } .dot.g { background: #28c840; }
-  .mock-url { margin-left: 12px; font-size: 12px; color: var(--text-3); background: var(--bg); padding: 5px 12px; border-radius: 980px; border: 1px solid var(--sep); }
-  .mock-body { padding: 18px; }
-  .mock-tool { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
-  .mock-search { flex: 1; min-width: 160px; background: var(--bg-2); border: 1px solid var(--sep); border-radius: 980px; padding: 9px 16px; font-size: 13px; color: var(--text-3); }
-  .mock-chip { font-size: 12px; padding: 7px 13px; border-radius: 980px; background: var(--bg-2); border: 1px solid var(--sep); color: var(--text-2); }
-  .mock-chip.on { background: var(--blue); color: #fff; border-color: var(--blue); }
-  .mock-bc { font-size: 13px; color: var(--text-3); margin-bottom: 14px; } .mock-bc b { color: var(--text); font-weight: 600; }
-  .mock-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
-  .mock-item { border: 1px solid var(--sep); border-radius: 14px; padding: 14px; background: var(--bg); display: flex; flex-direction: column; gap: 6px; }
-  .mock-item .ic { font-size: 26px; } .mock-item .nm { font-size: 13px; font-weight: 600; } .mock-item .sz { font-size: 11px; color: var(--text-3); }
+  /* ================= 界面预览（纯 CSS 绘制，零素材，随主题变色） ================= */
+  .previews { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  .pv { border: 1px solid var(--sep); border-radius: var(--radius); background: var(--card-2); padding: 12px 12px 10px; transition: transform var(--t), box-shadow var(--t), border-color var(--t); }
+  .pv:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); border-color: var(--sep-2); }
+  .pv .pv-cap { display: flex; align-items: baseline; gap: 8px; margin-top: 10px; font-size: 12.5px; color: var(--text-2); }
+  .pv .pv-cap b { font-size: 13.5px; color: var(--text); font-weight: 650; }
+  .pv .pv-cap span { margin-left: auto; color: var(--text-3); font-size: 11.5px; white-space: nowrap; }
+  .pv .pv-tag { display: inline-block; font-size: 10.5px; color: var(--blue); border: 1px solid color-mix(in srgb, var(--blue) 30%, var(--sep)); background: color-mix(in srgb, var(--blue) 7%, transparent); border-radius: var(--radius-pill); padding: 1px 8px; margin-bottom: 8px; }
 
-  /* ---------- Sections ---------- */
-  section { padding: 76px 0; }
-  .sec-head { text-align: center; max-width: 720px; margin: 0 auto 46px; }
-  .sec-head .tag { font-size: 13px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--blue); }
-  .sec-head h2 { font-size: clamp(28px, 4vw, 42px); font-weight: 700; letter-spacing: -.02em; margin: 10px 0 12px; }
-  .sec-head p { color: var(--text-2); font-size: 17px; }
+  .win { border: 1px solid var(--sep); border-radius: 12px; overflow: hidden; background: var(--card); }
+  .win .win-bar { display: flex; align-items: center; gap: 5px; padding: 7px 9px; border-bottom: 1px solid var(--sep); background: var(--bg-2); }
+  .win .win-bar i { width: 7px; height: 7px; border-radius: 50%; background: var(--sep-2); }
+  .win .win-bar .url { margin-left: 7px; flex: 1; height: 15px; border-radius: 8px; background: var(--card); border: 1px solid var(--sep); display: flex; align-items: center; padding: 0 8px; font-family: var(--mono); font-size: 9.5px; color: var(--text-3); overflow: hidden; white-space: nowrap; }
+  .win .win-body { display: flex; height: 216px; }
+  .mk-side { width: 72px; flex: 0 0 auto; border-right: 1px solid var(--sep); padding: 8px 6px; display: flex; flex-direction: column; gap: 5px; background: var(--card-2); }
+  .mk-nav { height: 13px; border-radius: 4px; background: var(--sep); }
+  .mk-nav.on { background: color-mix(in srgb, var(--blue) 26%, transparent); }
+  .mk-side .lab { height: 5px; width: 40%; border-radius: 3px; background: var(--sep); margin: 6px 0 1px 3px; }
+  .mk-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .mk-tools { display: flex; align-items: center; gap: 4px; padding: 7px 8px; border-bottom: 1px solid var(--sep); background: var(--card); }
+  .mk-btn { height: 15px; width: 24px; border-radius: 5px; background: var(--sep); }
+  .mk-btn.pri { background: var(--blue); width: 30px; }
+  .mk-search { flex: 1; min-width: 40px; height: 15px; border-radius: 5px; border: 1px solid var(--sep); background: var(--bg-2); }
+  .mk-body { padding: 8px; display: flex; flex-direction: column; gap: 6px; overflow: hidden; flex: 1; }
+  .mk-tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
+  .mk-tile { border: 1px solid var(--sep); border-radius: 6px; padding: 5px 6px; background: var(--card); }
+  .mk-tile b { display: block; height: 6px; width: 62%; border-radius: 3px; background: var(--text-3); opacity: .4; }
+  .mk-tile i { display: block; height: 4px; width: 40%; border-radius: 3px; background: var(--sep); margin-top: 4px; }
+  .mk-cols { display: grid; grid-template-columns: 84px 1fr; gap: 8px; align-items: center; }
+  .mk-ring { width: 64px; height: 64px; border-radius: 50%; margin: 0 auto; display: grid; place-items: center; background: conic-gradient(var(--blue) 14%, var(--sep) 0); }
+  .mk-ring > div { width: 48px; height: 48px; border-radius: 50%; background: var(--card); display: grid; place-items: center; font-size: 9.5px; font-weight: 700; color: var(--text-2); }
+  .mk-spark { display: flex; align-items: flex-end; gap: 3px; height: 42px; }
+  .mk-spark i { flex: 1; background: var(--blue); opacity: .7; border-radius: 2px 2px 0 0; }
+  .mk-panel { border: 1px solid var(--sep); border-radius: 6px; padding: 6px 7px; background: var(--card); flex: 1; min-width: 0; }
+  .mk-panel .t { height: 5px; width: 46%; border-radius: 3px; background: var(--text-3); opacity: .4; margin-bottom: 6px; }
+  .mk-rows { display: flex; flex-direction: column; }
+  .mk-row { display: flex; align-items: center; gap: 6px; height: 17px; border-bottom: 1px solid var(--sep); }
+  .mk-row:last-child { border-bottom: 0; }
+  .mk-row .ck { width: 8px; height: 8px; border: 1px solid var(--sep-2); border-radius: 2px; flex: 0 0 auto; }
+  .mk-row .ic { width: 11px; height: 11px; border-radius: 3px; background: color-mix(in srgb, var(--blue) 30%, transparent); flex: 0 0 auto; }
+  .mk-row .nm { flex: 1; height: 5px; border-radius: 3px; background: var(--text-3); opacity: .32; }
+  .mk-row .nm.w2 { flex: 0 0 46%; }
+  .mk-row .sz { width: 24px; height: 5px; border-radius: 3px; background: var(--sep); }
+  .mk-row .ac { width: 30px; height: 8px; border-radius: 4px; background: var(--sep); }
+  .mk-chips { display: flex; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--sep); }
+  .mk-chips i { height: 11px; width: 22px; border-radius: 6px; background: var(--sep); }
+  .mk-chips i.on { background: color-mix(in srgb, var(--blue) 30%, transparent); }
+  .mk-share { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; padding: 12px; text-align: center; }
+  .mk-file { width: 34px; height: 42px; border-radius: 6px; border: 1px solid var(--sep-2); background: var(--card-2); position: relative; }
+  .mk-file::after { content: ""; position: absolute; right: -1px; top: -1px; border-width: 0 13px 13px 0; border-style: solid; border-color: transparent var(--sep) transparent transparent; }
+  .mk-bar { height: 6px; border-radius: 3px; background: var(--text-3); opacity: .35; }
+  .mk-acts { display: flex; gap: 6px; margin-top: 2px; }
+  .mk-acts i { display: block; height: 15px; width: 42px; border-radius: 8px; background: var(--sep); }
+  .mk-acts i.pri { background: var(--blue); }
+  .mk-comment { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--sep); }
+  .mk-comment .av { width: 14px; height: 14px; border-radius: 50%; background: var(--sep-2); }
+  .mk-comment .tx { flex: 1; height: 9px; border-radius: 5px; border: 1px solid var(--sep); background: var(--bg-2); }
+  .mk-album { flex: 1; padding: 8px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; align-content: start; }
+  .mk-album i { display: block; aspect-ratio: 1 / 1; border-radius: 6px; background: linear-gradient(140deg, color-mix(in srgb, var(--blue) 30%, transparent), color-mix(in srgb, var(--violet) 26%, transparent)); }
+  .mk-album i:nth-child(2n) { background: linear-gradient(140deg, color-mix(in srgb, var(--green) 26%, transparent), color-mix(in srgb, var(--blue) 22%, transparent)); }
+  .mk-album i:nth-child(3n) { background: linear-gradient(140deg, color-mix(in srgb, var(--orange) 28%, transparent), color-mix(in srgb, var(--violet) 20%, transparent)); }
+  .force-dark { --bg: #0b0b0d; --bg-2: #121216; --card: #16161a; --card-2: #1b1b20; --text: #f5f5f7; --text-2: #b6b6bc; --text-3: #8e8e93; --sep: rgba(255,255,255,.10); --sep-2: rgba(255,255,255,.20); background: var(--bg); }
 
-  .grid { display: grid; gap: 18px; } .g-3 { grid-template-columns: repeat(3, 1fr); } .g-2 { grid-template-columns: repeat(2, 1fr); } .g-4 { grid-template-columns: repeat(4, 1fr); }
-  .card { background: var(--card); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid var(--sep); border-radius: var(--radius); padding: 26px; box-shadow: var(--shadow-sm); transition: transform .25s, box-shadow .25s, border-color .25s; position: relative; overflow: hidden; }
-  .card:hover { transform: translateY(-4px); box-shadow: var(--shadow-lg); border-color: var(--sep-op); }
-  .card .cic { width: 52px; height: 52px; border-radius: 15px; display: grid; place-items: center; font-size: 26px; margin-bottom: 16px; background: linear-gradient(140deg, color-mix(in srgb, var(--blue) 16%, transparent), color-mix(in srgb, var(--blue-2) 16%, transparent)); }
-  .card h3 { font-size: 19px; font-weight: 650; margin-bottom: 8px; letter-spacing: -.01em; }
-  .card p { color: var(--text-2); font-size: 14.5px; }
-  .card ul { margin-top: 12px; list-style: none; display: flex; flex-direction: column; gap: 8px; }
-  .card ul li { font-size: 13.5px; color: var(--text-2); display: flex; gap: 9px; align-items: flex-start; }
-  .card ul li::before { content: "✓"; color: var(--green); font-weight: 800; flex-shrink: 0; }
+  .phone { width: 178px; margin: 2px auto 0; border: 1px solid var(--sep-2); border-radius: 22px; padding: 7px 7px 9px; background: var(--card); }
+  .phone .notch { width: 48px; height: 4px; border-radius: 3px; background: var(--sep-2); margin: 2px auto 7px; }
+  .phone .scr { border: 1px solid var(--sep); border-radius: 15px; overflow: hidden; background: var(--bg); }
+  .phone .scr .head { height: 20px; border-bottom: 1px solid var(--sep); display: flex; align-items: center; gap: 5px; padding: 0 7px; }
+  .phone .scr .head i { width: 30px; height: 5px; border-radius: 3px; background: var(--text-3); opacity: .4; }
+  .phone .scr .head .sp { flex: 1; }
+  .phone .scr .list { padding: 6px; }
+  .phone .scr .tabbar { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; padding: 6px; border-top: 1px solid var(--sep); background: var(--card-2); }
+  .phone .scr .tabbar i { height: 11px; border-radius: 4px; background: var(--sep); }
+  .phone .scr .tabbar i.on { background: color-mix(in srgb, var(--blue) 60%, transparent); }
+  .phone-wrap { display: flex; align-items: center; justify-content: center; height: 216px; }
 
-  .badges { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 8px; }
-  .badge { font-size: 14px; padding: 10px 18px; border-radius: 980px; background: var(--card-solid); border: 1px solid var(--sep); color: var(--text-2); box-shadow: var(--shadow-sm); }
-  .badge b { color: var(--text); }
+  /* ================= 功能标签页 ================= */
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 18px; }
+  .tab { font-size: 13.5px; padding: 8px 15px; border-radius: var(--radius-pill); border: 1px solid var(--sep); background: var(--card); color: var(--text-2); cursor: pointer; transition: all var(--t-fast); }
+  .tab:hover { color: var(--text); border-color: var(--sep-2); }
+  .tab.active { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; animation: panelIn .32s var(--ease) both; }
+  @keyframes panelIn { from { opacity: 0; transform: translateY(8px) } to { opacity: 1; transform: none } }
 
-  .rows { display: grid; gap: 14px; }
-  .row { display: flex; gap: 18px; align-items: flex-start; padding: 20px 22px; border: 1px solid var(--sep); border-radius: var(--radius-sm); background: var(--card); }
-  .row .ic { font-size: 28px; flex-shrink: 0; width: 46px; text-align: center; }
-  .row h4 { font-size: 16.5px; font-weight: 650; margin-bottom: 4px; } .row p { font-size: 14px; color: var(--text-2); }
+  /* ================= 性能 ================= */
+  .perf { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .perf .card { text-align: center; padding: 20px 14px; }
+  .perf b { display: block; font-size: 30px; font-weight: 700; letter-spacing: -.02em; }
+  .perf span { font-size: 12.5px; color: var(--text-3); }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .table-wrap { border: 1px solid var(--sep); border-radius: var(--radius); overflow: hidden; background: var(--card); }
+  .table-wrap.scroll { overflow-x: auto; }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--sep); vertical-align: top; }
+  thead th { background: var(--bg-2); font-size: 12.5px; color: var(--text-2); font-weight: 600; white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr { transition: background var(--t-fast); }
+  tbody tr:hover { background: color-mix(in srgb, var(--blue) 4%, transparent); }
+  td.num { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+  .yes { color: var(--green); font-weight: 600; }
+  .no { color: var(--text-3); }
+  .mid { color: var(--orange); }
+  .feat { font-weight: 600; }
 
-  /* tabs */
-  .tabs { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-bottom: 30px; }
-  .tab { font-size: 14.5px; font-weight: 600; padding: 10px 18px; border-radius: 980px; border: 1px solid var(--sep); background: var(--card-solid); color: var(--text-2); cursor: pointer; transition: .2s; }
-  .tab:hover { color: var(--text); }
-  .tab.active { background: var(--blue); color: #fff; border-color: var(--blue); box-shadow: 0 8px 18px var(--glow-1); }
-  .tab-panel { display: none; } .tab-panel.active { display: block; animation: fade .35s ease; }
-  @keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  /* ================= 架构图 ================= */
+  .arch { display: grid; gap: 12px; }
+  .arch-row { display: grid; gap: 12px; }
+  .arch-row.c1 { grid-template-columns: 1fr; }
+  .arch-row.c3 { grid-template-columns: repeat(3, 1fr); }
+  .box { border: 1px solid var(--sep); border-radius: var(--radius); background: var(--card); padding: 15px; }
+  .box .bt { font-size: 13px; font-weight: 650; display: flex; align-items: center; gap: 7px; }
+  .box .bd { font-size: 12.5px; color: var(--text-2); margin-top: 7px; }
+  .box.core { border-color: color-mix(in srgb, var(--blue) 42%, var(--sep)); background: color-mix(in srgb, var(--blue) 5%, var(--card)); }
+  .arrow { text-align: center; color: var(--text-3); font-size: 17px; line-height: 1; }
+  .pill { display: inline-block; font-size: 11.5px; color: var(--text-2); border: 1px solid var(--sep); border-radius: var(--radius-pill); padding: 2px 9px; margin: 3px 4px 0 0; background: var(--bg-2); }
+  .req { color: var(--red); font-weight: 600; }
+  .opt { color: var(--text-3); }
 
-  /* comparison table */
-  .table-wrap { overflow-x: auto; border: 1px solid var(--sep); border-radius: var(--radius); background: var(--card); }
-  table { width: 100%; border-collapse: collapse; font-size: 14.5px; min-width: 640px; }
-  th, td { padding: 15px 18px; text-align: left; border-bottom: 1px solid var(--sep); }
-  thead th { font-size: 14px; color: var(--text-3); font-weight: 600; background: var(--bg-2); }
-  tbody tr:last-child td { border-bottom: none; }
-  td.feat { font-weight: 600; }
-  .yes { color: var(--green); font-weight: 700; } .no { color: var(--text-3); } .part { color: var(--orange); font-weight: 700; }
-  tbody tr:hover td { background: color-mix(in srgb, var(--blue) 5%, transparent); }
+  /* ================= 代码块与复制 ================= */
+  .code-block { position: relative; border: 1px solid var(--sep); border-radius: var(--radius); background: var(--bg-2); overflow: hidden; }
+  .code-block .cb-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px 8px 14px; border-bottom: 1px solid var(--sep); font-size: 12.5px; color: var(--text-2); }
+  .code-block .cb-head .fname { font-family: var(--mono); font-size: 12px; }
+  .code-block pre { margin: 0; padding: 14px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.7; color: var(--text); }
+  .copy { margin-left: auto; font-size: 12px; padding: 5px 11px; border-radius: var(--radius-pill); border: 1px solid var(--sep-2); background: var(--card); color: var(--text-2); cursor: pointer; transition: all var(--t-fast); white-space: nowrap; }
+  .copy:hover { color: var(--text); background: var(--bg); }
+  .copy.ok { color: #fff; background: var(--green); border-color: var(--green); }
+  .steps { counter-reset: s; display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+  .steps li { counter-increment: s; position: relative; padding: 13px 15px 13px 48px; border: 1px solid var(--sep); border-radius: var(--radius-sm); background: var(--card); font-size: 13.5px; color: var(--text-2); }
+  .steps li::before { content: counter(s); position: absolute; left: 14px; top: 12px; width: 22px; height: 22px; border-radius: 50%; background: color-mix(in srgb, var(--blue) 12%, transparent); color: var(--blue); font-size: 12px; font-weight: 700; display: grid; place-items: center; }
+  .steps li b { color: var(--text); }
 
-  /* steps */
-  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; counter-reset: step; }
-  .step { position: relative; padding: 28px 24px 24px; border: 1px solid var(--sep); border-radius: var(--radius); background: var(--card); }
-  .step .n { position: absolute; top: -16px; left: 24px; width: 34px; height: 34px; border-radius: 50%; background: linear-gradient(140deg, var(--blue), var(--blue-2)); color: #fff; display: grid; place-items: center; font-weight: 700; box-shadow: 0 8px 18px var(--glow-1); }
-  .step h4 { font-size: 17px; margin: 6px 0 8px; } .step p { font-size: 14px; color: var(--text-2); }
-  .step code { display: inline-block; margin-top: 10px; }
+  /* ================= FAQ ================= */
+  details.faq { border: 1px solid var(--sep); border-radius: var(--radius-sm); background: var(--card); padding: 0; margin-bottom: 9px; overflow: hidden; transition: border-color var(--t-fast), box-shadow var(--t-fast); }
+  details.faq[open] { border-color: var(--sep-2); box-shadow: var(--shadow-sm); }
+  details.faq summary { list-style: none; cursor: pointer; padding: 14px 44px 14px 16px; font-size: 14.5px; font-weight: 600; position: relative; }
+  details.faq summary::-webkit-details-marker { display: none; }
+  details.faq summary::after { content: "+"; position: absolute; right: 16px; top: 12px; font-size: 19px; font-weight: 400; color: var(--text-3); transition: transform var(--t); }
+  details.faq[open] summary::after { transform: rotate(45deg); color: var(--blue); }
+  details.faq .ans { padding: 0 16px 15px; font-size: 13.5px; color: var(--text-2); }
+  details.faq .ans p + p { margin-top: 8px; }
 
-  /* FAQ accordion */
-  .faq { max-width: 820px; margin: 0 auto; display: grid; gap: 12px; }
-  .qa { border: 1px solid var(--sep); border-radius: var(--radius-sm); background: var(--card); overflow: hidden; }
-  .qa summary { list-style: none; cursor: pointer; padding: 18px 22px; font-size: 16px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-  .qa summary::-webkit-details-marker { display: none; }
-  .qa summary .pm { transition: transform .25s; color: var(--blue); font-size: 22px; flex-shrink: 0; }
-  .qa[open] summary .pm { transform: rotate(45deg); }
-  .qa .ans { padding: 0 22px 18px; font-size: 14.5px; color: var(--text-2); }
+  /* ================= 时间线 ================= */
+  .timeline { display: grid; gap: 12px; }
+  .tl-item { border: 1px solid var(--sep); border-radius: var(--radius); background: var(--card); padding: 17px 19px; }
+  .tl-item .ver { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 16px; }
+  .tl-item .ver .badge { font-size: 11px; font-weight: 600; color: var(--blue); border: 1px solid color-mix(in srgb, var(--blue) 32%, var(--sep)); background: color-mix(in srgb, var(--blue) 8%, transparent); padding: 2px 9px; border-radius: var(--radius-pill); }
+  .tl-item .ver .date { margin-left: auto; font-size: 12px; color: var(--text-3); font-weight: 500; }
+  .tl-item ul { margin-top: 10px; }
+  .tl-item ul li { font-size: 13.5px; color: var(--text-2); padding: 3px 0 3px 16px; position: relative; list-style: none; }
+  .tl-item ul li::before { content: "·"; position: absolute; left: 5px; color: var(--blue); font-weight: 700; }
 
-  /* architecture */
-  .arch { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
-  .arch .node { border: 1px solid var(--sep); border-radius: var(--radius-sm); padding: 22px 18px; background: var(--card); text-align: center; }
-  .arch .node .ic { font-size: 30px; } .arch .node h4 { font-size: 15.5px; margin: 10px 0 6px; } .arch .node p { font-size: 13px; color: var(--text-3); }
-  .arch-flow { text-align: center; color: var(--text-3); font-size: 13px; margin: 14px 0 26px; }
+  /* ================= CTA / 页脚 ================= */
+  .cta { text-align: center; border: 1px solid var(--sep); border-radius: var(--radius); background: var(--card); padding: 44px 22px; }
+  .cta h2 { max-width: 20em; margin: 0 auto; }
+  .cta p { margin: 12px auto 20px; max-width: 40em; color: var(--text-2); font-size: 15px; }
+  footer { border-top: 1px solid var(--sep); padding: 30px 0 44px; font-size: 13px; color: var(--text-3); }
+  footer .cols { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 20px; }
+  footer h4 { font-size: 12.5px; color: var(--text-2); margin-bottom: 9px; font-weight: 650; }
+  footer a { display: block; padding: 3px 0; transition: color var(--t-fast); }
+  footer a:hover { color: var(--text); }
+  footer .fine { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--sep); font-size: 12px; line-height: 1.7; }
 
-  /* CTA */
-  .cta-band { border-radius: 28px; padding: 54px 30px; text-align: center; color: #fff; position: relative; overflow: hidden; background: linear-gradient(130deg, var(--blue), var(--blue-2)); }
-  .cta-band h2 { font-size: clamp(26px, 4vw, 38px); font-weight: 700; letter-spacing: -.02em; }
-  .cta-band p { opacity: .9; margin: 12px auto 26px; max-width: 560px; font-size: 16px; }
-  .cta-band .btn.ghost { background: rgba(255,255,255,0.16); color: #fff; border-color: rgba(255,255,255,0.4); }
-  .cta-band .btn.ghost:hover { background: rgba(255,255,255,0.26); }
-
-  footer { padding: 40px 0 60px; color: var(--text-3); font-size: 13px; text-align: center; border-top: 1px solid var(--sep); }
-  footer .fl { display: flex; gap: 18px; justify-content: center; flex-wrap: wrap; margin-bottom: 14px; }
-  footer a { color: var(--text-2); } footer a:hover { color: var(--text); }
-
-  .reveal { opacity: 0; transform: translateY(24px); transition: opacity .7s cubic-bezier(.2,.7,.2,1), transform .7s cubic-bezier(.2,.7,.2,1); }
-  .reveal.in { opacity: 1; transform: none; }
-
-  /* ===== 过渡动画 & 增强 ===== */
-  .progress { position: fixed; top: 0; left: 0; height: 3px; width: 0%; z-index: 200; background: linear-gradient(90deg, var(--blue), var(--blue-2)); box-shadow: 0 0 12px var(--glow-1); }
-  #toTop { position: fixed; right: 22px; bottom: 22px; width: 46px; height: 46px; border-radius: 50%; border: 1px solid var(--sep); background: var(--card-solid); color: var(--text); display: grid; place-items: center; font-size: 20px; cursor: pointer; box-shadow: var(--shadow-lg); opacity: 0; pointer-events: none; transform: translateY(12px); transition: opacity .3s, transform .3s; z-index: 90; }
+  #toTop { position: fixed; right: 18px; bottom: 18px; width: 42px; height: 42px; border-radius: 50%; border: 1px solid var(--sep-2); background: var(--card); color: var(--text); font-size: 17px; cursor: pointer; opacity: 0; pointer-events: none; transform: translateY(8px); transition: opacity var(--t), transform var(--t); z-index: 120; box-shadow: var(--shadow-sm); }
   #toTop.show { opacity: 1; pointer-events: auto; transform: none; }
-  #toTop:hover { background: var(--sep); }
-  .nav-links a { position: relative; }
-  .nav-links a::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: 4px; height: 2px; background: var(--blue); border-radius: 2px; transform: scaleX(0); transform-origin: center; transition: transform .25s ease; }
-  .nav-links a:hover::after { transform: scaleX(1); }
-  .hero h1 .grad-text { background-size: 200% auto; animation: shimmer 6s linear infinite; }
-  @keyframes shimmer { to { background-position: 200% center; } }
-  .orb { animation: float 14s ease-in-out infinite; }
-  .orb.b { animation-delay: -4s; } .orb.c { animation-delay: -8s; }
-  @keyframes float { 0%,100% { transform: translateY(0) translateX(0); } 50% { transform: translateY(-26px) translateX(14px); } }
-  .card .cic { transition: transform .3s ease, box-shadow .3s ease; }
-  .card:hover .cic { transform: scale(1.08) rotate(-4deg); box-shadow: 0 10px 24px var(--glow-1); }
-  .card:hover { border-color: color-mix(in srgb, var(--blue) 40%, var(--sep)); }
-  .btn.primary { position: relative; overflow: hidden; }
-  .btn.primary::after { content: ""; position: absolute; top: 0; left: -120%; width: 60%; height: 100%; background: linear-gradient(120deg, transparent, rgba(255,255,255,0.45), transparent); transform: skewX(-20deg); transition: left .6s; }
-  .btn.primary:hover::after { left: 140%; }
-  .types { display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px; }
-  .type { border: 1px solid var(--sep); border-radius: var(--radius-sm); padding: 18px 12px; text-align: center; background: var(--card); transition: transform .25s, box-shadow .25s, border-color .25s; }
-  .type:hover { transform: translateY(-4px); box-shadow: var(--shadow-sm); border-color: var(--sep-op); }
-  .type .ti { font-size: 30px; } .type .tn { font-size: 12.5px; color: var(--text-2); margin-top: 6px; }
-  .voices { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
-  .voice { border: 1px solid var(--sep); border-radius: var(--radius); padding: 26px; background: var(--card); }
-  .voice .q { font-size: 34px; color: var(--blue); opacity: .5; line-height: 1; }
-  .voice p { font-size: 14.5px; color: var(--text-2); margin: 8px 0 16px; }
-  .voice .who { font-size: 13.5px; font-weight: 600; } .voice .role { font-size: 12px; color: var(--text-3); }
-  .timeline { max-width: 760px; margin: 0 auto; position: relative; padding-left: 28px; }
-  .timeline::before { content: ""; position: absolute; left: 8px; top: 6px; bottom: 6px; width: 2px; background: var(--sep-op); }
-  .tl { position: relative; padding: 0 0 26px 8px; }
-  .tl::before { content: ""; position: absolute; left: -24px; top: 6px; width: 14px; height: 14px; border-radius: 50%; background: var(--blue); box-shadow: 0 0 0 4px color-mix(in srgb, var(--blue) 20%, transparent); }
-  .tl .v { font-weight: 700; font-size: 15px; } .tl .d { font-size: 12.5px; color: var(--text-3); margin-left: 8px; } .tl p { font-size: 14px; color: var(--text-2); margin-top: 4px; }
-  .marquee { overflow: hidden; -webkit-mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent); mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent); }
-  .marquee .track { display: flex; gap: 12px; width: max-content; animation: scrollx 26s linear infinite; }
-  .marquee:hover .track { animation-play-state: paused; }
-  @keyframes scrollx { to { transform: translateX(-50%); } }
-  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } .reveal { opacity: 1 !important; transform: none !important; } }
-  @media (max-width: 920px) { .types { grid-template-columns: repeat(3, 1fr); } .voices { grid-template-columns: 1fr; } }
-  @media (max-width: 680px) { .types { grid-template-columns: repeat(2, 1fr); } }
 
-  @media (max-width: 920px) { .g-3, .arch, .steps { grid-template-columns: repeat(2, 1fr); } .mock-grid { grid-template-columns: repeat(3, 1fr); } }
-  @media (max-width: 680px) {
-    .nav-links { display: none; } .g-3, .g-2, .g-4, .arch, .steps { grid-template-columns: 1fr; }
-    .mock-grid { grid-template-columns: repeat(2, 1fr); } section { padding: 56px 0; }
+  /* ================= 动效 ================= */
+  .reveal { opacity: 0; transform: translateY(16px); transition: opacity .62s var(--ease), transform .62s var(--ease); }
+  .reveal.in { opacity: 1; transform: none; }
+  .fade-up { animation: fadeUp .7s var(--ease) both; }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(18px) } to { opacity: 1; transform: none } }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+    .reveal { opacity: 1; transform: none; }
+  }
+
+  /* ================= 响应式 ================= */
+  @media (max-width: 1000px) {
+    .kpis { grid-template-columns: repeat(3, 1fr); }
+    .g-4, .perf { grid-template-columns: repeat(2, 1fr); }
+    .shots { grid-template-columns: repeat(2, 1fr); }
+    footer .cols { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 760px) {
+    .nav-links { display: none; }
+    .nav-in { gap: 10px; }
+    section { padding: 50px 0; }
+    .hero { padding: 52px 0 34px; }
+    .g-2, .g-3, .g-4, .perf, .shots, .arch-row.c3 { grid-template-columns: 1fr; }
+    .kpis { grid-template-columns: repeat(2, 1fr); }
+    .table-wrap { border-radius: var(--radius-sm); }
+    th, td { padding: 9px 11px; }
+    footer .cols { grid-template-columns: 1fr; }
   }
 </style>
 </head>
 <body>
-<div class="progress" id="progress"></div>
 
+<div id="progress"></div>
+
+<!-- ============ 导航 ============ -->
 <nav>
   <div class="wrap nav-in">
-    <div class="brand"><span class="logo">☁️</span> Personal Drive</div>
+    <a class="brand" href="#top" aria-label="回到顶部">
+      <span class="logo">☁</span>
+      <span>CF-KVR2-NetworkCloud<br><small>单文件边缘网盘 · v5.2.0</small></span>
+    </a>
     <div class="nav-links">
-      <a href="#why">为什么自建</a>
-      <a href="#core">功能</a>
-      <a href="#compare">对比</a>
+      <a href="#shots">界面</a>
+      <a href="#features">功能</a>
+      <a href="#perf">性能</a>
       <a href="#security">安全</a>
-      <a href="#start">快速开始</a>
+      <a href="#compare">对比</a>
+      <a href="#arch">架构</a>
+      <a href="#deploy">部署</a>
       <a href="#faq">FAQ</a>
     </div>
     <div class="nav-cta">
-      <button class="ico-btn" id="themeBtn" title="切换主题" aria-label="切换主题">🌗</button>
-      <a class="btn primary" href="#start">立即部署</a>
+      <button class="ico-btn" id="themeBtn" title="切换主题（跟随系统 / 浅色 / 深色）" aria-label="切换主题">🌗</button>
+      <a class="btn primary sm" href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud" target="_blank" rel="noopener">GitHub</a>
     </div>
   </div>
 </nav>
 
-<!-- HERO -->
-<header class="hero">
-  <span class="orb a"></span><span class="orb b"></span><span class="orb c"></span>
-  <div class="wrap inner">
-    <span class="eyebrow">Cloudflare Edge · 私有网盘 · v5.1.2</span>
-    <h1>把你的文件，<br><span class="grad-text">安放在边缘</span>。</h1>
-    <p class="sub">基于 Cloudflare R2 + KV + Durable Object 构建的私有云盘。Apple 风界面、分片续传、回收站、受控分享、可选端到端加密——开源、可自托管、跑在全球边缘节点上。</p>
-    <div class="hero-cta">
-      <a class="btn primary" href="#core">探索功能 →</a>
-      <a class="btn ghost" href="#arch">了解架构</a>
+<!-- ============ Hero ============ -->
+<header class="hero" id="top">
+  <div class="wrap">
+    <span class="tag fade-up"><span class="dot"></span> v5.2.0 · 单文件 Cloudflare Worker · 零依赖</span>
+    <h1 class="fade-up" style="animation-delay:.06s">把整个网盘，<br><span class="grad-text">装进一个文件</span>。</h1>
+    <p class="sub fade-up" style="animation-delay:.12s">
+      粘贴到 Cloudflare Worker 就能跑：文件存 <b>R2</b>、元数据存 <b>KV</b>、目录索引走可选的 <b>Durable Object</b>，
+      界面与交互全部内嵌在这一个文件里。<br>没有构建步骤、没有 npm 依赖、没有第二个文件；数据始终在你自己的存储桶中。
+    </p>
+    <div class="hero-cta fade-up" style="animation-delay:.18s">
+      <a class="btn primary" href="#deploy">查看部署步骤</a>
+      <a class="btn ghost" href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud" target="_blank" rel="noopener">查看源码</a>
     </div>
-    <p class="hero-meta">无需独立服务器 · 按量计费 · 数据始终在你掌控的存储桶中</p>
+    <div class="hero-meta fade-up" style="animation-delay:.24s">免费额度可用 · 开源 AGPL-3.0 · 无需独立服务器</div>
 
-    <div class="stats reveal">
-      <div class="stat"><div class="num" data-count="500">0</div><div class="lab">单文件上限 (MB)</div></div>
-      <div class="stat"><div class="num" data-count="5">0</div><div class="lab">保留历史版本</div></div>
-      <div class="stat"><div class="num" data-count="30">0</div><div class="lab">回收站保留 (天)</div></div>
-      <div class="stat"><div class="num" data-count="3">0</div><div class="lab">主题模式</div></div>
-    </div>
-
-    <!-- App mockup -->
-    <div class="mock reveal">
-      <div class="mock-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="mock-url">drive.example.com</span></div>
-      <div class="mock-body">
-        <div class="mock-tool">
-          <div class="mock-search">🔍 搜索文件、照片、文档…</div>
-          <span class="mock-chip on">网格</span><span class="mock-chip">列表</span><span class="mock-chip">图库</span><span class="mock-chip">⬆️ 上传</span>
-        </div>
-        <div class="mock-bc">📁 我的云盘 / <b>照片</b> / 2026 旅行</div>
-        <div class="mock-grid">
-          <div class="mock-item"><span class="ic">📁</span><span class="nm">视频</span><span class="sz">12 项</span></div>
-          <div class="mock-item"><span class="ic">🖼️</span><span class="nm">风景.jpg</span><span class="sz">4.2 MB</span></div>
-          <div class="mock-item"><span class="ic">🎬</span><span class="nm">vlog.mp4</span><span class="sz">86 MB</span></div>
-          <div class="mock-item"><span class="ic">📄</span><span class="nm">发票.pdf</span><span class="sz">320 KB</span></div>
-          <div class="mock-item"><span class="ic">📝</span><span class="nm">笔记.md</span><span class="sz">8 KB</span></div>
-          <div class="mock-item"><span class="ic">📦</span><span class="nm">备份.zip</span><span class="sz">51 MB</span></div>
-          <div class="mock-item"><span class="ic">🎵</span><span class="nm">音乐</span><span class="sz">34 项</span></div>
-          <div class="mock-item"><span class="ic">⭐</span><span class="nm">收藏夹</span><span class="sz">9 项</span></div>
-        </div>
-      </div>
+    <div class="kpis">
+      <div class="kpi reveal"><b data-count="12900" data-suffix="+">0</b><span>单文件行数</span></div>
+      <div class="kpi reveal"><b data-count="444">0</b><span>回归断言全绿</span></div>
+      <div class="kpi reveal"><b data-count="115">0</b><span>API 接口</span></div>
+      <div class="kpi reveal"><b data-count="9" data-suffix="×">0</b><span>目录遍历提速</span></div>
+      <div class="kpi reveal"><b data-count="0">0</b><span>运行时依赖</span></div>
+      <div class="kpi reveal"><b>AGPL</b><span>开源许可</span></div>
     </div>
   </div>
 </header>
 
-<!-- WHY -->
-<section id="why">
+<!-- ============ 界面预览（纯 CSS 绘制，无图片素材） ============ -->
+<section id="shots">
+  <div class="wrap">
+    <div class="sec-head center reveal">
+      <div class="tag-label">界面</div>
+      <h2>文件优先，密集高效</h2>
+      <p>下面是按真实布局 1:1 缩绘的界面示意图（纯 CSS 绘制，不依赖任何图片）。打开即概览，点一下进入文件列表：单行工具栏常显 11 个常用操作，行高 38px，一屏 15 行以上。</p>
+    </div>
+
+    <div class="previews">
+      <div class="pv reveal">
+        <span class="pv-tag">落地页</span>
+        <div class="win">
+          <div class="win-bar"><i></i><i></i><i></i><span class="url">https://drive.example.com/#/home</span></div>
+          <div class="win-body">
+            <div class="mk-side">
+              <div class="mk-nav on"></div><div class="mk-nav"></div><div class="mk-nav"></div><div class="mk-nav"></div>
+              <div class="lab"></div><div class="mk-nav"></div><div class="mk-nav"></div>
+            </div>
+            <div class="mk-main">
+              <div class="mk-tools"><span class="mk-btn pri"></span><span class="mk-btn"></span><span class="mk-search"></span><span class="mk-btn"></span><span style="flex:1"></span><span class="mk-btn"></span><span class="mk-btn"></span><span class="mk-btn"></span></div>
+              <div class="mk-body">
+                <div class="mk-tiles">
+                  <div class="mk-tile"><b></b><i></i></div><div class="mk-tile"><b></b><i></i></div><div class="mk-tile"><b></b><i></i></div>
+                </div>
+                <div class="mk-cols">
+                  <div class="mk-ring"><div>12%</div></div>
+                  <div class="mk-spark"><i style="height:32%"></i><i style="height:54%"></i><i style="height:28%"></i><i style="height:72%"></i><i style="height:46%"></i><i style="height:88%"></i><i style="height:60%"></i></div>
+                </div>
+                <div style="display:flex;gap:6px">
+                  <div class="mk-panel"><div class="t"></div><div class="mk-bar" style="width:80%"></div><div class="mk-bar" style="width:56%;margin-top:5px"></div></div>
+                  <div class="mk-panel"><div class="t"></div><div class="mk-bar" style="width:70%"></div><div class="mk-bar" style="width:44%;margin-top:5px"></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="pv-cap"><b>概览仪表盘</b><span>容量环 · 统计瓦片 · 7 天趋势</span></div>
+      </div>
+
+      <div class="pv reveal">
+        <span class="pv-tag">文件页</span>
+        <div class="win">
+          <div class="win-bar"><i></i><i></i><i></i><span class="url">https://drive.example.com/#/files/</span></div>
+          <div class="win-body">
+            <div class="mk-side">
+              <div class="mk-nav"></div><div class="mk-nav on"></div><div class="mk-nav"></div><div class="mk-nav"></div>
+              <div class="lab"></div><div class="mk-nav"></div>
+            </div>
+            <div class="mk-main">
+              <div class="mk-tools"><span class="mk-btn pri"></span><span class="mk-btn"></span><span class="mk-search"></span><span class="mk-btn"></span><span style="flex:1"></span><span class="mk-btn"></span><span class="mk-btn"></span><span class="mk-btn"></span><span class="mk-btn"></span><span class="mk-btn"></span></div>
+              <div class="mk-chips"><i class="on"></i><i></i><i></i><i></i><i></i><i></i></div>
+              <div class="mk-body" style="gap:0">
+                <div class="mk-rows">
+                  <div class="mk-row"><span class="ck"></span><span class="ic"></span><span class="nm"></span><span class="sz"></span><span class="ac"></span></div>
+                  <div class="mk-row"><span class="ck"></span><span class="ic" style="background:color-mix(in srgb,var(--orange) 34%,transparent)"></span><span class="nm w2"></span><span class="sz"></span><span class="ac"></span></div>
+                  <div class="mk-row"><span class="ck"></span><span class="ic" style="background:color-mix(in srgb,var(--green) 34%,transparent)"></span><span class="nm"></span><span class="sz"></span><span class="ac"></span></div>
+                  <div class="mk-row"><span class="ck"></span><span class="ic"></span><span class="nm w2"></span><span class="sz"></span><span class="ac"></span></div>
+                  <div class="mk-row"><span class="ck"></span><span class="ic" style="background:color-mix(in srgb,var(--violet) 34%,transparent)"></span><span class="nm"></span><span class="sz"></span><span class="ac"></span></div>
+                  <div class="mk-row"><span class="ck"></span><span class="ic"></span><span class="nm w2"></span><span class="sz"></span><span class="ac"></span></div>
+                  <div class="mk-row"><span class="ck"></span><span class="ic" style="background:color-mix(in srgb,var(--green) 34%,transparent)"></span><span class="nm"></span><span class="sz"></span><span class="ac"></span></div>
+                  <div class="mk-row"><span class="ck"></span><span class="ic"></span><span class="nm"></span><span class="sz"></span><span class="ac"></span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="pv-cap"><b>文件列表</b><span>单行工具栏 · 密集行 · 行内操作</span></div>
+      </div>
+
+      <div class="pv reveal">
+        <span class="pv-tag">公开页</span>
+        <div class="win">
+          <div class="win-bar"><i></i><i></i><i></i><span class="url">https://drive.example.com/s/report-2026</span></div>
+          <div class="win-body" style="flex-direction:column">
+            <div class="mk-share">
+              <div class="mk-file"></div>
+              <div class="mk-bar" style="width:104px"></div>
+              <div class="mk-bar" style="width:68px;opacity:.22"></div>
+              <div class="mk-acts"><i class="pri"></i><i></i><i></i></div>
+            </div>
+            <div class="mk-comment"><span class="av"></span><span class="tx"></span></div>
+          </div>
+        </div>
+        <div class="pv-cap"><b>分享页</b><span>权限控制 · 密码 · 统计 · 留言</span></div>
+      </div>
+
+      <div class="pv reveal">
+        <span class="pv-tag">公开相册</span>
+        <div class="win">
+          <div class="win-bar"><i></i><i></i><i></i><span class="url">https://drive.example.com/a/travel-2026</span></div>
+          <div class="win-body" style="flex-direction:column">
+            <div class="mk-album"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+          </div>
+        </div>
+        <div class="pv-cap"><b>相册</b><span>EXIF 时间线 · 原图下载</span></div>
+      </div>
+
+      <div class="pv reveal force-dark">
+        <span class="pv-tag">深色</span>
+        <div class="win">
+          <div class="win-bar"><i></i><i></i><i></i><span class="url">https://drive.example.com/#/files/photos</span></div>
+          <div class="win-body">
+            <div class="mk-side"><div class="mk-nav"></div><div class="mk-nav on"></div><div class="mk-nav"></div><div class="lab"></div><div class="mk-nav"></div></div>
+            <div class="mk-main">
+              <div class="mk-tools"><span class="mk-btn pri"></span><span class="mk-btn"></span><span class="mk-search"></span><span style="flex:1"></span><span class="mk-btn"></span><span class="mk-btn"></span></div>
+              <div class="mk-body">
+                <div class="mk-tiles"><div class="mk-tile"><b></b><i></i></div><div class="mk-tile"><b></b><i></i></div><div class="mk-tile"><b></b><i></i></div></div>
+                <div class="mk-rows">
+                  <div class="mk-row"><span class="ck"></span><span class="ic"></span><span class="nm"></span><span class="sz"></span><span class="ac"></span></div>
+                  <div class="mk-row"><span class="ck"></span><span class="ic"></span><span class="nm w2"></span><span class="sz"></span><span class="ac"></span></div>
+                  <div class="mk-row"><span class="ck"></span><span class="ic"></span><span class="nm"></span><span class="sz"></span><span class="ac"></span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="pv-cap"><b>深色模式</b><span>同一套布局，随主题自动切换</span></div>
+      </div>
+
+      <div class="pv reveal">
+        <span class="pv-tag">移动端</span>
+        <div class="phone-wrap">
+          <div class="phone">
+            <div class="notch"></div>
+            <div class="scr">
+              <div class="head"><i></i><span class="sp"></span><i style="width:14px"></i></div>
+              <div class="list">
+                <div class="mk-rows">
+                  <div class="mk-row"><span class="ic"></span><span class="nm"></span><span class="sz"></span></div>
+                  <div class="mk-row"><span class="ic" style="background:color-mix(in srgb,var(--orange) 34%,transparent)"></span><span class="nm w2"></span><span class="sz"></span></div>
+                  <div class="mk-row"><span class="ic"></span><span class="nm"></span><span class="sz"></span></div>
+                  <div class="mk-row"><span class="ic" style="background:color-mix(in srgb,var(--green) 34%,transparent)"></span><span class="nm w2"></span><span class="sz"></span></div>
+                  <div class="mk-row"><span class="ic"></span><span class="nm"></span><span class="sz"></span></div>
+                </div>
+              </div>
+              <div class="tabbar"><i class="on"></i><i></i><i></i><i></i><i></i></div>
+            </div>
+          </div>
+        </div>
+        <div class="pv-cap"><b>移动端</b><span>底部标签栏 · 手势 · 批量栏</span></div>
+      </div>
+    </div>
+
+    <p class="note reveal">全部示意图由 CSS 绘制，因此会跟随右上角的主题切换一起变深色——不需要任何图片文件，也不会出现"图片待补"。</p>
+  </div>
+</section>
+
+<!-- ============ 功能总览（七大包） ============ -->
+<section id="features" class="alt">
   <div class="wrap">
     <div class="sec-head reveal">
-      <div class="tag">为什么自建</div>
-      <h2>把数据主权拿回来</h2>
-      <p>商业网盘越用越贵、越用越受限。Personal Drive 让你用一份 Worker 的成本，拥有完全属于自己、可随时迁移的云盘。</p>
+      <div class="tag-label">功能总览</div>
+      <h2>一个网盘该有的，以及你没料到的</h2>
+      <p>按七大类整理，每一项都在回归测试覆盖范围内。</p>
     </div>
+
+    <div class="tabs reveal" role="tablist">
+      <button class="tab active" data-tab="a">🔐 安全与权限</button>
+      <button class="tab" data-tab="b">⬆ 传输与文件</button>
+      <button class="tab" data-tab="c">🔗 分享与协作</button>
+      <button class="tab" data-tab="d">🎬 媒体与预览</button>
+      <button class="tab" data-tab="e">🔍 检索与组织</button>
+      <button class="tab" data-tab="f">🛠 运维与配置</button>
+      <button class="tab" data-tab="g">✨ 前端与体验</button>
+    </div>
+
+    <div class="tab-panel active" data-panel="a">
+      <div class="grid g-3">
+        <div class="card reveal"><h3><span class="ci">🔐</span>二次验证 TOTP</h3><p>兼容任意验证器 App；启用时生成 8 个一次性备用码，服务端只存哈希。</p></div>
+        <div class="card reveal"><h3><span class="ci">🔒</span>目录密码锁</h3><p>任意目录（含根目录整体上锁）设密码；解锁状态随会话保留 10 分钟，锁定子树在搜索、复制、删除中一并受保护。</p></div>
+        <div class="card reveal"><h3><span class="ci">🎛</span>分享级管控</h3><p>禁止下载 / 仅预览、一次性下载、访问密码、IP·国家·UA 限制、访问次数上限、有效期，可随时删除。</p></div>
+        <div class="card reveal"><h3><span class="ci">🔑</span>只读令牌</h3><p>签发 <code>ro</code> 令牌给脚本或第三方集成：可读不可写，写接口统一返回 403。</p></div>
+        <div class="card reveal"><h3><span class="ci">⏱</span>限时签名直链</h3><p>带签名与过期时间的下载链接（默认 60 分钟，可调），适合外发给不支持 Cookie 的场景。</p></div>
+        <div class="card reveal"><h3><span class="ci">🚦</span>风控与限流</h3><p>读 150 / 写 30 次每分钟；登录按 IP 与用户名双维度 5 次/5 分钟；支持 IP·CIDR、国家、UA 黑白名单。</p></div>
+        <div class="card reveal"><h3><span class="ci">📋</span>审计与告警</h3><p>登录、上传、下载、删除、移动、恢复、配置变更全程留痕，可筛选并导出 CSV；异常登录可推 Webhook。</p></div>
+        <div class="card reveal"><h3><span class="ci">🖥</span>设备与会话</h3><p>列出登录设备逐个注销；改密即全体失效；KV 写入不可用时自动切换 HMAC 无状态会话，仍可登录。</p></div>
+        <div class="card reveal"><h3><span class="ci">🧬</span>输入闸门</h3><p>文件名净化、路径长度上限 400、KV 键校验、属性转义；远程抓取做协议白名单、主机黑名单、DNS 解析后校验与逐跳重定向检查。</p></div>
+      </div>
+    </div>
+
+    <div class="tab-panel" data-panel="b">
+      <div class="grid g-3">
+        <div class="card reveal"><h3><span class="ci">⬆</span>上传队列</h3><p>多文件并发 1–6，可暂停 / 继续 / 取消 / 重试，逐文件进度与状态。</p></div>
+        <div class="card reveal"><h3><span class="ci">🧩</span>分片上传</h3><p>超过 5MB 自动切片（5MB/片），装配后校验大小；孤儿分片由定时任务回收。</p></div>
+        <div class="card reveal"><h3><span class="ci">⏯</span>断点续传</h3><p>中断任务被记录，刷新或重开页面后可一键恢复。</p></div>
+        <div class="card reveal"><h3><span class="ci">⚡</span>秒传</h3><p>按内容哈希识别已存在的文件，命中即落记录，不重复上传。</p></div>
+        <div class="card reveal"><h3><span class="ci">📝</span>在线编辑</h3><p>文本文件直接在线编辑并保存，无需下载再上传。</p></div>
+        <div class="card reveal"><h3><span class="ci">📦</span>打包与解压</h3><p>目录流式 ZIP 下载（上限 2000 文件 / 2GB）、压缩包解压、多选批量下载。</p></div>
+        <div class="card reveal"><h3><span class="ci">🕰</span>版本与回收站</h3><p>覆盖自动留版本（单文件最多 5 份，≤64MB）；删除进回收站保留 30 天，可单条或批量恢复。</p></div>
+        <div class="card reveal"><h3><span class="ci">🧬</span>客户端加密</h3><p>浏览器内 AES 加密后再上传，服务端只存 <code>.enc</code> 密文，密钥不离开你的设备。</p></div>
+        <div class="card reveal"><h3><span class="ci">📋</span>批量操作</h3><p>多选后批量删除 / 重命名（支持 <code>{n}</code> 序号）/ 移动 / 下载 / 打包 / 分享。</p></div>
+      </div>
+    </div>
+
+    <div class="tab-panel" data-panel="c">
+      <div class="grid g-3">
+        <div class="card reveal"><h3><span class="ci">🔗</span>文件与目录分享</h3><p>独立分享页，可浏览子目录并打包下载整个文件夹。</p></div>
+        <div class="card reveal"><h3><span class="ci">🔖</span>自定义短链</h3><p><code>/s/&lt;别名&gt;</code>（2–32 位字母数字下划线），可随时更换或清除，换别名即旧链接失效。</p></div>
+        <div class="card reveal"><h3><span class="ci">💬</span>访客留言</h3><p>站内与访客共用一套评论，可开关，新留言可推送 Webhook。</p></div>
+        <div class="card reveal"><h3><span class="ci">📈</span>访问统计</h3><p>浏览与下载计数、最近访问明细（含国家、浏览器、设备）；写盘有节流，不刷爆额度。</p></div>
+        <div class="card reveal"><h3><span class="ci">🎨</span>分享外观</h3><p>自定义标题、描述、主题色与给访客的提示语。</p></div>
+        <div class="card reveal"><h3><span class="ci">📤</span>公开上传页</h3><p><code>/upload</code> 接收匿名上传，可指定目标目录、限制大小、启用 Turnstile 人机验证。</p></div>
+        <div class="card reveal"><h3><span class="ci">📥</span>上传链接</h3><p><code>/u/&lt;token&gt;</code> 限时收件箱：给别人一个上传入口，不用给账号。</p></div>
+        <div class="card reveal"><h3><span class="ci">🗂</span>批量分享</h3><p>多选文件一次生成多个分享链接，便于逐项分发。</p></div>
+        <div class="card reveal"><h3><span class="ci">🧾</span>下载明细</h3><p>区分预览与下载，可导出核对，用于排查异常访问。</p></div>
+      </div>
+    </div>
+
+    <div class="tab-panel" data-panel="d">
+      <div class="grid g-3">
+        <div class="card reveal"><h3><span class="ci">📄</span>Office 预览</h3><p>docx / xlsx / csv / ods 在线渲染（输出经净化；解析库按需加载，失败自动降级为下载）。</p></div>
+        <div class="card reveal"><h3><span class="ci">🎵</span>音乐播放器</h3><p>播放列表、顺序 / 列表循环 / 单曲 / 随机、音量与模式记忆、ID3 封面、同名 LRC 歌词跟随。</p></div>
+        <div class="card reveal"><h3><span class="ci">🎬</span>音视频播放</h3><p>支持 Range 拖动播放，大文件边下边播。</p></div>
+        <div class="card reveal"><h3><span class="ci">🖼</span>公开相册</h3><p><code>/a/&lt;id&gt;</code> 只读相册：可设密码、分页加载、原图下载、EXIF 拍摄时间分组、GPS 链接地图。</p></div>
+        <div class="card reveal"><h3><span class="ci">🔍</span>相似图片</h3><p>客户端 dHash 感知哈希 + 汉明距离分组，阈值可调，分批建立索引。</p></div>
+        <div class="card reveal"><h3><span class="ci">🖌</span>图片批处理</h3><p>批量缩放、JPEG 质量、旋转、文字水印；另存副本或覆盖（覆盖自动留版本）。</p></div>
+        <div class="card reveal"><h3><span class="ci">🪪</span>缩略图</h3><p>图片自动生成缩略图，随文件删除而清理，不额外占你的空间账单。</p></div>
+        <div class="card reveal"><h3><span class="ci">📊</span>媒体清单</h3><p>按类型汇总图片 / 音频 / 视频，支持排序与快速跳转。</p></div>
+        <div class="card reveal"><h3><span class="ci">🛡</span>预览沙箱</h3><p>HTML / SVG 等不可信内容以 <code>CSP: default-src 'none'; sandbox</code> 提供，脚本不执行。</p></div>
+      </div>
+    </div>
+
+    <div class="tab-panel" data-panel="e">
+      <div class="grid g-3">
+        <div class="card reveal"><h3><span class="ci">🔎</span>高级筛选</h3><p>名称、类型、扩展名、大小区间、日期区间、标签（任一或全部）、仅收藏、是否递归、排序、分页。</p></div>
+        <div class="card reveal"><h3><span class="ci">🏷</span>标签体系</h3><p>标签计数与颜色、重命名合并、批量增删、多标签 AND/OR 筛选、按类型或年月自动打标。</p></div>
+        <div class="card reveal"><h3><span class="ci">⭐</span>收藏分组</h3><p>收藏可分组管理（新建 / 重命名 / 删除 / 加入 / 移出），与收藏本身互不影响。</p></div>
+        <div class="card reveal"><h3><span class="ci">🕘</span>最近访问</h3><p>记录最近打开的文件，一键回到上次的位置。</p></div>
+        <div class="card reveal"><h3><span class="ci">🧹</span>重复与相似</h3><p>按内容哈希找完全重复，按感知哈希找相似图片。</p></div>
+        <div class="card reveal"><h3><span class="ci">📤</span>元数据导出导入</h3><p>子树内文件的标签 / 备注 / 收藏 / 大小 / 时间导出为 JSON 或 CSV；导入只匹配已存在文件，可合并或覆盖。</p></div>
+        <div class="card reveal"><h3><span class="ci">🌲</span>目录树与搜索</h3><p>目录树按层并行加载；全盘文件名搜索按键即出。</p></div>
+        <div class="card reveal"><h3><span class="ci">🗒</span>文件备注</h3><p>给任意文件写备注，随元数据一起备份与导出。</p></div>
+        <div class="card reveal"><h3><span class="ci">📐</span>目录用量</h3><p>按目录统计体积与条目数，找出占用最大的目录。</p></div>
+      </div>
+    </div>
+
+    <div class="tab-panel" data-panel="f">
+      <div class="grid g-3">
+        <div class="card reveal"><h3><span class="ci">🎛</span>可视化配置面板</h3><p>标题、Logo、配额、上传上限、版本与回收站策略、备份策略、防爆与限流、风控名单——改完即时生效（KV 覆盖环境变量）。</p></div>
+        <div class="card reveal"><h3><span class="ci">📏</span>目录级规则</h3><p>按目录设文件数上限、容量上限、单文件上限、扩展名白 / 黑名单；普通上传、分片、上传链接、公开上传、WebDAV 导入一并遵守。</p></div>
+        <div class="card reveal"><h3><span class="ci">⏰</span>定时任务</h3><p>TTL 过期清理（可进回收站或彻底删除）、清空目录、按月份自动归档；cron 触发或手动运行，单次处理有上限。</p></div>
+        <div class="card reveal"><h3><span class="ci">💾</span>备份与恢复</h3><p>增量快照只存变化目录并沿链合并；恢复前可看差异预览；份数与总占用双限；快照不含二次验证密钥。</p></div>
+        <div class="card reveal"><h3><span class="ci">🌐</span>WebDAV</h3><p>挂载为网络驱动器（Windows / macOS / Linux），也可从远程 WebDAV 目录批量导入。</p></div>
+        <div class="card reveal"><h3><span class="ci">🩺</span>健康检查</h3><p>一键自检 R2 / KV / DO 连通性，并展示防爆面板：缓存条目、近一分钟写入、预算、R2 内部占用采样。</p></div>
+        <div class="card reveal"><h3><span class="ci">🧽</span>孤儿扫描</h3><p>扫描 R2 中无元数据引用的对象并批量清理。</p></div>
+        <div class="card reveal"><h3><span class="ci">🪞</span>存储后端</h3><p>可选并联 S3 兼容后端做冗余或迁移过渡。</p></div>
+        <div class="card reveal"><h3><span class="ci">🔔</span>通知</h3><p>新设备 / 新地区登录、新评论、关键操作推送 Webhook（可加签名校验）。</p></div>
+      </div>
+    </div>
+
+    <div class="tab-panel" data-panel="g">
+      <div class="grid g-3">
+        <div class="card reveal"><h3><span class="ci">📊</span>概览仪表盘</h3><p>落地页即概览：容量环、6 项统计瓦片、近 7 天上传下载趋势、最近访问、收藏与标签、占用排行。</p></div>
+        <div class="card reveal"><h3><span class="ci">🧰</span>单行工具栏</h3><p>上传 / 新建 / 搜索 / 刷新 / 视图 / 排序 / 打包 / 分享 / 多选 / 回收站 / 设置——11 个常用入口常显，长尾收进 ⋯ 与命令面板。</p></div>
+        <div class="card reveal"><h3><span class="ci">🗂</span>四视图 + 虚拟滚动</h3><p>网格 / 列表 / 列（表头点击排序）/ 图库；超过 150 项只渲染可视窗口，几千项的目录也不卡。</p></div>
+        <div class="card reveal"><h3><span class="ci">🎯</span>密集列表</h3><p>行高 38px，一屏 15 行以上；每行的下载 / 分享 / 删除 / 更多按钮始终可见，不依赖悬停。</p></div>
+        <div class="card reveal"><h3><span class="ci">⌘</span>命令面板</h3><p><code>⌘K</code> 打开：命令与文件搜索结果混排，↑↓ 选择、Enter 执行，全流程不碰鼠标。</p></div>
+        <div class="card reveal"><h3><span class="ci">🎨</span>主题与密度</h3><p>深浅色跟随系统或手动切换；密度宽松 / 紧凑（默认紧凑）；主题色任意取色，全局一致。</p></div>
+        <div class="card reveal"><h3><span class="ci">📱</span>移动端手势</h3><p>右滑返回、左滑多选、长按呼出菜单（带震动反馈）、下拉刷新；底部标签栏与批量操作栏。</p></div>
+        <div class="card reveal"><h3><span class="ci">📲</span>PWA</h3><p>可添加到主屏幕；支持系统分享面板直接分享文件到网盘（分享即上传）；离线时浏览缓存列表（只读）。</p></div>
+        <div class="card reveal"><h3><span class="ci">♿</span>可达性</h3><p>键盘可达、按钮有 title 提示、状态用文字而非仅颜色表达。</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 性能与规模 ============ -->
+<section id="perf">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="tag-label">性能与规模</div>
+      <h2>不是"应该很快"，是量出来的</h2>
+      <p>用内存版 R2 / KV / DO 对每类请求做操作计数与延迟测量（给 DO 调用加 1.5ms 人造延迟模拟真实往返），再按数据优化。</p>
+    </div>
+
+    <div class="perf">
+      <div class="card reveal"><b data-count="444">0</b><span>回归断言（全绿）</span></div>
+      <div class="card reveal"><b data-count="9" data-suffix="×">0</b><span>目录遍历提速</span></div>
+      <div class="card reveal"><b data-count="115">0</b><span>API 接口</span></div>
+      <div class="card reveal"><b data-count="0">0</b><span>运行时依赖</span></div>
+    </div>
+
+    <div class="table-wrap scroll reveal" style="margin-top:14px">
+      <table>
+        <thead><tr><th>请求</th><th>优化前</th><th>优化后</th><th>手段</th></tr></thead>
+        <tbody>
+          <tr><td class="feat">GET /api/list</td><td class="num">DO 往返 2 · 存储写 1</td><td class="num yes">DO 1 · 写 0</td><td>目录写操作由 DO 直接返回最新列表，KV 镜像不再二次回读</td></tr>
+          <tr><td class="feat">POST /api/mkdir</td><td class="num">DO 5 · stGet 5 · 写 2</td><td class="num yes">DO 1 · stGet 1 · 写 1</td><td>四次往返收敛为一次原子 upsert</td></tr>
+          <tr><td class="feat">GET /api/preview · /api/thumb · /api/rename</td><td class="num">DO 1 · 写 1</td><td class="num yes">DO 0 · 写 0</td><td>限流器从 DO 改为 isolate 内存令牌桶</td></tr>
+          <tr><td class="feat">GET /api/tree（43 个目录）</td><td class="num">584 ms（串行）</td><td class="num yes">65 ms（按层并行）</td><td>目录并行预取（<code>DIR_PREFETCH</code>，默认 12）</td></tr>
+          <tr><td class="feat">GET /api/query（深度遍历）</td><td class="num">517 ms</td><td class="num yes">59 ms</td><td>同一并行预取 + BFS 重写</td></tr>
+          <tr><td class="feat">GET /api/dashboard</td><td class="num">DO 1.3</td><td class="num yes">DO 0.3</td><td>30 秒聚合缓存</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid g-4" style="margin-top:14px">
+      <div class="card reveal"><h3><span class="ci">📉</span>读缓存</h3><p>会话 10s、配置 30s、标签计数 60s、目录锁列表 20s——读请求不再直冲 KV。</p></div>
+      <div class="card reveal"><h3><span class="ci">🧮</span>写预算</h3><p>每分钟 600 次 KV 写预算 + 每日 500 条遥测预算 + 15 秒内存缓冲合并落盘。</p></div>
+      <div class="card reveal"><h3><span class="ci">📦</span>体积闸门</h3><p>单值 8MB、单目录 20000 条、路径 400 字符——超限拒绝而不是静默丢数据。</p></div>
+      <div class="card reveal"><h3><span class="ci">🧹</span>自动回收</h3><p>版本 5 份 / 单版本 64MB、回收站 30 天、分片 24 小时、备份 14 份且总占用 200MB。</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 安全与隐私 ============ -->
+<section id="security" class="alt">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="tag-label">安全与隐私</div>
+      <h2>数据是你的，控制权也是</h2>
+      <p>下面每一项都在代码里实现，并有对应的回归断言；发现漏洞请走私密渠道（见 SECURITY.md）。</p>
+    </div>
+
     <div class="grid g-3">
-      <div class="card reveal"><div class="cic">💰</div><h3>成本可控</h3><p>R2 免出口费，KV/DO 按量计费。没有座位费、没有阶梯涨价，用多少付多少。</p></div>
-      <div class="card reveal"><div class="cic">🔑</div><h3>数据归属</h3><p>文件就在你自己的 R2 桶里，随时可整体导出或迁移，不被平台绑定。</p></div>
-      <div class="card reveal"><div class="cic">🌍</div><h3>边缘速度</h3><p>请求在离用户最近的 Cloudflare 节点响应，静态壳与资源可缓存，全球都快。</p></div>
-      <div class="card reveal"><div class="cic">🧩</div><h3>完全可改</h3><p>单文件源码，前端全内联。想加字段、改界面、接 Webhook，几分钟搞定。</p></div>
-      <div class="card reveal"><div class="cic">🛡️</div><h3>隐私优先</h3><p>服务端不持有明文密码（端到端加密可选），日志与分享都在你域内。</p></div>
-      <div class="card reveal"><div class="cic">🚫</div><h3>无广告无追踪</h3><p>没有推荐流、没有行为分析，纯粹的文件工具。</p></div>
+      <div class="card reveal"><h3><span class="ci">🔑</span>认证与会话</h3><ul>
+        <li>口令加盐哈希；比较使用常量时间函数</li>
+        <li>会话 7 天，可逐台注销，改密即全体失效</li>
+        <li>可选 TOTP（SHA-1 / 6 位 / 30 秒）+ 8 个备用码</li>
+        <li>KV 不可用时切换 HMAC 无状态会话（界面会提示其不可提前吊销）</li>
+      </ul></div>
+      <div class="card reveal"><h3><span class="ci">🚪</span>授权与隔离</h3><ul>
+        <li>目录密码（含根目录锁定），解锁随会话保留 10 分钟</li>
+        <li>锁定子树在列表 / 搜索 / 查询 / 复制 / 移动 / 删除 / 打包中全部过滤</li>
+        <li>只读令牌写操作一律 403</li>
+        <li>R2 内部前缀（.versions/.trash/.chunks/.thumb/.backup）对用户、分享、相册、WebDAV 全部不可见</li>
+      </ul></div>
+      <div class="card reveal"><h3><span class="ci">🛡</span>响应加固</h3><ul>
+        <li>HTML 与 API 禁止缓存；<code>CDN-Cache-Control: no-store</code> 防边缘缓存旧页面</li>
+        <li><code>X-Content-Type-Options: nosniff</code>、<code>Referrer-Policy: no-referrer</code></li>
+        <li>不可信预览内容加沙箱 CSP，阻断脚本与外部加载</li>
+        <li>下载走 attachment，避免浏览器内联执行</li>
+      </ul></div>
+      <div class="card reveal"><h3><span class="ci">🕸</span>SSRF 防护</h3><ul>
+        <li>仅允许 http / https</li>
+        <li>阻断 localhost、.local、.internal、.home.arpa 与私有 / 链路本地 / 云元数据地址段</li>
+        <li><b>DNS 解析后再校验</b>，防域名解析绕过</li>
+        <li>重定向逐跳校验；体积与超时上限；可一键关闭抓取功能</li>
+      </ul></div>
+      <div class="card reveal"><h3><span class="ci">🚧</span>滥用与配额保护</h3><ul>
+        <li>读写分桶限流 150 / 30 次每分钟（可选 DO 精确模式）</li>
+        <li>登录 IP + 用户名双维度 5 次 / 5 分钟</li>
+        <li>公开上传可选 Turnstile 人机验证</li>
+        <li>额度紧张时优先暂停遥测写入，保证登录与元数据可用</li>
+      </ul></div>
+      <div class="card reveal"><h3><span class="ci">🗄</span>数据保护与审计</h3><ul>
+        <li>覆盖留历史版本；删除进回收站（30 天）</li>
+        <li>备份快照不含二次验证密钥；恢复前可看差异</li>
+        <li>操作日志可筛选并导出 CSV；登录与评论可推 Webhook</li>
+        <li>可选客户端 AES 加密上传（服务端只存密文）</li>
+      </ul></div>
+    </div>
+
+    <div class="card reveal" style="margin-top:14px">
+      <h3><span class="ci">✅</span>部署安全清单（4 条，做完就挡住了大多数风险）</h3>
+      <ul>
+        <li>用 16 位以上随机口令，并单独设置 <code>URL_SIGN_SECRET</code>（与口令解耦，便于单独轮换）</li>
+        <li>开启二次验证并把备用码离线保存；给脚本用只读令牌而不是管理员口令</li>
+        <li>公开上传页要么关闭，要么挂 Turnstile 并限制目标目录与大小</li>
+        <li>分享链接一律设有效期；重要文件先在客户端加密；定期做一次备份恢复演练</li>
+      </ul>
+      <p class="note">完整威胁模型、密钥轮换步骤与事件响应流程见仓库 <code>SECURITY.md</code>。</p>
     </div>
   </div>
 </section>
 
-<!-- CORE (tabs) -->
-<section id="core" style="background:var(--bg-2)">
-  <div class="wrap">
-    <div class="sec-head reveal">
-      <div class="tag">功能总览</div>
-      <h2>一个网盘该有的，都有了</h2>
-      <p>按场景切换查看——从日常存取到批量整理，顺手、好用、不绕路。</p>
-    </div>
-
-    <div class="tabs reveal">
-      <button class="tab active" data-tab="all">全部</button>
-      <button class="tab" data-tab="manage">文件管理</button>
-      <button class="tab" data-tab="share">分享协作</button>
-      <button class="tab" data-tab="media">媒体相册</button>
-      <button class="tab" data-tab="auto">自动化</button>
-    </div>
-
-    <div class="tab-panel active" data-panel="all">
-      <div class="grid g-3">
-        <div class="card reveal"><div class="cic">🗂️</div><h3>三种视图</h3><p>网格、列表、图库随心切换，照片自动走大图模式。</p></div>
-        <div class="card reveal"><div class="cic">⬆️</div><h3>分片续传</h3><p>大文件切片上传，断点可续；合并前做完整性校验，缺片明确返回。</p></div>
-        <div class="card reveal"><div class="cic">⚡</div><h3>秒传去重</h3><p>按内容哈希识别已存在文件，相同内容即时落盘。</p></div>
-        <div class="card reveal"><div class="cic">🔗</div><h3>受控分享</h3><p>文件或整目录生成链接，可设密码、有效期、访问次数上限。</p></div>
-        <div class="card reveal"><div class="cic">🗑️</div><h3>回收站</h3><p>文件与<strong>目录</strong>删除均进回收站，可单条/批量恢复，30 天自动清理。</p></div>
-        <div class="card reveal"><div class="cic">🔍</div><h3>搜索与树</h3><p>全局搜索、目录树、重复文件查找，海量文件快速定位。</p></div>
-        <div class="card reveal"><div class="cic">🖼️</div><h3>相册与幻灯片</h3><p>目录变公开相册，灯箱大图、幻灯片、EXIF 展示。</p></div>
-        <div class="card reveal"><div class="cic">🤖</div><h3>自动归档</h3><p>按类型自动归类，压缩包上传自动解包。</p></div>
-        <div class="card reveal"><div class="cic">🌐</div><h3>远程下载</h3><p>粘贴外链，边缘节点拉取入库，本机无需中转。</p></div>
-      </div>
-    </div>
-
-    <div class="tab-panel" data-panel="manage">
-      <div class="grid g-3">
-        <div class="card reveal"><div class="cic">🗂️</div><h3>三种视图</h3><p>网格 / 列表 / 图库；图库视图专为照片优化。</p></div>
-        <div class="card reveal"><div class="cic">📝</div><h3>在线编辑</h3><p>文本文件直接在线编辑保存，无需下载。</p></div>
-        <div class="card reveal"><div class="cic">📦</div><h3>ZIP 打包 / 解包</h3><p>目录一键打包下载；压缩包可自动解包进目录。</p></div>
-        <div class="card reveal"><div class="cic">🏷️</div><h3>标签系统</h3><p>给文件打标签并据此筛选，跨目录归类。</p></div>
-        <div class="card reveal"><div class="cic">⭐</div><h3>收藏 / 最近</h3><p>常用文件一键收藏，最近访问快速回到。</p></div>
-        <div class="card reveal"><div class="cic">🧹</div><h3>批量操作</h3><p>批量删除 / 重命名 / 移动 / 分享，效率拉满。</p></div>
-      </div>
-    </div>
-
-    <div class="tab-panel" data-panel="share">
-      <div class="grid g-3">
-        <div class="card reveal"><div class="cic">🔗</div><h3>文件 / 目录分享</h3><p>生成独立链接，目录有专属浏览页。</p></div>
-        <div class="card reveal"><div class="cic">🔒</div><h3>密码 + 有效期</h3><p>可设访问密码、1–3650 天有效期、最大访问次数。</p></div>
-        <div class="card reveal"><div class="cic">🚦</div><h3>访问计数</h3><p>仅密码校验后计入，避免匿名刷爆配额。</p></div>
-        <div class="card reveal"><div class="cic">📤</div><h3>公开上传</h3><p>免登录公开上传页，Turnstile 人机验证，按链接限制。</p></div>
-        <div class="card reveal"><div class="cic">📡</div><h3>WebDAV</h3><p>标准协议，挂载到系统像本地磁盘用。</p></div>
-        <div class="card reveal"><div class="cic">🤝</div><h3>只读令牌</h3><p>签发 ro 令牌做第三方只读集成或嵌入。</p></div>
-      </div>
-    </div>
-
-    <div class="tab-panel" data-panel="media">
-      <div class="grid g-3">
-        <div class="card reveal"><div class="cic">🖼️</div><h3>相册</h3><p>目录整理成公开相册，灯箱大图浏览。</p></div>
-        <div class="card reveal"><div class="cic">🎞️</div><h3>幻灯片</h3><p>自动播放幻灯片，沉浸看图。</p></div>
-        <div class="card reveal"><div class="cic">🪪</div><h3>缩略图 / EXIF</h3><p>图片自动缩略图，预览展示拍摄信息。</p></div>
-        <div class="card reveal"><div class="cic">🎬</div><h3>流媒体预览</h3><p>视频 / 音频在线播放，支持 Range 拖动。</p></div>
-        <div class="card reveal"><div class="cic">📄</div><h3>文档预览</h3><p>文本 / PDF 直接预览，无需下载。</p></div>
-        <div class="card reveal"><div class="cic">📸</div><h3>截图</h3><p>内置截图能力，快速留存。</p></div>
-      </div>
-    </div>
-
-    <div class="tab-panel" data-panel="auto">
-      <div class="grid g-3">
-        <div class="card reveal"><div class="cic">🤖</div><h3>自动归档</h3><p>按扩展名/类型自动归类，上传即整理。</p></div>
-        <div class="card reveal"><div class="cic">🌐</div><h3>远程下载</h3><p>外链由边缘拉取入库。</p></div>
-        <div class="card reveal"><div class="cic">💾</div><h3>备份快照</h3><p>手动 / 每日自动快照，可整体恢复。</p></div>
-        <div class="card reveal"><div class="cic">🪞</div><h3>存储镜像</h3><p>配置 S3 兼容后端做冗余。</p></div>
-        <div class="card reveal"><div class="cic">🕰️</div><h3>版本历史</h3><p>覆盖自动留版本，一键回滚。</p></div>
-        <div class="card reveal"><div class="cic">🔔</div><h3>Webhook</h3><p>关键事件回调通知，接入自有系统。</p></div>
-      </div>
-    </div>
-
-    <div class="badges reveal" style="margin-top:34px">
-      <span class="badge">📁 新建 / 重命名 / 移动</span>
-      <span class="badge">📝 在线编辑文本</span>
-      <span class="badge">🏷️ 标签</span>
-      <span class="badge">⭐ 收藏</span>
-      <span class="badge">🕘 最近访问</span>
-      <span class="badge">📦 ZIP</span>
-      <span class="badge">🗑️ 批量操作</span>
-      <span class="badge">🧹 重复查找</span>
-    </div>
-  </div>
-</section>
-
-<!-- COMPARE -->
+<!-- ============ 对比 ============ -->
 <section id="compare">
   <div class="wrap">
     <div class="sec-head reveal">
-      <div class="tag">横向对比</div>
-      <h2>Personal Drive vs 商业网盘</h2>
-      <p>同样能存文件，区别在成本、主权与可控性。</p>
+      <div class="tag-label">横向对比</div>
+      <h2>和商业网盘比，差别在哪</h2>
+      <p>同样是存文件，区别在数据位置、可控程度与迁移成本。表格描述的是本项目实际提供的能力，不是营销话术。</p>
     </div>
-    <div class="table-wrap reveal">
+
+    <div class="table-wrap scroll reveal">
       <table>
-        <thead><tr><th>能力</th><th>Personal Drive</th><th>商业网盘</th></tr></thead>
+        <thead><tr><th>能力</th><th>本方案（自建于 Cloudflare）</th><th>商业网盘</th></tr></thead>
         <tbody>
-          <tr><td class="feat">数据存储位置</td><td class="yes">你自己的 R2 桶</td><td class="no">服务商平台内</td></tr>
-          <tr><td class="feat">按量计费 / 无座位费</td><td class="yes">✓</td><td class="part">常含上限/阶梯</td></tr>
-          <tr><td class="feat">端到端加密（可选）</td><td class="yes">✓</td><td class="no">多为服务端加密</td></tr>
-          <tr><td class="feat">文件夹级密码锁</td><td class="yes">✓</td><td class="part">少数支持</td></tr>
-          <tr><td class="feat">IP 白/黑名单</td><td class="yes">✓</td><td class="no">通常不开放</td></tr>
-          <tr><td class="feat">WebDAV 挂载</td><td class="yes">✓</td><td class="part">付费才给</td></tr>
-          <tr><td class="feat">只读 / 读写令牌</td><td class="yes">✓</td><td class="no">多数无细粒度</td></tr>
-          <tr><td class="feat">源码可改</td><td class="yes">✓ 单文件</td><td class="no">闭源</td></tr>
-          <tr><td class="feat">广告 / 行为追踪</td><td class="yes">无</td><td class="part">部分有</td></tr>
-          <tr><td class="feat">跨区边缘加速</td><td class="yes">✓ 全球</td><td class="yes">✓</td></tr>
+          <tr><td class="feat">数据存放位置</td><td class="yes">你自己的 R2 存储桶</td><td class="no">服务商平台内</td></tr>
+          <tr><td class="feat">源码可见可改</td><td class="yes">单文件，AGPL-3.0</td><td class="no">闭源</td></tr>
+          <tr><td class="feat">部署方式</td><td class="yes">粘贴到 Worker，无构建无依赖</td><td class="mid">注册即用（省事）</td></tr>
+          <tr><td class="feat">目录级密码锁</td><td class="yes">支持，含根目录整体上锁</td><td class="mid">少数支持</td></tr>
+          <tr><td class="feat">分享细粒度控制</td><td class="yes">禁下载 / 一次性 / 密码 / IP·国家·UA / 次数 / 有效期</td><td class="mid">通常只有密码与有效期</td></tr>
+          <tr><td class="feat">只读令牌（脚本集成）</td><td class="yes">支持，写操作 403</td><td class="mid">多数无细粒度令牌</td></tr>
+          <tr><td class="feat">WebDAV 挂载</td><td class="yes">内置（目录 MOVE/COPY 返回 501）</td><td class="mid">部分套餐提供</td></tr>
+          <tr><td class="feat">审计日志与导出</td><td class="yes">内置，可导出 CSV</td><td class="mid">部分提供</td></tr>
+          <tr><td class="feat">配额保护可调</td><td class="yes">写预算、上限闸门全部可视化可调</td><td class="no">限额策略不透明</td></tr>
+          <tr><td class="feat">迁移成本</td><td class="yes">拷走一个文件 + 你的桶</td><td class="mid">受导出速度与格式限制</td></tr>
+          <tr><td class="feat">广告与行为追踪</td><td class="yes">没有</td><td class="mid">部分产品有</td></tr>
+          <tr><td class="feat">计费方式</td><td class="yes">按 Cloudflare 用量（免费额度可用）</td><td class="mid">订阅制 / 阶梯涨价</td></tr>
+          <tr><td class="feat">运维负担</td><td class="no">需要你自己配置绑定、处理升级</td><td class="yes">平台代管</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note reveal">说明：商业网盘的能力随产品与套餐变化，上表只做一般性对比；本方案的"不提供"项也在诚实列出（见下）。</p>
+
+    <div class="grid g-3" style="margin-top:16px">
+      <div class="card reveal"><h3><span class="ci">⚠️</span>本方案不提供的</h3><ul>
+        <li>多租户隔离（单管理员模型，适合个人或小团队自用）</li>
+        <li>端到端加密的完整实现（仅提供单文件客户端加密上传）</li>
+        <li>硬件密钥 / WebAuthn（只有 TOTP）</li>
+        <li>合规认证、SLA 与商业支持</li>
+      </ul></div>
+      <div class="card reveal"><h3><span class="ci">📌</span>已知取舍</h3><ul>
+        <li>未启用严格 CSP / SRI（内联资源过多，改造风险大）</li>
+        <li>WebDAV 目录 MOVE/COPY 返回 501；<code>Depth: infinity</code> 按 1 处理</li>
+        <li>口令哈希为单轮加盐 SHA-256（弱于 PBKDF2/Argon2）</li>
+        <li>预览依赖按需加载的 CDN 库（失败自动降级）</li>
+      </ul></div>
+      <div class="card reveal"><h3><span class="ci">🎯</span>什么场景最合适</h3><ul>
+        <li>个人文件集中存放 + 自己域名访问</li>
+        <li>给家人/小团队一个共享空间</li>
+        <li>需要 WebDAV 挂载到系统当磁盘用</li>
+        <li>想把"数据在谁手里"这件事攥紧</li>
+      </ul></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 架构 ============ -->
+<section id="arch" class="alt">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="tag-label">技术架构</div>
+      <h2>跑在边缘，轻量却完整</h2>
+      <p>一个 Worker 承载全部逻辑；R2 存内容，KV 存元数据，Durable Object 只做加速——不绑也能跑。</p>
+    </div>
+
+    <div class="arch reveal">
+      <div class="arch-row c3">
+        <div class="box"><div class="bt">🌐 浏览器 / PWA</div><div class="bd">主应用、公开分享页、相册页、上传页；Service Worker 提供离线外壳与"分享即上传"。</div></div>
+        <div class="box"><div class="bt">🗄 WebDAV 客户端</div><div class="bd">Windows 映射网络驱动器、macOS 连接服务器、Linux davfs2。</div></div>
+        <div class="box"><div class="bt">🤖 脚本 / 第三方</div><div class="bd">访问令牌（只读或读写）或限时签名直链。</div></div>
+      </div>
+      <div class="arrow">↓</div>
+      <div class="arch-row c1">
+        <div class="box core">
+          <div class="bt">⚙️ Cloudflare Worker —— <code>_workers.js</code>（单文件）</div>
+          <div class="bd">
+            <b>路由层</b>：115 条精确路由 + 3 条前缀路由 → 鉴权（会话 / 无状态会话 / 只读令牌）→ 风控（IP·国家·UA / 限流）→ 锁定目录检查<br>
+            <b>业务层</b>：文件 · 分享 · 相册 · 标签 · 检索 · 备份 · 定时任务 · 目录规则 · 审计<br>
+            <b>视图层</b>：内嵌 SPA（HTML / CSS / JS 同文件）+ 公开页 + Service Worker
+          </div>
+        </div>
+      </div>
+      <div class="arrow">↓</div>
+      <div class="arch-row c3">
+        <div class="box"><div class="bt">📦 R2 · 绑定 <code>DRIVE</code> <span class="req">必需</span></div><div class="bd">文件本体；内部前缀 <code>.versions/</code> <code>.trash/</code> <code>.chunks/</code> <code>.thumb/</code> <code>.backup/</code> 对用户不可见。</div></div>
+        <div class="box"><div class="bt">🗃 KV · 绑定 <code>STORE</code> <span class="req">必需</span></div><div class="bd">目录元数据、会话、站点配置、统计与各类索引（带 TTL）。<b>元数据的唯一真相源。</b></div></div>
+        <div class="box"><div class="bt">🧠 DO · 绑定 <code>DIR</code> <span class="opt">可选</span></div><div class="bd">目录索引加速（类名 <code>DirStore</code>）。不绑定时自动回退 KV 模式，功能一致、仅并发与大目录略慢。</div></div>
+      </div>
+    </div>
+
+    <div class="grid g-3" style="margin-top:14px">
+      <div class="card reveal"><h3><span class="ci">🔁</span>DO 是加速层不是依赖</h3><p>DO 实例被回收或清空时会从 KV 重新播种；大目录超出 DO 单值上限（96KB 安全余量）时自动走 KV 合并路径。</p></div>
+      <div class="card reveal"><h3><span class="ci">🧱</span>单文件不是偷懒</h3><p>换来"拷走即用 + 无供应链风险 + 无构建链断裂"；代价是阅读成本，因此回归断言与文档要求更严。</p></div>
+      <div class="card reveal"><h3><span class="ci">📉</span>无 npm 依赖</h3><p>运行时依赖为 0，部署物就是那一个文件；开发期也只依赖 Node 跑回归（离线、内存仿真）。</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 部署 ============ -->
+<section id="deploy">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="tag-label">快速开始</div>
+      <h2>三步，拥有你的边缘网盘</h2>
+      <p>两种方式任选：控制台粘贴（最快）或 wrangler（便于版本管理）。免费额度即可运行。</p>
+    </div>
+
+    <div class="tabs reveal" role="tablist">
+      <button class="tab active" data-tab="d1">🖱 方式一 · 控制台粘贴</button>
+      <button class="tab" data-tab="d2">⌨️ 方式二 · wrangler</button>
+    </div>
+
+    <div class="tab-panel active" data-panel="d1">
+      <div class="grid g-2">
+        <div>
+          <ol class="steps reveal">
+            <li><b>创建 Worker</b>：Cloudflare 控制台 → Workers &amp; Pages → 创建 Worker。</li>
+            <li><b>粘贴代码</b>：打开仓库里的 <code>_workers.js</code> → 全选复制 → 编辑器里全选替换 → <b>Deploy</b>。</li>
+            <li><b>加绑定与变量</b>：Settings 里添加 <code>DRIVE</code>（R2）、<code>STORE</code>（KV），可选 <code>DIR</code>（DO，类名 <code>DirStore</code>）；环境变量加 <code>DRIVE_PASSWORD</code>。</li>
+          </ol>
+          <div class="card reveal" style="margin-top:12px">
+            <h3><span class="ci">✅</span>部署后 3 步自检</h3>
+            <ul>
+              <li>访问 <code>/api/version</code>：应返回 <code>version</code>、<code>ui</code> 与 <code>bindings</code>（其中 <code>store</code> / <code>drive</code> 必须为 true）</li>
+              <li>登录后上传一个文件 → 预览 → 刷新确认仍在</li>
+              <li>看页面底部状态条：应显示 <code>v5.2.0 · flat-1</code>（这是判断线上版本是否生效的最快方式）</li>
+            </ul>
+          </div>
+        </div>
+        <div>
+          <div class="table-wrap reveal">
+            <table>
+              <thead><tr><th>绑定</th><th>类型</th><th>必需</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td class="num">DRIVE</td><td>R2 桶</td><td class="req">必需</td><td>文件本体与内部对象</td></tr>
+                <tr><td class="num">STORE</td><td>KV 命名空间</td><td class="req">必需</td><td>元数据、会话、配置、索引</td></tr>
+                <tr><td class="num">DIR</td><td>Durable Object</td><td class="opt">可选</td><td>目录索引加速，类名 <code>DirStore</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-wrap reveal" style="margin-top:12px">
+            <table>
+              <thead><tr><th>环境变量</th><th>必需</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td class="num">DRIVE_PASSWORD</td><td class="req">必需</td><td>管理员口令（请用强口令）</td></tr>
+                <tr><td class="num">URL_SIGN_SECRET</td><td class="opt">建议</td><td>签名直链与无状态会话的密钥，与口令解耦</td></tr>
+                <tr><td class="num">DRIVE_TITLE / DRIVE_QUOTA</td><td class="opt">可选</td><td>站点标题、总配额</td></tr>
+                <tr><td class="num">TURNSTILE_SITE_KEY / TURNSTILE_SECRET</td><td class="opt">可选</td><td>公开上传页的人机验证</td></tr>
+                <tr><td class="num">IP_ALLOW / IP_DENY</td><td class="opt">可选</td><td>IP 黑白名单（支持 CIDR）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="note reveal">其余上限（目录条目、KV 值、版本、回收站、备份、限流、遥测预算、并发…）可在站点的「运维与配置 → 站点配置」面板里调整，改完即时生效。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-panel" data-panel="d2">
+      <div class="grid g-2">
+        <div class="code-block reveal">
+          <div class="cb-head"><span class="fname">wrangler.toml</span>
+            <button class="copy" data-copy="code-wrangler">复制</button>
+          </div>
+          <pre id="code-wrangler">name = "cf-kvr2-networkcloud"
+main = "_workers.js"
+compatibility_date = "2025-01-01"
+
+# 文件内容
+[[r2_buckets]]
+binding = "DRIVE"
+bucket_name = "your-bucket-name"
+
+# 元数据
+[[kv_namespaces]]
+binding = "STORE"
+id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# 可选：目录索引加速（不绑会自动回退 KV）
+[[durable_objects.bindings]]
+name = "DIR"
+class_name = "DirStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DirStore"]
+
+# 可选：定时任务（回收站清理 / 分片回收 / 自动备份）
+[triggers]
+crons = ["17 3 * * *"]
+
+[vars]
+DRIVE_PASSWORD = "换成你自己的强口令"</pre>
+        </div>
+        <div>
+          <div class="code-block reveal">
+            <div class="cb-head"><span class="fname">终端</span>
+              <button class="copy" data-copy="code-deploy">复制</button>
+            </div>
+            <pre id="code-deploy"># 安装并部署（无需本地构建）
+npx wrangler deploy
+
+# 建议：把密钥放 Secrets 而不是 [vars]
+npx wrangler secret put DRIVE_PASSWORD
+npx wrangler secret put URL_SIGN_SECRET</pre>
+          </div>
+          <div class="card reveal" style="margin-top:12px">
+            <h3><span class="ci">🔐</span>Secret 优于 [vars]</h3>
+            <p>把口令写进 <code>wrangler.toml</code> 的 <code>[vars]</code> 容易被一起提交到公开仓库；用 <code>wrangler secret put</code> 则只存在 Cloudflare 侧。若必须写在文件里，请把该文件加入 <code>.gitignore</code>。</p>
+          </div>
+          <div class="card reveal" style="margin-top:12px">
+            <h3><span class="ci">🧪</span>本地验证（改代码时）</h3>
+            <ul>
+              <li><code>node --check _workers.js</code> —— 语法检查</li>
+              <li><code>node _workers.verify.mjs</code> —— 444 项回归，全程离线、不碰任何线上数据</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 移动端与 PWA ============ -->
+<section id="mobile" class="alt">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="tag-label">移动端与 PWA</div>
+      <h2>手机上也是完整网盘</h2>
+      <p>不是把桌面版缩小，而是重排了导航与操作方式；示意图见上方「移动端」。</p>
+    </div>
+
+    <div class="grid g-3">
+      <div class="card reveal"><h3><span class="ci">📱</span>底部标签栏</h3><p>文件 · 收藏 · 最近 · 上传 · 我的；侧栏改为抽屉式，单手可达。</p></div>
+      <div class="card reveal"><h3><span class="ci">☑️</span>批量操作栏</h3><p>进入多选后底部浮出操作栏：下载 / 打包 / 分享 / 移动 / 删除。</p></div>
+      <div class="card reveal"><h3><span class="ci">📲</span>分享即上传</h3><p>支持系统分享面板：在相册或文件 App 里选"分享到网盘"即可上传。</p></div>
+      <div class="card reveal"><h3><span class="ci">📴</span>离线只读</h3><p>Service Worker 缓存应用外壳与最近列表；离线时显示提示条，可浏览已缓存内容。</p></div>
+      <div class="card reveal"><h3><span class="ci">🏠</span>可安装</h3><p>添加到主屏幕后以独立窗口运行，带图标与启动色。</p></div>
+      <div class="card reveal"><h3><span class="ci">🎯</span>触控尺寸</h3><p>按钮与行高按手指尺寸放大，长按有震动反馈，误触更少。</p></div>
+    </div>
+
+    <div class="table-wrap reveal" style="margin-top:14px">
+      <table>
+        <thead><tr><th>手势</th><th>作用</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td class="feat">右滑</td><td>返回上一级</td><td>在文件列表从左侧边缘向右滑动</td></tr>
+          <tr><td class="feat">左滑</td><td>进入多选</td><td>滑出即选中该行，底部浮出批量操作栏</td></tr>
+          <tr><td class="feat">长按</td><td>上下文菜单</td><td>重命名 / 移动 / 复制到 / 版本 / 解压 / 标签 / 备注 等</td></tr>
+          <tr><td class="feat">下拉</td><td>刷新列表</td><td>松手后重新拉取当前目录</td></tr>
+          <tr><td class="feat">点按 ☑</td><td>切换选择模式</td><td>与左滑等效，适合单手操作</td></tr>
         </tbody>
       </table>
     </div>
   </div>
 </section>
 
-<!-- VOICES -->
-<section id="voices">
+<!-- ============ 版本里程碑 ============ -->
+<section id="log">
   <div class="wrap">
     <div class="sec-head reveal">
-      <div class="tag">用户怎么说</div>
-      <h2>把云盘握在自己手里</h2>
-      <p>来自自建玩家的真实反馈（示例）。</p>
-    </div>
-    <div class="voices">
-      <div class="voice reveal"><div class="q">"</div><p>原来每月给商业网盘交会员，现在一份 Worker 的钱用一年，文件还在自己桶里，安心。</p><div class="who">— 独立开发者 A</div><div class="role">个人备份</div></div>
-      <div class="voice reveal"><div class="q">"</div><p>分享给客户能设密码和次数，过期链接自动失效，不用担心外泄，专业感拉满。</p><div class="who">— 自由设计师 B</div><div class="role">客户交付</div></div>
-      <div class="voice reveal"><div class="q">"</div><p>WebDAV 一挂，手机电脑都当本地磁盘用，配合端到端加密，私密文件也敢放。</p><div class="who">— 研究员 C</div><div class="role">科研资料</div></div>
-    </div>
-  </div>
-</section>
-
-<!-- ADVANCED -->
-<section id="advanced" style="background:var(--bg-2)">
-  <div class="wrap">
-    <div class="sec-head reveal">
-      <div class="tag">进阶工具箱</div>
-      <h2>给重度用户的进阶能力</h2>
-      <p>版本、相册、远程下载、自动归档……把繁琐留给系统。</p>
-    </div>
-    <div class="rows">
-      <div class="row reveal"><div class="ic">🕰️</div><div><h4>版本历史</h4><p>每次覆盖自动留存历史版本（默认 5 份），可一键回滚到任意时间点。</p></div></div>
-      <div class="row reveal"><div class="ic">🖼️</div><div><h4>相册与幻灯片</h4><p>把目录整理成公开相册，支持灯箱预览、自动播放幻灯片与 EXIF 信息展示。</p></div></div>
-      <div class="row reveal"><div class="ic">🌐</div><div><h4>远程下载（Fetch URL）</h4><p>粘贴外链即可让网盘在边缘拉取并入库，无需本机中转。</p></div></div>
-      <div class="row reveal"><div class="ic">🤖</div><div><h4>自动归档规则</h4><p>按扩展名/类型自动归类（如压缩包自动解包进目录），上传即整理。</p></div></div>
-      <div class="row reveal"><div class="ic">💾</div><div><h4>备份与快照</h4><p>手动或每日自动快照，可整体恢复；支持存储后端镜像（Mirror）冗余。</p></div></div>
-      <div class="row reveal"><div class="ic">📡</div><div><h4>WebDAV 协议</h4><p>标准 WebDAV 接口，挂载到系统或第三方客户端，像本地磁盘一样用。</p></div></div>
-    </div>
-  </div>
-</section>
-
-<!-- SECURITY -->
-<section id="security">
-  <div class="wrap">
-    <div class="sec-head reveal">
-      <div class="tag">安全与管控</div>
-      <h2>数据是你的，控制权也是</h2>
-      <p>从访问边界到内容加密，多层防护默认开启。</p>
-    </div>
-    <div class="grid g-3">
-      <div class="card reveal"><div class="cic">🔐</div><h3>可选端到端加密</h3><p>浏览器内基于密码派生密钥加密，服务端只存密文，密码不离开本地。</p></div>
-      <div class="card reveal"><div class="cic">🚪</div><h3>文件夹密码锁</h3><p>对任意目录单独加锁，锁定子树禁止被移动/删除绕过，分享也需先解锁。</p></div>
-      <div class="card reveal"><div class="cic">🛡️</div><h3>IP 白/黑名单</h3><p>按 IP 段放行或拒绝访问，企业内网场景一键收敛暴露面。</p></div>
-      <div class="card reveal"><div class="cic">🎫</div><h3>读写 / 只读令牌</h3><p>签发独立访问令牌，可设为只读，适合嵌入展示或第三方只读集成。</p></div>
-      <div class="card reveal"><div class="cic">🚦</div><h3>按令牌限流</h3><p>Durable Object 令牌桶对读写分别限流，防单令牌刷爆 KV 配额，故障自动放行。</p></div>
-      <div class="card reveal"><div class="cic">🤖</div><h3>人机验证</h3><p>公开上传可启用 Turnstile 验证，阻挡机器刷量；管理员会话可随时吊销。</p></div>
-    </div>
-    <div class="rows" style="margin-top:18px">
-      <div class="row reveal"><div class="ic">🛡️</div><div><h4>安全响应头</h4><p>API 响应默认 <code>no-store</code> 不缓存、<code>nosniff</code> 防 MIME 嗅探；错误信息统一为通用提示，不泄露内部细节。所有路径经 <code>normPath</code> 规范化，<code>..</code> 被解析，防目录穿越。</p></div></div>
-    </div>
-  </div>
-</section>
-
-<!-- UX -->
-<section id="ux" style="background:var(--bg-2)">
-  <div class="wrap">
-    <div class="sec-head reveal">
-      <div class="tag">极致体验</div>
-      <h2>Apple 风，顺手到忘了它的存在</h2>
-      <p>毛玻璃、大圆角、柔和阴影，浅色 / 深色 / 跟随系统三主题无缝切换。</p>
-    </div>
-    <div class="grid g-2">
-      <div class="card reveal"><div class="cic">🌗</div><h3>三态主题</h3><p>浅色、深色、跟随系统自由切换，偏好本地记忆；所有内联页一致体验。</p><ul><li>顶部面包屑导航</li><li>全宽网格，无侧栏干扰</li><li>系统字体，清晰易读</li></ul></div>
-      <div class="card reveal"><div class="cic">🖱️</div><h3>拖拽即传</h3><p>拖文件进窗口即上传，进度条实时可见；批量并发、失败可重试。</p><ul><li>悬浮预览（图片/视频/音频/文本/PDF）</li><li>缩略图与生图预览</li><li>移动端同样顺手</li></ul></div>
-      <div class="card reveal"><div class="cic">📱</div><h3>渐进式 Web 应用</h3><p>内置 Service Worker 与清单，可"添加到主屏幕"，离线壳、近原生体验。</p><ul><li>公开上传页（无需登录）</li><li>分享页独立、可嵌入</li><li>响应式，手机/桌面自适应</li></ul></div>
-      <div class="card reveal"><div class="cic">📊</div><h3>用量与统计</h3><p>实时容量进度、上传下载趋势、操作日志一目了然，管理员可远程运维。</p><ul><li>健康自检与孤儿清理</li><li>Webhook 事件通知</li><li>访问令牌集中管理</li></ul></div>
-    </div>
-  </div>
-</section>
-
-<!-- TYPES -->
-<section id="types" style="background:var(--bg-2)">
-  <div class="wrap">
-    <div class="sec-head reveal">
-      <div class="tag">文件无界</div>
-      <h2>什么都能存，什么都能看</h2>
-      <p>图片、视频、音频、文档、压缩包……统一管理与预览。</p>
-    </div>
-    <div class="types">
-      <div class="type reveal"><div class="ti">🖼️</div><div class="tn">图片</div></div>
-      <div class="type reveal"><div class="ti">🎬</div><div class="tn">视频</div></div>
-      <div class="type reveal"><div class="ti">🎵</div><div class="tn">音频</div></div>
-      <div class="type reveal"><div class="ti">📄</div><div class="tn">PDF</div></div>
-      <div class="type reveal"><div class="ti">📝</div><div class="tn">文本/代码</div></div>
-      <div class="type reveal"><div class="ti">📊</div><div class="tn">表格</div></div>
-      <div class="type reveal"><div class="ti">📃</div><div class="tn">文档</div></div>
-      <div class="type reveal"><div class="ti">📦</div><div class="tn">压缩包</div></div>
-      <div class="type reveal"><div class="ti">🎞️</div><div class="tn">RAW/HEIC</div></div>
-      <div class="type reveal"><div class="ti">🗂️</div><div class="tn">目录</div></div>
-      <div class="type reveal"><div class="ti">⚙️</div><div class="tn">工程文件</div></div>
-      <div class="type reveal"><div class="ti">📁</div><div class="tn">任意类型</div></div>
-    </div>
-  </div>
-</section>
-
-<!-- ARCH -->
-<section id="arch">
-  <div class="wrap">
-    <div class="sec-head reveal">
-      <div class="tag">技术架构</div>
-      <h2>跑在边缘，轻量却完整</h2>
-      <p>无服务器、无运维，存储与计算分离，延迟贴近用户。</p>
-    </div>
-    <div class="arch-flow">请求 → Cloudflare 边缘节点（Worker）→ 路由 / 鉴权 / 限流</div>
-    <div class="arch">
-      <div class="node reveal"><div class="ic">🪣</div><h4>R2 存储</h4><p>文件本体与缩略图、版本，低延迟、免出口费。</p></div>
-      <div class="node reveal"><div class="ic">🗄️</div><h4>KV 元数据</h4><p>目录清单、标签、笔记、分享与令牌等结构化数据。</p></div>
-      <div class="node reveal"><div class="ic">⚙️</div><h4>Durable Object</h4><p>用量计数与限流令牌桶，保证并发下原子一致。</p></div>
-      <div class="node reveal"><div class="ic">🌍</div><h4>边缘网络</h4><p>全球节点就近响应，静态壳与资源可缓存。</p></div>
-    </div>
-  </div>
-</section>
-
-<!-- START -->
-<section id="start" style="background:var(--bg-2)">
-  <div class="wrap">
-    <div class="sec-head reveal">
-      <div class="tag">快速开始</div>
-      <h2>三步，拥有你的边缘云盘</h2>
-      <p>克隆、配置绑定、一条命令上线。数据留在你自己的存储桶。</p>
-    </div>
-    <div class="steps">
-      <div class="step reveal"><span class="n">1</span><h4>准备资源</h4><p>创建 KV 命名空间、R2 存储桶、Durable Object 命名空间，记录各自 ID。</p><code>wrangler kv namespace create STORE</code></div>
-      <div class="step reveal"><span class="n">2</span><h4>配置绑定</h4><p>在 <code>wrangler.toml</code> 中把上述资源绑定为 <code>STORE</code> / <code>DRIVE</code> / <code>DIR</code>，并按需注入限流、Turnstile 等变量。</p><code>main = "_workers.js"</code></div>
-      <div class="step reveal"><span class="n">3</span><h4>部署</h4><p>部署后访问站点，设置管理员密码即可开始使用。</p><code>wrangler deploy</code></div>
-    </div>
-  </div>
-</section>
-
-<!-- LOG -->
-<section id="log" style="background:var(--bg-2)">
-  <div class="wrap">
-    <div class="sec-head reveal">
-      <div class="tag">更新日志</div>
+      <div class="tag-label">版本里程碑</div>
       <h2>持续打磨的版本</h2>
-      <p>单文件迭代，部署即更新。</p>
+      <p>只列有实际变化的里程碑，不含琐碎提交。</p>
     </div>
+
     <div class="timeline">
-      <div class="tl reveal"><span class="v">v5.1.2</span><span class="d">当前</span><p>回收站支持目录整体恢复；分片合并完整性预检；API 安全响应头加固。</p></div>
-      <div class="tl reveal"><span class="v">v5.1</span><span class="d">体验</span><p>Apple 风界面重做；浅/深/跟随系统三主题；全宽网格与面包屑导航。</p></div>
-      <div class="tl reveal"><span class="v">v5.0</span><span class="d">架构</span><p>R2 + KV + Durable Object 存储编排；Durable Object 原子化用量与限流。</p></div>
-      <div class="tl reveal"><span class="v">v4.x</span><span class="d">能力</span><p>WebDAV、远程下载、版本历史、相册、自动归档陆续落地。</p></div>
+      <div class="tl-item reveal">
+        <div class="ver"><span>v5.2.0</span><span class="badge">当前 · UI flat-1</span><span class="date">功能与体验大版本</span></div>
+        <ul>
+          <li><b>安全</b>：TOTP 二次验证与备用码、审计日志与 CSV 导出、限时签名直链、风控名单、无状态会话兜底</li>
+          <li><b>分享</b>：细粒度权限（禁下载 / 一次性 / 评论开关 / IP·国家·UA）、自定义短链、访问统计与明细、访客留言、分享外观</li>
+          <li><b>媒体</b>：Office 预览、音乐播放器（封面 / 歌词）、相似图片 dHash、图片批处理、相册增强（密码 / 分页 / EXIF / GPS）</li>
+          <li><b>检索</b>：高级筛选接口、标签体系、收藏分组、元数据导入导出（JSON / CSV）</li>
+          <li><b>运维</b>：可视化配置面板、目录级规则、定时任务、WebDAV 导入、增量备份与差异预览、健康检查与孤儿扫描</li>
+          <li><b>前端</b>：概览仪表盘、单行工具栏与密集列表、四视图与虚拟滚动、⌘K 命令面板、PWA 分享即上传、移动端手势、离线只读</li>
+          <li><b>性能</b>：限流器内存化（省掉每请求一次 DO 往返）、目录按层并行预取（9×）、DO 返回值复用（镜像不再二次回读）</li>
+          <li><b>防爆</b>：读缓存、每分钟写预算、每日遥测预算、内存缓冲合并、各类体积闸门与自动回收</li>
+        </ul>
+      </div>
+      <div class="tl-item reveal">
+        <div class="ver"><span>v5.1.2</span><span class="badge">安全加固</span><span class="date">代码审查全量修复</span></div>
+        <ul>
+          <li>WebDAV PUT 配额与流式写入、URL 抓取回滚、分享目录锁、分享密码限频</li>
+          <li>登录用户级限频、Turnstile 配置完整性、WebDAV GET 净化、删除锁定子树</li>
+          <li>分片孤儿豁免、上传计数原子化、分享 TTL 过期即清</li>
+          <li>口令无盐迁移、令牌改走 Authorization 头、前端属性转义、Webhook 主机校验、错误脱敏</li>
+        </ul>
+      </div>
     </div>
   </div>
 </section>
 
-<!-- FAQ -->
+<!-- ============ 开源与许可 ============ -->
+<section id="license" class="alt">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="tag-label">开源与许可</div>
+      <h2>AGPL-3.0：源码永远对使用者可见</h2>
+      <p>本仓库以 GNU Affero General Public License v3.0 发布。</p>
+    </div>
+
+    <div class="grid g-3">
+      <div class="card reveal"><h3><span class="ci">✅</span>你可以</h3><ul>
+        <li>自由使用、修改、分发，甚至商用</li>
+        <li>部署成自己的服务，数据完全归你</li>
+        <li>基于它做二次开发（需保留许可与声明）</li>
+      </ul></div>
+      <div class="card reveal"><h3><span class="ci">⚠️</span>你需要</h3><ul>
+        <li><b>AGPL §13（网络使用即分发）</b>：把<b>修改过的</b>版本部署成对外服务时，必须向使用者提供完整的对应源码</li>
+        <li>保留版权与许可声明，标注你的修改与日期</li>
+        <li>修改版整体仍以 AGPL-3.0 授权</li>
+      </ul></div>
+      <div class="card reveal"><h3><span class="ci">🧭</span>合规部署两步</h3><ul>
+        <li>用<b>未修改</b>的原版：在页面底部或 README 放一个指向本仓库的链接即可</li>
+        <li>改了代码再对外服务：显式标注"基于上游的修改版 + 修改日期 + 你的源码地址"</li>
+      </ul></div>
+    </div>
+
+    <div class="table-wrap reveal" style="margin-top:14px">
+      <table>
+        <thead><tr><th>文档</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><td class="num">README.md</td><td>功能一览、部署步骤、绑定与环境变量、接口速查、FAQ、已知限制</td></tr>
+          <tr><td class="num">SECURITY.md</td><td>威胁模型、报告渠道与响应时限、密钥轮换、事件响应、部署安全清单</td></tr>
+          <tr><td class="num">CONTRIBUTING.md</td><td>测试规范、代码规范、防爆约束、常见改动配方、PR 流程</td></tr>
+          <tr><td class="num">CODE_OF_CONDUCT.md</td><td>协作行为准则（含 AGPL §13 网络部署条款）</td></tr>
+          <tr><td class="num">LICENSE</td><td>GNU Affero General Public License v3.0</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FAQ ============ -->
 <section id="faq">
   <div class="wrap">
     <div class="sec-head reveal">
-      <div class="tag">常见问题</div>
-      <h2>关于 Personal Drive</h2>
+      <div class="tag-label">常见问题</div>
+      <h2>你大概会问这些</h2>
     </div>
-    <div class="faq">
-      <details class="qa reveal"><summary>大文件传一半断了怎么办？<span class="pm">+</span></summary><div class="ans">分片续传会记录已收分片，重传时服务端返回缺失下标，前端可仅补传缺失片；合并前还会做完整性校验，不再合并中途静默失败。</div></details>
-      <details class="qa reveal"><summary>删除的文件能找回来吗？<span class="pm">+</span></summary><div class="ans">能。文件与目录删除都进入回收站，可单条或批量恢复；30 天内自动清理，并准确回退占用用量。</div></details>
-      <details class="qa reveal"><summary>数据会被平台看到吗？<span class="pm">+</span></summary><div class="ans">文件本体存在你自己的 R2 桶。开启"可选端到端加密"后，服务端只存密文，密码在浏览器内派生、不离开本地。</div></details>
-      <details class="qa reveal"><summary>能当网络硬盘挂载吗？<span class="pm">+</span></summary><div class="ans">可以。内置标准 WebDAV 接口，可挂载到系统文件管理器或第三方客户端，像本地磁盘一样使用。</div></details>
-      <details class="qa reveal"><summary>分享链接会泄露内部信息吗？<span class="pm">+</span></summary><div class="ans">不会。分享页独立渲染，错误统一返回通用提示；访问计数仅在密码校验后计入，超限自动失效。</div></details>
-      <details class="qa reveal"><summary>单文件有大小限制吗？<span class="pm">+</span></summary><div class="ans">默认单文件上限 500 MB（常量可调），超大文件建议分片上传；自动解包受 50 MB 上限保护以防 Worker 内存溢出。</div></details>
+
+    <div class="reveal">
+      <details class="faq"><summary>一定要绑定 Durable Object 吗？</summary><div class="ans">
+        <p>不。DIR 是可选的加速层。不绑定时目录索引走 KV，功能完全一致，只是并发改写与大目录遍历会慢一些。绑定后遇到超出 DO 单值上限的大目录，也会自动回退 KV 合并路径。</p>
+      </div></details>
+
+      <details class="faq"><summary>免费额度够用吗？会不会被限流？</summary><div class="ans">
+        <p>代码就是按免费额度设计的：默认每日遥测写预算 500 条（KV 免费额度是每天 1000 次写），并有多级读缓存、每分钟写预算与内存缓冲合并。个人日常使用通常远低于额度。</p>
+        <p>即使触发限制，也是先暂停遥测类写入（日志、最近访问），登录与目录元数据等关键写入照常——不会"为了统计把服务写死"。</p>
+      </div></details>
+
+      <details class="faq"><summary>备份包含文件内容吗？</summary><div class="ans">
+        <p>不包含。快照只存元数据（目录树、标签、备注、分享、上传链接、目录密码、收藏、最近、用量），并且<b>不含二次验证密钥</b>。文件本体在 R2 里，所以请另外为重要文件保留离线副本——备份恢复不等于文件备份。</p>
+      </div></details>
+
+      <details class="faq"><summary>支持多大的文件？</summary><div class="ans">
+        <p>默认单文件上限 500MB（可在站点配置面板调整），超过 5MB 自动走分片上传（5MB/片），装配后校验大小。实际上限还受 Cloudflare 请求体限制与你的套餐影响。</p>
+      </div></details>
+
+      <details class="faq"><summary>能用自己的域名吗？</summary><div class="ans">
+        <p>可以。给 Worker 配置 Custom Domain（或 Route）即可。仓库里的 <code>CNAME</code> 与 <code>index.html</code> 用于 GitHub Pages 展示页，与 Worker 的访问域名互不影响。</p>
+      </div></details>
+
+      <details class="faq"><summary>分享链接怎么做得更安全？</summary><div class="ans">
+        <p>组合使用：访问密码 + 有效期 + 访问次数上限 + 一次性下载 + 禁止下载（仅预览）+ IP / 国家 / UA 限制 + 自定义短链（换别名即旧链接失效）。对特别敏感的文件，先在客户端加密上传（服务端只存 <code>.enc</code> 密文）。</p>
+      </div></details>
+
+      <details class="faq"><summary>WebDAV 能挂载吗？有什么限制？</summary><div class="ans">
+        <p>可以，地址是 <code>https://&lt;你的域名&gt;/dav/</code>，用户名任意、口令为管理员口令。Windows「映射网络驱动器」、macOS「连接服务器」、Linux <code>davfs2</code> 都行。</p>
+        <p>限制：目录级 MOVE/COPY 返回 501（请用站内"移动/复制"），<code>Depth: infinity</code> 按 1 处理（避免一次 PROPFIND 打爆配额）。</p>
+      </div></details>
+
+      <details class="faq"><summary>怎么确认线上跑的是最新版？</summary><div class="ans">
+        <p>看页面底部状态条（形如 <code>v5.2.0 · flat-1</code>），或访问 <code>/api/version</code> 看 <code>version</code> 与 <code>ui</code> 字段。两者都带界面构建号，专门用于判断"部署有没有生效"。HTML 响应已禁用边缘缓存，刷新即生效。</p>
+      </div></details>
+
+      <details class="faq"><summary>升级会丢数据吗？</summary><div class="ans">
+        <p>不会。数据在 R2 / KV 里，Worker 只是代码，升级＝粘贴新代码再部署。但绑定改名或 KV 结构变化属于破坏性变更，会在发布说明里标注，建议先读再升。回滚也简单：重新部署上一版代码即可。</p>
+      </div></details>
+
+      <details class="faq"><summary>和商业网盘相比，我失去了什么？</summary><div class="ans">
+        <p>主要是"省心"：你要自己配置绑定、自己升级、自己处理故障；没有多租户隔离（单管理员模型）、没有硬件密钥登录、没有商业 SLA 与合规认证、没有端到端加密的完整实现（仅单文件客户端加密）。换来的是数据位置、源码可控与迁移自由。</p>
+      </div></details>
     </div>
   </div>
 </section>
 
-<!-- MARQUEE -->
-<section style="padding:40px 0">
-  <div class="wrap"><div class="marquee"><div class="track" id="mq"></div></div></div>
-</section>
-
-<!-- CTA -->
-<section id="cta">
+<!-- ============ 结尾 CTA ============ -->
+<section id="cta" class="alt">
   <div class="wrap">
-    <div class="cta-band reveal">
-      <h2>几分钟，拥有你的边缘云盘</h2>
-      <p>克隆仓库、填入 R2 与绑定、一条命令部署。数据留在你自己的存储桶，界面与功能完全由你掌控。</p>
-      <a class="btn ghost" href="#core">↑ 回到功能总览</a>
+    <div class="cta reveal">
+      <h2>几分钟，拥有属于你的网盘</h2>
+      <p>一个文件、两个绑定、一个口令。数据在自己的存储桶里，代码在自己的手里。</p>
+      <div class="hero-cta" style="margin-bottom:0">
+        <a class="btn primary" href="#deploy">回到部署步骤</a>
+        <a class="btn ghost" href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud" target="_blank" rel="noopener">在 GitHub 上查看</a>
+      </div>
     </div>
   </div>
 </section>
 
+<!-- ============ 页脚 ============ -->
 <footer>
   <div class="wrap">
-    <div class="fl">
-      <a href="#why">为什么自建</a><a href="#core">功能</a><a href="#compare">对比</a><a href="#security">安全</a><a href="#start">快速开始</a><a href="#faq">FAQ</a>
+    <div class="cols">
+      <div>
+        <div class="brand" style="margin-bottom:10px"><span class="logo">☁</span><span>CF-KVR2-NetworkCloud</span></div>
+        <div>单文件边缘网盘 · v5.2.0 · UI flat-1<br>基于 Cloudflare R2 + KV + Durable Object 构建</div>
+      </div>
+      <div>
+        <h4>文档</h4>
+        <a href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud/blob/main/README.md" target="_blank" rel="noopener">README</a>
+        <a href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud/blob/main/SECURITY.md" target="_blank" rel="noopener">安全策略</a>
+        <a href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">贡献指南</a>
+        <a href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud/blob/main/CODE_OF_CONDUCT.md" target="_blank" rel="noopener">行为准则</a>
+      </div>
+      <div>
+        <h4>页面</h4>
+        <a href="#features">功能总览</a>
+        <a href="#perf">性能数据</a>
+        <a href="#security">安全与隐私</a>
+        <a href="#deploy">部署步骤</a>
+      </div>
+      <div>
+        <h4>项目</h4>
+        <a href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 许可</a>
+        <a href="https://github.com/BlueDriftHK/CF-KVR2-NetworkCloud/issues" target="_blank" rel="noopener">问题反馈</a>
+      </div>
     </div>
-    <div>Personal Drive · v5.1.2 · 基于 Cloudflare R2 + KV + Durable Object 构建</div>
-    <div style="margin-top:6px;opacity:.7">本页为功能介绍示例，具体能力以实际部署版本为准。</div>
+    <div class="fine">
+      本页为项目功能介绍，界面示意图由 CSS 绘制，不依赖图片素材；具体能力以实际部署版本为准。<br>
+      本项目为独立开源项目，与 Cloudflare, Inc. 无隶属或背书关系；Cloudflare、R2、KV、Workers、Durable Objects 是其各自所有者的商标。
+    </div>
   </div>
 </footer>
 
 <button id="toTop" title="回到顶部" aria-label="回到顶部">↑</button>
 
 <script>
-  // 主题切换：与网盘一致的 localStorage 键 'dth'（auto | light | dark）
-  (function () {
-    var root = document.documentElement, key = 'dth', btn = document.getElementById('themeBtn');
-    function apply(v) { root.setAttribute('data-theme', v || 'auto'); if (btn) btn.textContent = (v === 'dark') ? '🌙' : (v === 'light') ? '☀️' : '🌗'; }
-    var saved = null; try { saved = localStorage.getItem(key); } catch (e) {}
-    if (!saved) saved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
-    apply(saved);
+/* ================= 主题：与网盘一致，localStorage 键 'dth'（auto | light | dark） ================= */
+(function () {
+  var root = document.documentElement, key = 'dth', btn = document.getElementById('themeBtn');
+  var label = { auto: '🌗', light: '☀️', dark: '🌙' };
+  function apply(v) {
+    v = (v === 'light' || v === 'dark') ? v : 'auto';
+    root.setAttribute('data-theme', v);
+    var resolved = v === 'auto' ? (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : v;
+    root.classList.toggle('dark', resolved === 'dark');
+    if (btn) { btn.textContent = label[v]; btn.title = '主题：跟随系统 / 浅色 / 深色（当前：' + v + '）'; }
+  }
+  var saved = null; try { saved = localStorage.getItem(key); } catch (e) {}
+  apply(saved || 'auto');
+  if (btn) btn.addEventListener('click', function () {
     var order = ['auto', 'light', 'dark'];
+    var cur = root.getAttribute('data-theme') || 'auto';
+    var next = order[(order.indexOf(cur) + 1) % order.length];
+    apply(next); try { localStorage.setItem(key, next); } catch (e) {}
+  });
+  if (window.matchMedia) {
+    var mq = window.matchMedia('(prefers-color-scheme: dark)');
+    var onChange = function () { if ((root.getAttribute('data-theme') || 'auto') === 'auto') apply('auto'); };
+    if (mq.addEventListener) mq.addEventListener('change', onChange); else if (mq.addListener) mq.addListener(onChange);
+  }
+})();
+
+/* ================= 滚动渐显（含同容器错峰） ================= */
+(function () {
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var groups = new Map();
+  document.querySelectorAll('.reveal').forEach(function (el) {
+    var p = el.parentElement, n = groups.get(p) || 0; groups.set(p, n + 1);
+    el.style.transitionDelay = Math.min(n * 60, 360) + 'ms';
+  });
+  if (reduce || !('IntersectionObserver' in window)) {
+    document.querySelectorAll('.reveal').forEach(function (el) { el.classList.add('in'); });
+    return;
+  }
+  var io = new IntersectionObserver(function (es) {
+    es.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
+  }, { rootMargin: '0px 0px -8% 0px', threshold: .08 });
+  document.querySelectorAll('.reveal').forEach(function (el) { io.observe(el); });
+})();
+
+/* ================= 标签页（功能总览 + 部署方式） ================= */
+(function () {
+  var tabs = [].slice.call(document.querySelectorAll('.tab'));
+  var panels = [].slice.call(document.querySelectorAll('.tab-panel'));
+  // 两组 tab 各自按容器分组
+  var byGroup = new Map();
+  tabs.forEach(function (t) {
+    var g = t.parentElement; if (!byGroup.has(g)) byGroup.set(g, []); byGroup.get(g).push(t);
+  });
+  tabs.forEach(function (t) {
+    t.addEventListener('click', function () {
+      var group = byGroup.get(t.parentElement) || [];
+      var id = t.getAttribute('data-tab');
+      group.forEach(function (x) { x.classList.toggle('active', x === t); });
+      panels.forEach(function (p) { p.classList.toggle('active', p.getAttribute('data-panel') === id); });
+      // 切换后重算一次可见元素的渐显（避免切到未观察过的面板时空白）
+      if ('IntersectionObserver' in window) {
+        panels.forEach(function (p) {
+          if (p.classList.contains('active')) {
+            p.querySelectorAll('.reveal').forEach(function (el) { el.classList.add('in'); });
+          }
+        });
+      }
+    });
+  });
+})();
+
+/* ================= 数字滚动 ================= */
+(function () {
+  var els = [].slice.call(document.querySelectorAll('[data-count]'));
+  if (!els.length) return;
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function render(el, v) {
+    var suffix = el.getAttribute('data-suffix') || '';
+    el.textContent = (v >= 1000 ? v.toLocaleString('zh-CN') : String(v)) + suffix;
+  }
+  function run(el) {
+    var target = parseInt(el.getAttribute('data-count'), 10) || 0;
+    if (reduce) { render(el, target); return; }
+    var dur = 1100, t0 = 0;
+    function step(ts) {
+      if (!t0) t0 = ts;
+      var p = Math.min(1, (ts - t0) / dur);
+      var eased = 1 - Math.pow(1 - p, 3);
+      render(el, Math.round(target * eased));
+      if (p < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+  if (!('IntersectionObserver' in window)) { els.forEach(run); return; }
+  var io = new IntersectionObserver(function (es) {
+    es.forEach(function (e) { if (e.isIntersecting) { run(e.target); io.unobserve(e.target); } });
+  }, { threshold: .4 });
+  els.forEach(function (el) { io.observe(el); });
+})();
+
+/* ================= 顶部进度条 + 回到顶部 ================= */
+(function () {
+  var bar = document.getElementById('progress'), top = document.getElementById('toTop'), raf = 0;
+  function upd() {
+    raf = 0;
+    var st = window.scrollY || document.documentElement.scrollTop || 0;
+    var max = (document.documentElement.scrollHeight - window.innerHeight) || 1;
+    bar.style.width = Math.min(100, Math.max(0, (st / max) * 100)) + '%';
+    top.classList.toggle('show', st > 600);
+  }
+  window.addEventListener('scroll', function () { if (!raf) raf = requestAnimationFrame(upd); }, { passive: true });
+  top.addEventListener('click', function () { window.scrollTo({ top: 0, behavior: 'smooth' }); });
+  upd();
+})();
+
+/* ================= 导航高亮（scroll spy） ================= */
+(function () {
+  var links = [].slice.call(document.querySelectorAll('.nav-links a'));
+  if (!links.length || !('IntersectionObserver' in window)) return;
+  var map = {};
+  links.forEach(function (a) { var id = a.getAttribute('href').slice(1); var s = document.getElementById(id); if (s) map[id] = a; });
+  var io = new IntersectionObserver(function (es) {
+    es.forEach(function (e) {
+      if (!e.isIntersecting) return;
+      links.forEach(function (a) { a.classList.remove('on'); });
+      var a = map[e.target.id]; if (a) a.classList.add('on');
+    });
+  }, { rootMargin: '-45% 0px -50% 0px' });
+  Object.keys(map).forEach(function (id) { io.observe(document.getElementById(id)); });
+})();
+
+/* ================= 一键复制 ================= */
+(function () {
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+    return new Promise(function (resolve, reject) {
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.top = '-1000px';
+        document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, ta.value.length);
+        var ok = document.execCommand('copy'); document.body.removeChild(ta);
+        ok ? resolve() : reject(new Error('execCommand failed'));
+      } catch (e) { reject(e); }
+    });
+  }
+  document.querySelectorAll('.copy').forEach(function (btn) {
     btn.addEventListener('click', function () {
-      var cur = root.getAttribute('data-theme') || 'auto';
-      var next = order[(order.indexOf(cur) + 1) % order.length];
-      apply(next); try { localStorage.setItem(key, next); } catch (e) {}
-    });
-    if (window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () { if ((root.getAttribute('data-theme') || 'auto') === 'auto') apply('auto'); });
-  })();
-
-  // 滚动渐显
-  (function () {
-    var io = new IntersectionObserver(function (es) { es.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } }); }, { threshold: 0.12 });
-    document.querySelectorAll('.reveal').forEach(function (el) { io.observe(el); });
-  })();
-
-  // 功能标签页
-  (function () {
-    var tabs = document.querySelectorAll('.tab'), panels = document.querySelectorAll('.tab-panel');
-    tabs.forEach(function (t) {
-      t.addEventListener('click', function () {
-        var id = t.getAttribute('data-tab');
-        tabs.forEach(function (x) { x.classList.toggle('active', x === t); });
-        panels.forEach(function (p) { p.classList.toggle('active', p.getAttribute('data-panel') === id); });
+      var el = document.getElementById(btn.getAttribute('data-copy'));
+      if (!el) return;
+      var old = btn.textContent;
+      copyText(el.textContent.trim()).then(function () {
+        btn.textContent = '已复制 ✓'; btn.classList.add('ok');
+        setTimeout(function () { btn.textContent = old; btn.classList.remove('ok'); }, 1600);
+      }).catch(function () {
+        // 复制失败（非 https 或权限被拒）：选中文本让用户手动复制
+        var r = document.createRange(); r.selectNodeContents(el);
+        var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+        btn.textContent = '请按 Ctrl+C'; setTimeout(function () { btn.textContent = old; }, 2200);
       });
     });
-  })();
+  });
+})();
 
-  // 数字滚动
-  (function () {
-    var io = new IntersectionObserver(function (es) {
-      es.forEach(function (e) {
-        if (!e.isIntersecting) return;
-        var el = e.target, target = parseInt(el.getAttribute('data-count'), 10) || 0, start = 0, dur = 1100, t0 = null;
-        function step(ts) { if (!t0) t0 = ts; var p = Math.min(1, (ts - t0) / dur); el.textContent = Math.round(start + (target - start) * p); if (p < 1) requestAnimationFrame(step); }
-        requestAnimationFrame(step); io.unobserve(el);
-      });
-    }, { threshold: 0.5 });
-    document.querySelectorAll('[data-count]').forEach(function (el) { io.observe(el); });
-  })();
-
-  // 顶部滚动进度
-  (function () {
-    var bar = document.getElementById('progress');
-    function upd() { var st = window.scrollY || document.documentElement.scrollTop || 0; var max = document.documentElement.scrollHeight - window.innerHeight; bar.style.width = (max > 0 ? (st / max) * 100 : 0) + '%'; }
-    window.addEventListener('scroll', upd, { passive: true }); upd();
-  })();
-
-  // 回到顶部
-  (function () {
-    var b = document.getElementById('toTop');
-    window.addEventListener('scroll', function () { b.classList.toggle('show', window.scrollY > 600); }, { passive: true });
-    b.addEventListener('click', function () { window.scrollTo({ top: 0, behavior: 'smooth' }); });
-  })();
-
-  // 错峰渐显：同容器内的 .reveal 依次延迟
-  (function () {
-    var map = new Map();
-    document.querySelectorAll('.reveal').forEach(function (el) {
-      var p = el.parentElement; var n = (map.get(p) || 0); map.set(p, n + 1);
-      el.style.transitionDelay = Math.min(n * 70, 420) + 'ms';
-    });
-  })();
-
-  // 技术关键词跑马灯（复制一份实现无缝循环）
-  (function () {
-    var items = ['R2 存储','KV 元数据','Durable Object','边缘加速','WebDAV','端到端加密','文件夹锁','令牌限流','版本历史','相册','远程下载','自动归档','回收站','PWA','Turnstile','IP 名单'];
-    var html = items.map(function (t) { return '<span class="badge">' + t + '</span>'; }).join('');
-    var el = document.getElementById('mq'); if (el) el.innerHTML = html + html;
-  })();
 </script>
 </body>
 </html>
