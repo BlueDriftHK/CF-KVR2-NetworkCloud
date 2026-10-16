@@ -14,10 +14,17 @@ const APP_VERSION = 'v5.1.2';
 const THUMB_PREFIX = '.thumb/';
 const VERSIONS_PREFIX = '.versions/';
 const BACKUP_PREFIX = '.backup/';
+const TRASH_PREFIX = '.trash/';
+const TRASH_ROOT = '/' + TRASH_PREFIX;     // 回收站元数据目录
 const MAX_VERSIONS = 5;
 const MAX_UPLOAD_SIZE = 500 * 1024 * 1024;
 const UNZIP_MAX_BYTES = 50 * 1024 * 1024;
+const CHUNK_SIZE = 5 * 1024 * 1024;
+const CHUNKS_PREFIX = '.chunks/';          // 以点开头，避免与用户目录名冲突（sanitizeName 会去掉前导点）
+const UNZIP_MAX_ENTRIES = 1000;            // 解压条目数上限
+const UNZIP_MAX_OUT_BYTES = 200 * 1024 * 1024; // 解压后总量上限
 const USAGE_DO_NAME = '__usage__';
+const DO_ITEMS_MAX = 96 * 1024;            // DO 单值上限 128KiB 的安全余量
 
 // ===== Helpers =====
 function json(data, status) {
@@ -87,6 +94,8 @@ function clampCount(n) {
   return Math.min(v, 1000000);
 }
 function quotaTotal(env) {
+  const cfg = Number(CFG.quotaGB);
+  if (Number.isFinite(cfg) && cfg > 0) return cfg * 1024 * 1024 * 1024;
   const n = env ? Number(env.DRIVE_QUOTA) : NaN;
   return (Number.isFinite(n) && n > 0) ? n : 10 * 1024 * 1024 * 1024;
 }
@@ -96,6 +105,31 @@ async function verifyPassword(pw, rec) {
   if (!rec) return false;
   if (rec.salt) return safeEqual(await hashPassword(pw, rec.salt), rec.hash);
   return safeEqual(await sha256(pw || ''), rec.hash || '');
+}
+// R2 对象搬运（复制 + 删除源），用于回收站
+async function copyObject(env, fromKey, toKey) {
+  try {
+    const o = await env.DRIVE.get(fromKey);
+    if (!o) return false;
+    await env.DRIVE.put(toKey, o.body, { httpMetadata: o.httpMetadata });
+    await env.DRIVE.delete(fromKey);
+    return true;
+  } catch (e) { return false; }
+}
+// 保留源对象的复制（站内复制/粘贴用）
+async function copyObjectKeep(env, fromKey, toKey) {
+  try {
+    const o = await env.DRIVE.get(fromKey);
+    if (!o) return false;
+    await env.DRIVE.put(toKey, o.body, { httpMetadata: o.httpMetadata });
+    return true;
+  } catch (e) { return false; }
+}
+async function copyThumb(env, fromKey, toKey) {
+  try {
+    const t = await env.DRIVE.get(THUMB_PREFIX + fromKey);
+    if (t) await env.DRIVE.put(THUMB_PREFIX + toKey, t.body, { httpMetadata: t.httpMetadata });
+  } catch (e) {}
 }
 // 备注随文件移动/改名迁移
 async function moveNote(env, oldKey, newKey) {
@@ -108,6 +142,292 @@ async function moveNote(env, oldKey, newKey) {
     }
   } catch (e) {}
 }
+
+// ===== KV / R2 防爆（配额与放大保护）=====
+// 思路：
+//  1) 读：热数据加隔离级短 TTL 缓存（令牌 / 目录锁 / webhook / 相册 / 收藏…），
+//     isPathLocked 改为基于"目录锁前缀列表"判断，无锁场景几乎零 KV 读；
+//  2) 写：日志 / 下载明细 / 每日统计 / 最近访问改为内存缓冲 + 定时合并写，
+//     并受"非关键 KV 写预算"限制，避免单请求多次读改写同一热键；
+//  3) 增长：秒传索引与版本索引加 TTL，单目录条目数 / KV 值大小 / 备注标签大小设硬上限；
+//  4) R2：大文件不留历史版本、分片与回收站定期回收、备份按体积裁剪、cron 做孤儿清理与用量校准。
+function numEnv(env, name, def, allowZero) {
+  const n = (env && env[name] != null) ? Number(env[name]) : NaN;
+  if (!Number.isFinite(n)) return def;
+  if (n > 0) return n;
+  return allowZero && n === 0 ? 0 : def;
+}
+// ===== 站点配置（KV 覆盖 > 环境变量 > 默认值）=====
+// 通过网页改配置，无需重新部署；隔离级 30 秒缓存，每个 isolate 每 30 秒最多 1 次 KV 读。
+let CFG = {}, CFG_AT = 0, CFG_OK = false;
+const CONFIG_SPEC = {
+  title: { t: 'string', max: 60 }, logo: { t: 'string', max: 8 },
+  quotaGB: { t: 'number', min: 1, max: 1000000 },
+  maxDirItems: { t: 'number', min: 10, max: 500000 },
+  kvValueMB: { t: 'number', min: 1, max: 24 },
+  versionMaxMB: { t: 'number', min: 0, max: 102400 },
+  versionsMax: { t: 'number', min: 0, max: 50 },
+  versionsTtlDays: { t: 'number', min: 1, max: 3650 },
+  hashTtlDays: { t: 'number', min: 1, max: 3650 },
+  trashDays: { t: 'number', min: 0, max: 3650 },
+  chunkGcHours: { t: 'number', min: 0, max: 720 },
+  backupKeep: { t: 'number', min: 1, max: 500 },
+  backupMaxMB: { t: 'number', min: 1, max: 100 },
+  backupTotalMB: { t: 'number', min: 10, max: 1000000 },
+  backupIncremental: { t: 'bool' },
+  telemetryMaxPerDay: { t: 'number', min: 0, max: 1000000 },
+  telemetryFlushMs: { t: 'number', min: 0, max: 600000 },
+  sessionCacheSec: { t: 'number', min: 0, max: 3600 },
+  kvBudgetPerMin: { t: 'number', min: 0, max: 1000000 },
+  rlReadPerMin: { t: 'number', min: 0, max: 1000000 },
+  rlWritePerMin: { t: 'number', min: 0, max: 1000000 },
+  maxUploadMB: { t: 'number', min: 1, max: 10240 },
+  doorMaxMB: { t: 'number', min: 1, max: 10240 },
+  publicUploadMaxMB: { t: 'number', min: 1, max: 10240 },
+  publicUploadDir: { t: 'string', max: 300 },
+  ipAllow: { t: 'string', max: 500 }, ipDeny: { t: 'string', max: 500 },
+  countryAllow: { t: 'string', max: 200 }, countryDeny: { t: 'string', max: 200 },
+  uaAllow: { t: 'string', max: 500 }, uaDeny: { t: 'string', max: 500 },
+  disableUrlFetch: { t: 'bool' },
+  signTtlMin: { t: 'number', min: 1, max: 43200 },
+  shareZipMaxMB: { t: 'number', min: 1, max: 10240 },
+  notice: { t: 'string', max: 300 }
+};
+async function loadConfig(env, force) {
+  if (!force && CFG_OK && Date.now() - CFG_AT < 30000) return CFG;
+  try { const c = await env.STORE.get('meta:config', 'json'); CFG = (c && typeof c === 'object') ? c : {}; }
+  catch (e) { CFG = {}; }
+  CFG_AT = Date.now(); CFG_OK = true;
+  return CFG;
+}
+function cfgNum(env, envName, cfgName, def, allowZero) {
+  const c = CFG[cfgName];
+  if (typeof c === 'number' && Number.isFinite(c)) { if (c > 0) return c; if (allowZero && c === 0) return 0; }
+  return numEnv(env, envName, def, allowZero);
+}
+function cfgStr(env, envName, cfgName, def) {
+  const c = CFG[cfgName];
+  if (typeof c === 'string' && c.trim()) return c.trim();
+  const e = env && env[envName];
+  if (typeof e === 'string' && e.trim()) return e.trim();
+  return def;
+}
+function cfgBool(env, envName, cfgName, def) {
+  const c = CFG[cfgName];
+  if (typeof c === 'boolean') return c;
+  if (env && env[envName] != null && env[envName] !== '') return String(env[envName]) === '1' || env[envName] === true;
+  return def;
+}
+function siteTitle(env) { return cfgStr(env, 'DRIVE_TITLE', 'title', '云端网盘').slice(0, 60); }
+function siteLogo(env) { return cfgStr(env, 'DRIVE_LOGO', 'logo', '☁️').slice(0, 8); }
+function validateConfig(patch) {
+  const out = {}, errs = [];
+  for (const k of Object.keys(patch || {})) {
+    if (!Object.prototype.hasOwnProperty.call(CONFIG_SPEC, k)) { errs.push('unknown key: ' + k); continue; }
+    const spec = CONFIG_SPEC[k];
+    const v = patch[k];
+    if (v === null || v === '') { out[k] = null; continue; }     // null/空 = 清除该项覆盖
+    if (spec.t === 'bool') { out[k] = !!v; continue; }
+    if (spec.t === 'number') {
+      const n = Number(v);
+      if (!Number.isFinite(n)) { errs.push(k + ' must be a number'); continue; }
+      if (n < spec.min || n > spec.max) { errs.push(k + ' out of range [' + spec.min + ',' + spec.max + ']'); continue; }
+      out[k] = n; continue;
+    }
+    const s = String(v);
+    if (s.length > spec.max) { errs.push(k + ' too long (max ' + spec.max + ')'); continue; }
+    out[k] = s;
+  }
+  return { out, errs };
+}
+// —— 可调上限（配置面板 > 环境变量 > 默认值）——
+function maxDirItems(env) { return Math.floor(cfgNum(env, 'MAX_DIR_ITEMS', 'maxDirItems', 20000)); }
+// 说明：配置面板里的 MB 类键优先；同名旧环境变量按其历史单位（字节）解释，保持向后兼容
+function mbOrBytes(env, cfgKey, envName, defBytes) {
+  const c = CFG[cfgKey];
+  if (typeof c === 'number' && Number.isFinite(c) && c >= 0) return c * 1048576;
+  const n = (env && env[envName] != null) ? Number(env[envName]) : NaN;
+  if (Number.isFinite(n) && n >= 0) return n;
+  return defBytes;
+}
+function kvValueMax(env) { return mbOrBytes(env, 'kvValueMB', 'KV_VALUE_MAX', 8 * 1024 * 1024); }
+function versionMaxBytes(env) { return mbOrBytes(env, 'versionMaxMB', 'VERSION_MAX_BYTES', 64 * 1024 * 1024); }
+function backupMaxBytes(env) { return mbOrBytes(env, 'backupMaxMB', 'BACKUP_MAX_BYTES', 8 * 1024 * 1024); }
+function hashTtl(env) { return Math.floor(cfgNum(env, 'HASH_TTL_DAYS', 'hashTtlDays', 30) * 86400); }
+function versionsTtl(env) { return Math.floor(cfgNum(env, 'VERSIONS_TTL_DAYS', 'versionsTtlDays', 90) * 86400); }
+function trashDays(env) { return Math.max(0, Math.floor(cfgNum(env, 'TRASH_DAYS', 'trashDays', 30, true))); }
+function chunkGcHours(env) { return cfgNum(env, 'CHUNK_GC_HOURS', 'chunkGcHours', 24, true); }
+function backupKeep(env) { return Math.floor(cfgNum(env, 'BACKUP_KEEP', 'backupKeep', 14)); }
+function backupTotalBytes(env) { return cfgNum(env, 'BACKUP_TOTAL_MB', 'backupTotalMB', 200) * 1024 * 1024; }
+function maxNoteBytes(env) { return numEnv(env, 'MAX_NOTE_BYTES', 64 * 1024); }
+function maxTagsBytes(env) { return numEnv(env, 'MAX_TAGS_BYTES', 8 * 1024); }
+function telemetryFlushMs(env) { return cfgNum(env, 'TELEMETRY_FLUSH_MS', 'telemetryFlushMs', 15000, true); }
+function kvBudgetPerMin(env) { return Math.floor(cfgNum(env, 'KV_BUDGET_PER_MIN', 'kvBudgetPerMin', 600)); }
+// 每日遥测写预算：防止"日志/最近/下载明细"把免费额度（1000 写/天）吃光
+function telemetryMaxPerDay(env) { return Math.floor(cfgNum(env, 'TELEMETRY_MAX_PER_DAY', 'telemetryMaxPerDay', 800)); }
+function maxVersions(env) { return Math.floor(cfgNum(env, 'VERSIONS_MAX', 'versionsMax', MAX_VERSIONS, true)); }
+function kvMirrorDir(env) { return cfgBool(env, 'KV_MIRROR_DIR', 'kvMirrorDir', true); }
+function maxUploadBytes(env) { return cfgNum(env, 'MAX_UPLOAD_MB', 'maxUploadMB', 500) * 1024 * 1024; }
+function sessionCacheSec(env) { return numEnv(env, 'SESSION_CACHE_SEC', 10, true); }
+const KV_KEY_MAX = 480;          // KV key 硬限 512B
+const PATH_MAX = 400;            // 路径长度上限（防止 KV key 超限导致静默丢元数据）
+function pathTooLong(p) { return String(p == null ? '' : p).length > PATH_MAX; }
+
+// —— 隔离级读缓存（多 isolate 之间最多各自陈旧 TTL 秒）——
+const KV_CACHE = new Map();
+async function kvCached(key, ttlSec, loader) {
+  if (!(ttlSec > 0)) return loader();
+  const hit = KV_CACHE.get(key);
+  if (hit && Date.now() < hit.exp) return hit.v;
+  const v = await loader();
+  if (KV_CACHE.size > 400) KV_CACHE.clear();
+  KV_CACHE.set(key, { v, exp: Date.now() + ttlSec * 1000 });
+  return v;
+}
+function kvInvalidate(prefix) {
+  for (const k of Array.from(KV_CACHE.keys())) if (k === prefix || k.indexOf(prefix) === 0) KV_CACHE.delete(k);
+}
+
+// —— 非关键 KV 写预算（滑动窗口，每分钟）——
+const KV_WRITE_LOG = [];
+function kvWritesLastMin() { const t = Date.now(); return KV_WRITE_LOG.filter(x => t - x < 60000).length; }
+function kvBudgetOk(env) {
+  const t = Date.now();
+  while (KV_WRITE_LOG.length && t - KV_WRITE_LOG[0] > 60000) KV_WRITE_LOG.shift();
+  if (KV_WRITE_LOG.length >= kvBudgetPerMin(env)) return false;
+  KV_WRITE_LOG.push(t);
+  return true;
+}
+
+// —— 遥测缓冲：日志 / 下载明细 / 下载汇总 / 每日统计 / 最近访问 ——
+// 这些数据是"只增不减"的热键，原先每次请求都要读改写一遍，是 KV 写爆的主因。
+const TEL = { log: [], dllog: [], dl: { total: 0, bytes: 0 }, daily: {}, recent: [], lastFlush: 0, lastChunkGc: 0, day: '', dayCount: 0 };
+// 每日遥测预算：有 DO 时用 DO 计数（不消耗 KV 写），否则退化为进程内计数
+async function telemetryBudgetOk(env) {
+  const day = new Date().toISOString().substring(0, 10);
+  const max = telemetryMaxPerDay(env);
+  if (hasDO(env)) {
+    try {
+      const r = await withTimeout(counterStub(env, 'tel:' + day).fetch('https://dir/counterAdd', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ delta: 1 })
+      }), 2000);
+      if (r && r.ok) {
+        const v = (await r.json()).value;
+        if (typeof v === 'number') return v <= max;
+      }
+    } catch (e) {}
+  }
+  if (TEL.day !== day) { TEL.day = day; TEL.dayCount = 0; }
+  TEL.dayCount++;
+  return TEL.dayCount <= max;
+}
+function telPending() {
+  return TEL.log.length + TEL.dllog.length + TEL.recent.length + (TEL.dl.total || TEL.dl.bytes ? 1 : 0) + Object.keys(TEL.daily).length;
+}
+function telBufLog(entry) { TEL.log.unshift(entry); if (TEL.log.length > 200) TEL.log.length = 200; }
+function telBufDlLog(entry) { TEL.dllog.unshift(entry); if (TEL.dllog.length > 300) TEL.dllog.length = 300; }
+function telBufDaily(kind, bytes) {
+  const day = new Date().toISOString().substring(0, 10);
+  const d = TEL.daily[day] || (TEL.daily[day] = { up: 0, upBytes: 0, dl: 0, dlBytes: 0 });
+  if (kind === 'up') { d.up++; d.upBytes += (bytes || 0); }
+  else if (kind !== 'del') { d.dl++; d.dlBytes += (bytes || 0); }
+}
+function telBufRecent(path) {
+  TEL.recent = TEL.recent.filter(x => x.path !== path);
+  TEL.recent.unshift({ path, time: Date.now() });
+  if (TEL.recent.length > 50) TEL.recent.length = 50;
+}
+async function flushTelemetry(env) {
+  if (!telPending()) return false;
+  if (Date.now() - TEL.lastFlush < telemetryFlushMs(env)) return false;
+  if (!kvBudgetOk(env) || !await telemetryBudgetOk(env)) {
+    // 预算用尽：继续缓冲但强制裁剪，宁可丢日志也不能把 KV 写爆
+    if (TEL.log.length > 200) TEL.log.length = 200;
+    if (TEL.dllog.length > 300) TEL.dllog.length = 300;
+    if (TEL.recent.length > 50) TEL.recent.length = 50;
+    return false;
+  }
+  TEL.lastFlush = Date.now();
+  try {
+    if (TEL.log.length) {
+      const cur = (await env.STORE.get('meta:log', 'json')) || [];
+      const merged = TEL.log.concat(Array.isArray(cur) ? cur : []);
+      if (merged.length > 200) merged.length = 200;
+      await env.STORE.put('meta:log', JSON.stringify(merged));
+      TEL.log = [];
+    }
+    if (TEL.dllog.length) {
+      const cur = (await env.STORE.get('meta:dllog', 'json')) || [];
+      const merged = TEL.dllog.concat(Array.isArray(cur) ? cur : []);
+      if (merged.length > 300) merged.length = 300;
+      await env.STORE.put('meta:dllog', JSON.stringify(merged));
+      TEL.dllog = [];
+    }
+    if (TEL.dl.total || TEL.dl.bytes) {
+      const agg = (await env.STORE.get('meta:dlstat', 'json')) || { total: 0, bytes: 0 };
+      agg.total = (agg.total || 0) + TEL.dl.total;
+      agg.bytes = (agg.bytes || 0) + TEL.dl.bytes;
+      await env.STORE.put('meta:dlstat', JSON.stringify(agg));
+      TEL.dl = { total: 0, bytes: 0 };
+    }
+    const days = Object.keys(TEL.daily);
+    if (days.length) {
+      const all = (await env.STORE.get('meta:daily', 'json')) || {};
+      for (const day of days) {
+        const b = TEL.daily[day], d = all[day] || (all[day] = { up: 0, upBytes: 0, dl: 0, dlBytes: 0 });
+        d.up = (d.up || 0) + (b.up || 0); d.upBytes = (d.upBytes || 0) + (b.upBytes || 0);
+        d.dl = (d.dl || 0) + (b.dl || 0); d.dlBytes = (d.dlBytes || 0) + (b.dlBytes || 0);
+      }
+      const keys = Object.keys(all).sort();
+      while (keys.length > 90) delete all[keys.shift()];
+      await env.STORE.put('meta:daily', JSON.stringify(all));
+      TEL.daily = {};
+    }
+    if (TEL.recent.length) {
+      const cur = (await env.STORE.get('meta:recent', 'json')) || [];
+      const merged = TEL.recent.concat(Array.isArray(cur) ? cur : []);
+      const out = [];
+      const seen = {};
+      for (const it of merged) {
+        if (!it || !it.path || seen[it.path]) continue;
+        seen[it.path] = 1; out.push(it);
+        if (out.length >= 50) break;
+      }
+      await env.STORE.put('meta:recent', JSON.stringify(out), { expirationTtl: 180 * 86400 });
+      TEL.recent = [];
+    }
+  } catch (e) { /* 尽力而为，绝不因遥测写失败影响主流程 */ }
+  return true;
+}
+// 读侧合并缓冲，保证面板立刻能看到最新数据
+function telMergeLogs(cur) { return TEL.log.concat(Array.isArray(cur) ? cur : []).slice(0, 200); }
+function telMergeDlLogs(cur) { return TEL.dllog.concat(Array.isArray(cur) ? cur : []).slice(0, 300); }
+function telMergeDlStat(cur) {
+  const c = cur && typeof cur === 'object' ? cur : { total: 0, bytes: 0 };
+  return { total: (c.total || 0) + TEL.dl.total, bytes: (c.bytes || 0) + TEL.dl.bytes };
+}
+function telMergeDaily(all) {
+  const out = Object.assign({}, all || {});
+  for (const day of Object.keys(TEL.daily)) {
+    const b = TEL.daily[day], d = out[day] || { up: 0, upBytes: 0, dl: 0, dlBytes: 0 };
+    out[day] = {
+      up: (d.up || 0) + (b.up || 0), upBytes: (d.upBytes || 0) + (b.upBytes || 0),
+      dl: (d.dl || 0) + (b.dl || 0), dlBytes: (d.dlBytes || 0) + (b.dlBytes || 0)
+    };
+  }
+  return out;
+}
+function telMergeRecent(cur) {
+  const merged = TEL.recent.concat(Array.isArray(cur) ? cur : []);
+  const out = [], seen = {};
+  for (const it of merged) {
+    if (!it || !it.path || seen[it.path]) continue;
+    seen[it.path] = 1; out.push(it);
+    if (out.length >= 50) break;
+  }
+  return out;
+}
+
 // ===== Range / 流式响应 =====
 function dangerType(mime) {
   const m = String(mime || '').toLowerCase();
@@ -220,13 +540,12 @@ async function verifyTurnstile(env, token, ip) {
 
 // ===== 公开上传（需显式配置 PUBLIC_UPLOAD_DIR 才开启） =====
 function publicUploadDir(env) {
-  const d = env && env.PUBLIC_UPLOAD_DIR;
-  if (!d || typeof d !== 'string' || !d.trim()) return null;
-  return normPath(d.trim());
+  const d = cfgStr(env, 'PUBLIC_UPLOAD_DIR', 'publicUploadDir', '');
+  if (!d) return null;
+  return normPath(d);
 }
 function publicUploadMax(env) {
-  const n = env ? Number(env.PUBLIC_UPLOAD_MAX) : NaN;
-  return (Number.isFinite(n) && n > 0) ? n : 100 * 1024 * 1024;
+  return cfgNum(env, 'PUBLIC_UPLOAD_MAX', 'publicUploadMaxMB', 100) * 1024 * 1024;
 }
 
 // ===== 客户端信息 / 下载明细 =====
@@ -256,16 +575,12 @@ function clientInfo(req) {
   return { ip, country, browser: p.browser, os: p.os, device: p.device };
 }
 async function addDownloadLog(env, e) {
+  // 下载明细改为内存缓冲 + 定时合并写（原先每次下载都要读改写两个热键）
   try {
-    const list = (await env.STORE.get('meta:dllog', 'json')) || [];
-    list.unshift(e);
-    if (list.length > 300) list.length = 300;
-    await env.STORE.put('meta:dllog', JSON.stringify(list));
-    const agg = (await env.STORE.get('meta:dlstat', 'json')) || { total: 0, bytes: 0 };
-    agg.total = (agg.total || 0) + 1;
-    agg.bytes = (agg.bytes || 0) + (e.size || 0);
-    await env.STORE.put('meta:dlstat', JSON.stringify(agg));
-    await addDailyStat(env, 'dl', e.size || 0);
+    telBufDlLog(e);
+    TEL.dl.total += 1;
+    TEL.dl.bytes += (e.size || 0);
+    telBufDaily('dl', e.size || 0);
   } catch (err) {}
 }
 
@@ -276,13 +591,15 @@ async function listKV(env, prefix, max) {
   try {
     let cursor;
     do {
-      const res = await env.STORE.list({ prefix, cursor });
+      const res = await env.STORE.list({ prefix, cursor, limit: 1000 });
       for (const k of res.keys) { out.push(k.name); if (out.length >= cap) break; }
       cursor = res.list_complete ? undefined : res.cursor;
     } while (cursor && out.length < cap);
   } catch (e) {}
   return out;
 }
+// 分享 / 上传链接面板：限制单次列出的条数，避免一次面板打开产生上百次 KV 读
+const LIST_PANEL_MAX = 200;
 
 // ===== S3 兼容多后端（纯 JS AWS SigV4，未配置 DRIVE_BACKENDS 时全部空转） =====
 function getBackends(env) {
@@ -363,7 +680,9 @@ async function s3Request(env, cfg, method, key, query, body, contentType) {
   const sendHeaders = { 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate, 'Authorization': signed.authorization };
   if (cfg.sessionToken) sendHeaders['x-amz-security-token'] = cfg.sessionToken;
   if (method === 'PUT' || method === 'POST') sendHeaders['Content-Type'] = contentType || 'application/octet-stream';
-  const url = cfg.endpoint + canonicalUri + (canonicalQuery ? '?' + canonicalQuery : '');
+  // 虚拟主机风格必须把 bucket 放进 Host，否则签名用的 host 与实际请求不符（403）
+  const origin = cfg.pathStyle ? cfg.endpoint : (u.protocol + '//' + cfg.bucket + '.' + u.host);
+  const url = origin + canonicalUri + (canonicalQuery ? '?' + canonicalQuery : '');
   return fetch(url, { method, headers: sendHeaders, body: (method === 'PUT' || method === 'POST') ? bodyBytes : undefined });
 }
 async function recordMirror(env, id, ok, error) {
@@ -454,50 +773,64 @@ export class DirStore {
     const url = new URL(req.url);
     const op = url.pathname.replace(/^\/+/, '');
 
-    if (op === 'get') {
+    // 关键修复：所有读改写操作都必须先从 KV 播种，否则新起的 DO 实例会把空列表镜像回 KV，
+    // 导致该目录其它条目全部从列表消失。
+    const loadItems = async () => {
       let items = await this.state.storage.get('items');
       if (items === undefined) {
-        try {
-          const kv = await this.env.STORE.get('dir:' + this.name, 'json');
-          items = kv || [];
-        } catch (e) { items = []; }
-        await this.state.storage.put('items', items);
+        try { items = (await this.env.STORE.get('dir:' + this.name, 'json')) || []; }
+        catch (e) { items = []; }
+        try { await this.state.storage.put('items', items); } catch (e) {}
       }
-      return json(items);
+      return Array.isArray(items) ? items : [];
+    };
+    // DO 单值上限 128KiB：过大时清空本地副本，让后续读走 KV，避免读到陈旧列表
+    const saveItems = async (items) => {
+      if (JSON.stringify(items).length > DO_ITEMS_MAX) {
+        try { await this.state.storage.delete('items'); } catch (e) {}
+        return false;
+      }
+      await this.state.storage.put('items', items);
+      return true;
+    };
+
+    if (op === 'get') {
+      return json(await loadItems());
     }
     if (op === 'set' && req.method === 'PUT') {
       const items = await req.json();
-      await this.state.storage.put('items', items);
-      return json({ ok: true });
+      const ok = await saveItems(Array.isArray(items) ? items : []);
+      return json({ ok: true, cached: ok });
     }
     if (op === 'upsert' && req.method === 'POST') {
       const { item } = await req.json();
-      const items = await this.state.storage.get('items') || [];
+      const items = await loadItems();
       const idx = items.findIndex(i => i.name === item.name);
+      if (idx < 0 && items.length >= maxDirItems(this.env)) return json({ error: 'dir-full', limit: maxDirItems(this.env) }, 507);
       if (idx >= 0) items[idx] = item; else items.push(item);
-      await this.state.storage.put('items', items);
-      return json({ ok: true, existed: idx >= 0 });
+      const ok = await saveItems(items);
+      return json({ ok: true, existed: idx >= 0, cached: ok });
     }
     if (op === 'remove' && req.method === 'POST') {
       const { name } = await req.json();
-      const items = await this.state.storage.get('items') || [];
+      const items = await loadItems();
       const filtered = items.filter(i => i.name !== name);
-      await this.state.storage.put('items', filtered);
-      return json({ ok: true, removed: items.length - filtered.length });
+      const ok = await saveItems(filtered);
+      return json({ ok: true, removed: items.length - filtered.length, cached: ok });
     }
     if (op === 'rename' && req.method === 'POST') {
       const { oldName, newName } = await req.json();
-      const items = await this.state.storage.get('items') || [];
+      const items = await loadItems();
       const idx = items.findIndex(i => i.name === oldName);
       if (idx < 0) return json({ error: 'not found' }, 404);
       if (items.find(i => i.name === newName)) return json({ error: 'exists' }, 409);
       items[idx] = { ...items[idx], name: newName, time: new Date().toISOString() };
-      await this.state.storage.put('items', items);
-      return json({ ok: true, item: items[idx] });
+      const ok = await saveItems(items);
+      return json({ ok: true, item: items[idx], cached: ok });
     }
     if (op === 'find' && req.method === 'GET') {
       const name = url.searchParams.get('name');
-      const items = await this.state.storage.get('items') || [];
+      const items = await loadItems();
       return json({ item: items.find(i => i.name === name) || null });
     }
     if (op === 'delete' && req.method === 'POST') {
@@ -516,7 +849,11 @@ export class DirStore {
     }
     if (op === 'addUsage' && req.method === 'POST') {
       const { size, count } = await req.json();
-      const u = await this.state.storage.get('usage') || { used: 0, files: 0 };
+      let u = await this.state.storage.get('usage');
+      if (!u) {
+        try { u = await this.env.STORE.get('meta:usage', 'json') || { used: 0, files: 0 }; }
+        catch (e) { u = { used: 0, files: 0 }; }
+      }
       u.used = Math.max(0, (u.used || 0) + (size || 0));
       u.files = Math.max(0, (u.files || 0) + (count || 0));
       await this.state.storage.put('usage', u);
@@ -614,20 +951,29 @@ async function putDir(env, path, items) {
       }), 3000);
     } catch (e) { console.warn('DO putDir → KV:', e && e.message); }
   }
-  try { await env.STORE.put('dir:' + np, JSON.stringify(items)); } catch (e) {}
+  const body = JSON.stringify(items || []);
+  if (body.length > kvValueMax(env)) { console.warn('dir metadata too large, KV write skipped:', np); return; }
+  if (!kvKeyOk('dir:' + np)) return;
+  try { await env.STORE.put('dir:' + np, body); } catch (e) {}
 }
 
 // DO 成功变更后，把最新目录镜像回 KV，避免 DO 故障时读到陈旧数据
+// （KV_MIRROR_DIR=0 可关闭镜像以省 KV 写配额，代价是 DO 故障时可能读到较旧列表）
 async function mirrorDirToKV(env, np) {
-  if (!hasDO(env)) return;
+  if (!hasDO(env) || !kvMirrorDir(env)) return;
   try {
     const r = await withTimeout(dirStub(env, np).fetch('https://dir/get'), 3000);
-    if (r && r.ok) await env.STORE.put('dir:' + np, JSON.stringify(await r.json()));
+    if (r && r.ok) {
+      const body = JSON.stringify(await r.json());
+      if (body.length > kvValueMax(env) || !kvKeyOk('dir:' + np)) return;
+      await env.STORE.put('dir:' + np, body);
+    }
   } catch (e) {}
 }
 
 async function upsertDirItem(env, path, item) {
   const np = normPath(path);
+  const cap = maxDirItems(env);
   if (hasDO(env)) {
     try {
       const r = await withTimeout(dirStub(env, np).fetch('https://dir/upsert', {
@@ -635,14 +981,37 @@ async function upsertDirItem(env, path, item) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ item })
       }), 3000);
-      if (r && r.ok) { const out = await r.json(); await mirrorDirToKV(env, np); return out; }
+      if (r && r.status === 507) return { ok: false, error: 'Directory is full', limit: cap };
+      if (r && r.ok) {
+        const out = await r.json();
+        // cached=false 表示 DO 放不下（超大目录），此时必须走 KV 合并路径
+        if (!out || out.cached !== false) { await mirrorDirToKV(env, np); return out; }
+      }
     } catch (e) { console.warn('DO upsert → KV:', e && e.message); }
   }
   const items = await getDir(env, np);
   const idx = items.findIndex(i => i.name === item.name);
+  if (idx < 0 && items.length >= cap) return { ok: false, error: 'Directory is full', limit: cap };
   if (idx >= 0) items[idx] = item; else items.push(item);
-  await env.STORE.put('dir:' + np, JSON.stringify(items));
+  const body = JSON.stringify(items);
+  if (body.length > kvValueMax(env)) return { ok: false, error: 'Directory metadata too large', limit: kvValueMax(env) };
+  if (kvKeyOk('dir:' + np)) { try { await env.STORE.put('dir:' + np, body); } catch (e) {} }
   return { ok: true, existed: idx >= 0 };
+}
+// KV key 长度保护：超限时跳过写入（DO 仍持有），避免 put 抛错导致元数据静默丢失
+function kvKeyOk(key) {
+  if (String(key).length <= KV_KEY_MAX) return true;
+  console.warn('KV key too long, skipped:', String(key).slice(0, 60), '...');
+  return false;
+}
+// 目录是否还能放下新条目（写入前预检查，给用户明确报错）
+async function dirRoom(env, dirPath, adding) {
+  try {
+    const items = await getDir(env, dirPath);
+    const cap = maxDirItems(env);
+    if (items.length + (adding || 1) > cap) return { error: 'Directory is full (max ' + cap + ' items)', limit: cap };
+    return null;
+  } catch (e) { return null; }
 }
 
 async function removeDirItem(env, path, name) {
@@ -654,12 +1023,15 @@ async function removeDirItem(env, path, name) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name })
       }), 3000);
-      if (r && r.ok) { const out = await r.json(); await mirrorDirToKV(env, np); return out; }
+      if (r && r.ok) {
+        const out = await r.json();
+        if (!out || out.cached !== false) { await mirrorDirToKV(env, np); return out; }
+      }
     } catch (e) { console.warn('DO remove → KV:', e && e.message); }
   }
   const items = await getDir(env, np);
   const filtered = items.filter(i => i.name !== name);
-  await env.STORE.put('dir:' + np, JSON.stringify(filtered));
+  if (kvKeyOk('dir:' + np)) { try { await env.STORE.put('dir:' + np, JSON.stringify(filtered)); } catch (e) {} }
   return { ok: true, removed: items.length - filtered.length };
 }
 
@@ -672,7 +1044,10 @@ async function renameDirItem(env, path, oldName, newName) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ oldName, newName })
       }), 3000);
-      if (r && r.ok) { const out = await r.json(); await mirrorDirToKV(env, np); return out; }
+      if (r && r.ok) {
+        const out = await r.json();
+        if (!out || out.cached !== false) { await mirrorDirToKV(env, np); return out; }
+      }
       if (r && r.status === 404) return { error: 'not found' };
       if (r && r.status === 409) return { error: 'exists' };
     } catch (e) { console.warn('DO rename → KV:', e && e.message); }
@@ -682,7 +1057,7 @@ async function renameDirItem(env, path, oldName, newName) {
   if (idx < 0) return { error: 'not found' };
   if (items.find(i => i.name === newName)) return { error: 'exists' };
   items[idx] = { ...items[idx], name: newName, time: new Date().toISOString() };
-  await env.STORE.put('dir:' + np, JSON.stringify(items));
+  if (kvKeyOk('dir:' + np)) { try { await env.STORE.put('dir:' + np, JSON.stringify(items)); } catch (e) {} }
   return { ok: true, item: items[idx] };
 }
 
@@ -697,7 +1072,6 @@ async function findDirItem(env, path, name) {
   const items = await getDir(env, np);
   return { item: items.find(i => i.name === name) || null };
 }
-
 async function destroyDir(env, path) {
   const np = normPath(path);
   if (hasDO(env)) {
@@ -756,7 +1130,7 @@ async function recalcUsage(env) {
   async function scan(dirPath) {
     const items = await getDir(env, dirPath);
     for (const it of items) {
-      if (it.type === 'file' && !dirPath.startsWith('/.trash/')) { used += it.size || 0; files++; }
+      if (it.type === 'file' && !dirPath.startsWith(TRASH_ROOT)) { used += it.size || 0; files++; }
       else if (it.type === 'dir') await scan(dirPath + it.name + '/');
     }
   }
@@ -777,7 +1151,7 @@ async function searchDir(env, dirPath, query, locked) {
     if (!q && it.type === 'dir') results.push({ ...it, path: dirPath });
     if (it.type === 'dir') {
       const sub = dirPath + it.name + '/';
-      if (locked && locked.has(sub)) continue;
+      if (locked && isLockedPrefix(sub, locked)) continue;
       const nested = await searchDir(env, sub, query, locked);
       results.push(...nested);
     }
@@ -787,44 +1161,261 @@ async function searchDir(env, dirPath, query, locked) {
 
 // ===== Recent & Favorites =====
 async function addRecent(env, path) {
-  try {
-    let list = await env.STORE.get('meta:recent', 'json') || [];
-    list = list.filter(i => i.path !== path);
-    list.unshift({ path, time: Date.now() });
-    if (list.length > 50) list = list.slice(0, 50);
-    await env.STORE.put('meta:recent', JSON.stringify(list));
-  } catch (e) {}
+  // 预览/打开文件都会触发，改为内存缓冲 + 定时合并写
+  try { telBufRecent(path); } catch (e) {}
 }
-async function getRecent(env) { try { return await env.STORE.get('meta:recent', 'json') || []; } catch (e) { return []; } }
+async function getRecent(env) {
+  try { return telMergeRecent(await env.STORE.get('meta:recent', 'json')); } catch (e) { return telMergeRecent([]); }
+}
+// 把 "{path,time}" 之类的路径列表补全为真正的目录项（带 name/type/size/mime/path），
+// 否则前端会拿到没有 name 的条目，操作按钮会误作用到当前目录。
+async function enrichPathItems(env, paths) {
+  const out = [];
+  for (const p of (Array.isArray(paths) ? paths : [])) {
+    const fp = '/' + String(p || '').replace(/^\/+/, '');
+    const dir = parentOf(fp);
+    const name = fp.split('/').filter(Boolean).pop();
+    if (!name) continue;
+    let item = null;
+    try { const f = await findDirItem(env, dir, name); item = f.item; } catch (e) {}
+    if (item) out.push(Object.assign({}, item, { path: dir, name }));
+  }
+  return out;
+}
+async function handleGetRecent(env) {
+  const list = await getRecent(env);
+  const items = await enrichPathItems(env, list.map(r => (r && r.path) || ''));
+  return json({ items });
+}
 async function toggleFav(env, path) {
   let favs = await env.STORE.get('meta:favs', 'json') || [];
   const idx = favs.indexOf(path);
-  if (idx >= 0) favs.splice(idx, 1); else favs.push(path);
+  if (idx >= 0) {
+    favs.splice(idx, 1);
+    // 取消收藏时同步从分组里移除，避免分组残留失效路径
+    try {
+      const groups = (await env.STORE.get('meta:favgroups', 'json')) || [];
+      let changed = false;
+      for (const g of groups) {
+        if (!Array.isArray(g.paths)) continue;
+        const n = g.paths.filter(p => p !== path);
+        if (n.length !== g.paths.length) { g.paths = n; changed = true; }
+      }
+      if (changed) { await env.STORE.put('meta:favgroups', JSON.stringify(groups)); kvInvalidate('meta:favgroups'); }
+    } catch (e) {}
+  } else favs.push(path);
   await env.STORE.put('meta:favs', JSON.stringify(favs));
+  kvInvalidate('meta:favs');
   return favs;
 }
-async function getFavs(env) { try { return await env.STORE.get('meta:favs', 'json') || []; } catch (e) { return []; } }
+async function getFavs(env) {
+  return await kvCached('meta:favs', 15, async () => {
+    try { return await env.STORE.get('meta:favs', 'json') || []; } catch (e) { return []; }
+  });
+}
+// ===== 收藏分组 =====
+async function getFavGroups(env) {
+  return await kvCached('meta:favgroups', 15, async () => {
+    try { const g = await env.STORE.get('meta:favgroups', 'json'); return Array.isArray(g) ? g : []; } catch (e) { return []; }
+  });
+}
+// 旧的 meta:favs 是路径数组；分组是 [{name, paths:[]}]
+// 注意：分组操作只会把路径补进收藏，绝不会删除收藏（取消收藏由 toggleFav 负责），
+// 否则「删除分组/移出分组」会把收藏本身一并清空。
+async function saveFavGroups(env, groups) {
+  const flat = (await env.STORE.get('meta:favs', 'json') || []).slice();
+  for (const g of groups) for (const p of (g.paths || [])) if (flat.indexOf(p) < 0) flat.push(p);
+  await env.STORE.put('meta:favgroups', JSON.stringify(groups));
+  await env.STORE.put('meta:favs', JSON.stringify(flat));
+  kvInvalidate('meta:favgroups');
+  kvInvalidate('meta:favs');
+  return { groups, flat };
+}
+async function handleFavGroups(env, req) {
+  if (req.method === 'GET') {
+    const groups = await getFavGroups(env);
+    const flat = await getFavs(env);
+    const inGroup = {};
+    for (const g of groups) for (const p of (g.paths || [])) inGroup[p] = g.name;
+    return json({ groups, total: flat.length, inGroup, ungrouped: flat.filter(p => !inGroup[p]) });
+  }
+  const b = await req.json();
+  let groups = (await getFavGroups(env)).slice();
+  if (b && b.delete) {
+    groups = groups.filter(g => g.name !== b.delete);
+    await saveFavGroups(env, groups);
+    return json({ ok: true, groups });
+  }
+  if (b && b.renameFrom) {
+    const g = groups.find(x => x.name === b.renameFrom);
+    if (!g) return json({ error: 'Not found' }, 404);
+    if (groups.some(x => x.name === b.renameTo)) return json({ error: 'Name exists' }, 400);
+    g.name = sanitizeName(String(b.renameTo || '').slice(0, 60)) || g.name;
+    await saveFavGroups(env, groups);
+    return json({ ok: true, groups });
+  }
+  if (b && b.setPath && b.group !== undefined) {
+    // 把某个路径加入/移出分组（group 为空表示移出全部分组）
+    const p = '/' + String(b.setPath).replace(/^\/+/, '');
+    for (const g of groups) g.paths = (g.paths || []).filter(x => x !== p);
+    if (b.group) {
+      let g = groups.find(x => x.name === b.group);
+      if (!g) { g = { name: sanitizeName(String(b.group).slice(0, 60)), paths: [], created: new Date().toISOString() }; groups.push(g); }
+      g.paths.push(p);
+    }
+    const r = await saveFavGroups(env, groups);
+    return json({ ok: true, groups: r.groups });
+  }
+  const name = sanitizeName(String((b && b.name) || '').slice(0, 60));
+  if (!name) return json({ error: 'No name' }, 400);
+  if (groups.length >= 100) return json({ error: 'Too many groups' }, 413);
+  if (!groups.some(g => g.name === name)) groups.push({ name, paths: [], created: new Date().toISOString() });
+  await saveFavGroups(env, groups);
+  return json({ ok: true, groups });
+}
+// ===== 元数据导出 / 导入 =====
+async function collectMetaForExport(env, dir, out, depth) {
+  if (depth > 8 || out.files >= 20000) return;
+  let items = [];
+  try { items = await getDir(env, dir); } catch (e) { return; }
+  for (const it of items) {
+    if (!it || !it.name) continue;
+    if (it.type === 'dir') { out.dirs.push(dir + it.name + '/'); await collectMetaForExport(env, dir + it.name + '/', out, depth + 1); continue; }
+    const full = dir + it.name;
+    let tags = [], note = '';
+    try { tags = await env.STORE.get('tags:' + full, 'json') || []; } catch (e) {}
+    try {
+      const rawNote = await env.STORE.get('note:' + full);
+      if (rawNote != null) {
+        try { note = JSON.parse(rawNote) || ''; } catch (e) { note = String(rawNote); }   // 备注以 JSON 字符串存储
+        if (typeof note !== 'string') note = String(note);
+      }
+    } catch (e) {}
+    out.files.push({ path: full, name: it.name, size: it.size || 0, mime: it.mime || '', time: it.time || '', ph: it.ph || '', tags: tags.map(t => (t && t.name) || ''), note: note.slice(0, 500) });
+    if (out.files.length >= 20000) return;
+  }
+}
+async function handleExportMeta(env, q) {
+  const dir = normPath(q.path || '/');
+  const out = { dirs: [], files: [] };
+  await collectMetaForExport(env, dir, out, 0);
+  const favs = await getFavs(env);
+  const payload = {
+    app: 'personal-drive', version: APP_VERSION, created: new Date().toISOString(), scope: dir,
+    dirs: out.dirs, files: out.files,
+    favorites: favs.filter(p => p.indexOf(dir) === 0)
+  };
+  const body = JSON.stringify(payload);
+  if (q.format === 'download') {
+    return new Response(body, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Disposition': 'attachment; filename="drive-meta-' + new Date().toISOString().substring(0, 10) + '.json"',
+        'Cache-Control': 'no-store'
+      }
+    });
+  }
+  if (q.format === 'csv') {
+    const rows = ['path,size,mime,time,tags,note'];
+    for (const f of out.files) {
+      rows.push([f.path, f.size, f.mime, f.time, f.tags.join('|'), String(f.note || '').replace(/[\r\n]+/g, ' ')]
+        .map(x => '"' + String(x == null ? '' : x).replace(/"/g, '""') + '"').join(','));
+    }
+    return new Response('\ufeff' + rows.join('\n'), {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="drive-meta-' + new Date().toISOString().substring(0, 10) + '.csv"',
+        'Cache-Control': 'no-store'
+      }
+    });
+  }
+  return json({ ok: true, files: out.files.length, dirs: out.dirs.length, bytes: body.length, payload });
+}
+async function handleImportMeta(env, b) {
+  const data = (b && b.payload) ? b.payload : b;
+  if (!data || !Array.isArray(data.files)) return json({ error: 'Bad payload' }, 400);
+  const mode = (b && b.mode) === 'replace' ? 'replace' : 'merge';
+  const applyFav = !(b && b.favorites === false);
+  let matched = 0, missing = 0, tagsWritten = 0, notesWritten = 0, favAdded = 0;
+  const limit = Math.min(data.files.length, 5000);
+  for (let i = 0; i < limit; i++) {
+    const f = data.files[i];
+    if (!f || !f.path) continue;
+    const p = '/' + String(f.path).replace(/^\/+/, '');
+    const dir = parentOf(p), name = p.split('/').filter(Boolean).pop();
+    const found = await findDirItem(env, dir, name);
+    if (!found.item) { missing++; continue; }
+    matched++;
+    const incoming = Array.isArray(f.tags) ? f.tags.filter(Boolean).map(n => ({ name: String(n).slice(0, 60), color: '' })) : [];
+    if (incoming.length) {
+      let cur = [];
+      try { cur = await env.STORE.get('tags:' + p, 'json') || []; } catch (e) { cur = []; }
+      let next;
+      if (mode === 'replace') next = incoming;
+      else {
+        const map = {};
+        for (const t of cur) if (t && t.name) map[t.name] = t.color || '';
+        for (const t of incoming) if (!(t.name in map)) map[t.name] = '';
+        next = Object.keys(map).map(n => ({ name: n, color: map[n] }));
+      }
+      if (JSON.stringify(next).length <= maxTagsBytes(env)) {
+        await env.STORE.put('tags:' + p, JSON.stringify(next));
+        tagsWritten++;
+        await addGlobalTags(env, incoming);
+      }
+    }
+    if (f.note) {
+      const note = String(f.note).slice(0, 4000);
+      const enc = JSON.stringify(note);
+      if (enc.length <= maxNoteBytes(env)) { await env.STORE.put('note:' + p, enc); notesWritten++; }
+    }
+  }
+  if (applyFav && Array.isArray(data.favorites) && data.favorites.length) {
+    let favs = (await getFavs(env)).slice();
+    const before = favs.length;
+    for (const p of data.favorites.slice(0, 5000)) {
+      const k = '/' + String(p).replace(/^\/+/, '');
+      if (favs.indexOf(k) < 0 && favs.length < 5000) favs.push(k);
+    }
+    favAdded = favs.length - before;
+    if (favAdded) {
+      await env.STORE.put('meta:favs', JSON.stringify(favs));
+      kvInvalidate('meta:favs');
+    }
+  }
+  kvInvalidate('tagcounts');
+  return json({ ok: true, matched, missing, tagsWritten, notesWritten, favAdded, mode, considered: limit });
+}
 
 // ===== Auth =====
 // 统一鉴权：会话令牌（rw）或访问令牌（ro/rw）；也支持 Authorization: Bearer
+// 注意：query 里的 token 可能另有用途（例如 /api/share-stats?token=<分享令牌>），
+// 因此两个来源都要尝试，不能只认 query。
 async function authInfo(env, req) {
-  let t = '';
-  try { t = new URL(req.url).searchParams.get('token') || ''; } catch (e) {}
-  if (!t) {
-    const a = req.headers.get('Authorization') || '';
-    if (a.startsWith('Bearer ')) t = a.substring(7).trim();
-  }
-  if (!t) return { ok: false, perm: '' };
+  const cands = [];
+  try { const q = new URL(req.url).searchParams.get('token'); if (q) cands.push(q); } catch (e) {}
   try {
-    const s = await env.STORE.get('session:' + t, 'json');
-    if (s && Date.now() < s.exp) return { ok: true, perm: 'rw', kind: 'session' };
+    const a = req.headers.get('Authorization') || '';
+    if (a.startsWith('Bearer ')) { const b = a.substring(7).trim(); if (b && cands.indexOf(b) < 0) cands.push(b); }
   } catch (e) {}
+  if (!cands.length) return { ok: false, perm: '' };
+  for (const t of cands) {
+    try {
+      // 会话读取是每个请求的固定开销，默认缓存 10 秒（SESSION_CACHE_SEC=0 可关闭）
+      const s = await kvCached('session@' + t, sessionCacheSec(env), async () => {
+        try { return await env.STORE.get('session:' + t, 'json'); } catch (e) { return null; }
+      });
+      if (s && Date.now() < s.exp) return { ok: true, perm: 'rw', kind: 'session' };
+    } catch (e) {}
+  }
   try {
     const tokens = await getAccessTokens(env);
-    const found = tokens.find(x => safeEqual(x.token, t));
-    if (found) {
-      if (found.exp && Date.now() > new Date(found.exp).getTime()) return { ok: false, perm: '' };
-      return { ok: true, perm: found.perm === 'ro' ? 'ro' : 'rw', kind: 'token' };
+    for (const t of cands) {
+      const found = tokens.find(x => safeEqual(x.token, t));
+      if (found) {
+        if (found.exp && Date.now() > new Date(found.exp).getTime()) continue;
+        return { ok: true, perm: found.perm === 'ro' ? 'ro' : 'rw', kind: 'token' };
+      }
     }
   } catch (e) {}
   return { ok: false, perm: '' };
@@ -833,6 +1424,80 @@ async function checkAuth(env, req) {
   const a = await authInfo(env, req);
   return a.ok;
 }
+// ===== 防外链：签名直链（HMAC-SHA256，可绑定请求 IP）=====
+async function signSecretValue(env) {
+  const s = (env && (env.URL_SIGN_SECRET || env.DRIVE_PASSWORD)) || '';
+  if (s) return String(s);
+  try { const rec = await adminPasswordRec(env); if (rec && rec.hash) return String(rec.hash); } catch (e) {}
+  return 'personal-drive-default-sign-key';
+}
+async function signPath(env, key, expSec, ip) {
+  const secret = await signSecretValue(env);
+  const enc = new TextEncoder();
+  const mac = await hmacSha256(enc.encode(secret), enc.encode(key + '|' + expSec + '|' + (ip || '')));
+  return Array.from(mac).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 40);
+}
+async function verifySignedUrl(env, req, key) {
+  try {
+    const u = new URL(req.url);
+    const exp = parseInt(u.searchParams.get('exp') || '0', 10);
+    const sig = String(u.searchParams.get('sig') || '');
+    if (!exp || !sig) return { ok: false };
+    if (Math.floor(Date.now() / 1000) > exp) return { ok: false, reason: 'expired' };
+    const bind = String(u.searchParams.get('ip') || '');
+    if (bind) {
+      const reqIp = req.headers.get('CF-Connecting-IP') || '';
+      if (bind !== reqIp) return { ok: false, reason: 'ip' };
+    }
+    return (safeEqual(await signPath(env, key, exp, bind), sig)) ? { ok: true } : { ok: false, reason: 'sig' };
+  } catch (e) { return { ok: false }; }
+}
+async function handleSign(env, req, path, ttl, bindIp) {
+  const key = String(path || '').replace(/^\/+/, '');
+  if (!key) return json({ error: 'Bad path' }, 400);
+  const ttlSec = Math.min(Math.max(parseInt(ttl, 10) || 3600, 60), 30 * 86400);
+  const exp = Math.floor(Date.now() / 1000) + ttlSec;
+  const ip = bindIp ? (req.headers.get('CF-Connecting-IP') || '') : '';
+  const sig = await signPath(env, key, exp, ip);
+  const q = 'exp=' + exp + '&sig=' + sig + (ip ? '&ip=' + encodeURIComponent(ip) : '');
+  return json({
+    ok: true, exp, ttl: ttlSec, bound: ip || null,
+    url: '/api/download?path=' + encodeURIComponent('/' + key) + '&' + q,
+    preview: '/api/preview?path=' + encodeURIComponent('/' + key) + '&' + q
+  });
+}
+
+// ===== 审计日志：筛选与 CSV 导出 =====
+async function handleLogs(env, q) {
+  const logs = await getLogs(env);
+  const action = String((q && q.action) || '');
+  const kw = String((q && q.q) || '').toLowerCase();
+  const from = (q && q.from) ? Date.parse(q.from) : 0;
+  const to = (q && q.to) ? Date.parse(q.to) + 86399999 : 0;
+  const limit = Math.min(Math.max(parseInt((q && q.limit) || 200, 10) || 200, 1), 1000);
+  const out = logs.filter(l => {
+    if (action && l.action !== action) return false;
+    if (kw && (String(l.path || '') + ' ' + String(l.detail || '')).toLowerCase().indexOf(kw) < 0) return false;
+    const ts = Date.parse(l.time || '') || 0;
+    if (from && ts < from) return false;
+    if (to && ts > to) return false;
+    return true;
+  }).slice(0, limit);
+  const actions = {};
+  for (const l of logs) actions[l.action || '?'] = (actions[l.action || '?'] || 0) + 1;
+  return json({ logs: out, total: logs.length, shown: out.length, actions });
+}
+function csvCell(v) {
+  const s = String(v == null ? '' : v);
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+async function handleLogsCsv(env) {
+  const logs = await getLogs(env);
+  const rows = [['time', 'action', 'path', 'detail']].concat(logs.map(l => [l.time, l.action, l.path, l.detail]));
+  const csv = '\ufeff' + rows.map(r => r.map(csvCell).join(',')).join('\r\n');
+  return new Response(csv, { headers: { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="drive-log.csv"', 'Cache-Control': 'private, no-store' } });
+}
+
 // 从请求中提取用于限流的令牌（解析方式与 authInfo 保持一致：优先 ?token，其次 Authorization: Bearer）
 function extractToken(req) {
   let t = '';
@@ -841,8 +1506,8 @@ function extractToken(req) {
   return t;
 }
 // 按令牌限流配置（每分钟读写次数，可用环境变量覆盖；DO 未配置时跳过）
-function rlReadPerMin(env) { const n = env ? Number(env.RL_READ_PER_MIN) : NaN; return (Number.isFinite(n) && n > 0) ? n : 150; }
-function rlWritePerMin(env) { const n = env ? Number(env.RL_WRITE_PER_MIN) : NaN; return (Number.isFinite(n) && n > 0) ? n : 30; }
+function rlReadPerMin(env) { return Math.floor(cfgNum(env, 'RL_READ_PER_MIN', 'rlReadPerMin', 150)); }
+function rlWritePerMin(env) { return Math.floor(cfgNum(env, 'RL_WRITE_PER_MIN', 'rlWritePerMin', 30)); }
 function rlStub(env, token) { return env.DIR.get(env.DIR.idFromName('__rl__:' + (token || 'anon'))); }
 // 令牌桶限流：读/写各一个桶，按时间回填；DO 故障或超时时放行（fail-open），避免误伤正常请求
 async function rateLimitCheck(env, token, isWrite) {
@@ -898,6 +1563,140 @@ async function checkAdminPassword(env, pw) {
 async function handleAdminPassGet(env) {
   return json({ usingKv: await adminPasswordSet(env), envSet: !!env.DRIVE_PASSWORD });
 }
+
+// ===== TOTP 双因素（RFC 6238）=====
+const B32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function base32Encode(bytes) {
+  let bits = 0, value = 0, out = '';
+  for (const b of bytes) {
+    value = (value << 8) | b; bits += 8;
+    while (bits >= 5) { out += B32_ALPHABET[(value >>> (bits - 5)) & 31]; bits -= 5; }
+  }
+  if (bits > 0) out += B32_ALPHABET[(value << (5 - bits)) & 31];
+  return out;
+}
+function base32Decode(str) {
+  const s = String(str || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
+  let bits = 0, value = 0;
+  const out = [];
+  for (const ch of s) {
+    const idx = B32_ALPHABET.indexOf(ch);
+    if (idx < 0) continue;
+    value = (value << 5) | idx; bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 255); bits -= 8; }
+  }
+  return new Uint8Array(out);
+}
+async function totpAt(secretB32, offsetSteps) {
+  const key = base32Decode(secretB32);
+  if (!key.length) return '';
+  const counter = Math.floor(Date.now() / 1000 / 30) + (offsetSteps || 0);
+  const buf = new ArrayBuffer(8);
+  const dv = new DataView(buf);
+  dv.setUint32(0, Math.floor(counter / 4294967296));
+  dv.setUint32(4, counter >>> 0);
+  const k = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', k, buf));
+  const off = mac[mac.length - 1] & 0x0f;
+  const bin = ((mac[off] & 0x7f) << 24) | ((mac[off + 1] & 0xff) << 16) | ((mac[off + 2] & 0xff) << 8) | (mac[off + 3] & 0xff);
+  return String(bin % 1000000).padStart(6, '0');
+}
+async function totpVerify(secretB32, code) {
+  const c = String(code || '').replace(/\D/g, '');
+  if (c.length !== 6 || !secretB32) return false;
+  for (const off of [-1, 0, 1]) {
+    if (safeEqual(await totpAt(secretB32, off), c)) return true;
+  }
+  return false;
+}
+function makeBackupCodes(n) {
+  const out = [];
+  for (let i = 0; i < (n || 8); i++) {
+    const raw = randToken().substring(0, 8).toUpperCase();
+    out.push(raw.substring(0, 4) + '-' + raw.substring(4, 8));
+  }
+  return out;
+}
+async function totpRecord(env) {
+  try { return await env.STORE.get('meta:totp', 'json'); } catch (e) { return null; }
+}
+async function totpEnabled(env) {
+  const r = await totpRecord(env);
+  return !!(r && r.enabled && r.secret);
+}
+// 校验动态码或一次性备用码（备用码用过即失效）
+async function totpCheck(env, code) {
+  const rec = await totpRecord(env);
+  if (!rec || !rec.enabled || !rec.secret) return { ok: true, kind: 'off' };
+  const c = String(code || '').trim();
+  if (!c) return { ok: false, error: 'Missing code' };
+  if (await totpVerify(rec.secret, c)) return { ok: true, kind: 'totp' };
+  const h = await sha256(c.toUpperCase().replace(/[^A-Z0-9]/g, ''));
+  const list = Array.isArray(rec.backup) ? rec.backup : [];
+  const idx = list.findIndex(x => safeEqual(x, h));
+  if (idx >= 0) {
+    list.splice(idx, 1);
+    rec.backup = list;
+    try { await env.STORE.put('meta:totp', JSON.stringify(rec)); } catch (e) {}
+    return { ok: true, kind: 'backup', left: list.length };
+  }
+  return { ok: false, error: 'Wrong code' };
+}
+async function handleTotpGet(env) {
+  const rec = await totpRecord(env);
+  return json({
+    enabled: !!(rec && rec.enabled),
+    pending: !!(rec && rec.secret && !rec.enabled),
+    backupLeft: (rec && Array.isArray(rec.backup)) ? rec.backup.length : 0,
+    created: (rec && rec.created) || ''
+  });
+}
+async function handleTotpSetup(env, label) {
+  const rec = (await totpRecord(env)) || {};
+  if (rec.enabled) return json({ error: 'Already enabled' }, 400);
+  const bytes = crypto.getRandomValues(new Uint8Array(20));
+  const secret = base32Encode(bytes);
+  const next = Object.assign({}, rec, { secret, enabled: false, created: new Date().toISOString() });
+  await env.STORE.put('meta:totp', JSON.stringify(next));
+  const name = String(label || 'PersonalDrive').replace(/[^A-Za-z0-9._-]/g, '') || 'PersonalDrive';
+  const otpauth = 'otpauth://totp/' + encodeURIComponent(name) + '?secret=' + secret + '&issuer=' + encodeURIComponent(name) + '&algorithm=SHA1&digits=6&period=30';
+  return json({ ok: true, secret, otpauth });
+}
+async function handleTotpEnable(env, code) {
+  const rec = await totpRecord(env);
+  if (!rec || !rec.secret) return json({ error: 'No pending secret' }, 400);
+  if (rec.enabled) return json({ error: 'Already enabled' }, 400);
+  if (!await totpVerify(rec.secret, code)) return json({ error: 'Wrong code' }, 403);
+  const codes = makeBackupCodes(8);
+  const hashes = [];
+  for (const c of codes) hashes.push(await sha256(c.replace(/[^A-Z0-9]/g, '')));
+  rec.enabled = true;
+  rec.backup = hashes;
+  rec.enabledAt = new Date().toISOString();
+  await env.STORE.put('meta:totp', JSON.stringify(rec));
+  try { await addLog(env, 'sec', '(二次验证)', 'TOTP enabled'); } catch (e) {}
+  return json({ ok: true, backupCodes: codes });
+}
+async function handleTotpDisable(env, password, code) {
+  if (!await checkAdminPassword(env, password || '')) return json({ error: 'Wrong password' }, 403);
+  const v = await totpCheck(env, code);
+  if (!v.ok) return json({ error: v.error || 'Wrong code' }, 403);
+  try { await env.STORE.delete('meta:totp'); } catch (e) {}
+  try { await addLog(env, 'sec', '(二次验证)', 'TOTP disabled'); } catch (e) {}
+  return json({ ok: true });
+}
+async function handleTotpBackup(env, password, code) {
+  if (!await checkAdminPassword(env, password || '')) return json({ error: 'Wrong password' }, 403);
+  const rec = await totpRecord(env);
+  if (!rec || !rec.enabled) return json({ error: 'TOTP not enabled' }, 400);
+  if (!await totpVerify(rec.secret, code)) return json({ error: 'Wrong code' }, 403);
+  const codes = makeBackupCodes(8);
+  const hashes = [];
+  for (const c of codes) hashes.push(await sha256(c.replace(/[^A-Z0-9]/g, '')));
+  rec.backup = hashes;
+  await env.STORE.put('meta:totp', JSON.stringify(rec));
+  return json({ ok: true, backupCodes: codes });
+}
 async function handleAdminPassSet(env, current, next) {
   if (!next) return json({ error: 'Empty password' }, 400);
   if (!(await adminPasswordSet(env)) && !env.DRIVE_PASSWORD) return json({ error: 'Server not configured' }, 500);
@@ -909,6 +1708,7 @@ async function handleAdminPassSet(env, current, next) {
   try {
     const keys = await listKV(env, 'session:', 1000);
     for (const k of keys) { try { await env.STORE.delete(k); } catch (e) {} }
+    kvInvalidate('session@');
   } catch (e) {}
   return json({ ok: true });
 }
@@ -935,16 +1735,64 @@ function ipMatch(ip, rule) {
   return ip === r || String(ip).indexOf(r) === 0;
 }
 function ipAllowed(env, ip) {
-  const allow = String((env && env.IP_ALLOW) || '').split(',').map(s => s.trim()).filter(Boolean);
-  const deny = String((env && env.IP_DENY) || '').split(',').map(s => s.trim()).filter(Boolean);
+  const allow = csvList(cfgStr(env, 'IP_ALLOW', 'ipAllow', ''));
+  const deny = csvList(cfgStr(env, 'IP_DENY', 'ipDeny', ''));
   for (let i = 0; i < deny.length; i++) { if (ipMatch(ip, deny[i])) return false; }
   if (allow.length) { for (let i = 0; i < allow.length; i++) { if (ipMatch(ip, allow[i])) return true; } return false; }
   return true;
 }
+// ===== 地区 / User-Agent 风控（可选环境变量）=====
+// COUNTRY_ALLOW / COUNTRY_DENY：ISO 国家码（逗号分隔，如 "CN,HK,TW"）
+// UA_DENY / UA_ALLOW：User-Agent 关键字（逗号分隔，大小写不敏感）
+function csvList(v) { return String(v == null ? '' : v).split(',').map(s => s.trim()).filter(Boolean); }
+function countryAllowed(env, country) {
+  const allow = csvList(cfgStr(env, 'COUNTRY_ALLOW', 'countryAllow', '')).map(s => s.toUpperCase());
+  const deny = csvList(cfgStr(env, 'COUNTRY_DENY', 'countryDeny', '')).map(s => s.toUpperCase());
+  const c = String(country || '').toUpperCase();
+  if (c && deny.indexOf(c) >= 0) return false;
+  if (allow.length) return !!c && allow.indexOf(c) >= 0;
+  return true;
+}
+function uaAllowed(env, ua) {
+  const allow = csvList(cfgStr(env, 'UA_ALLOW', 'uaAllow', '')).map(s => s.toLowerCase());
+  const deny = csvList(cfgStr(env, 'UA_DENY', 'uaDeny', '')).map(s => s.toLowerCase());
+  const u = String(ua || '').toLowerCase();
+  for (const d of deny) { if (d && u.indexOf(d) >= 0) return false; }
+  if (allow.length) { for (const a of allow) { if (a && u.indexOf(a) >= 0) return true; } return false; }
+  return true;
+}
+function requestAllowed(env, req) {
+  const ip = (req && req.headers.get('CF-Connecting-IP')) || '';
+  if (!ipAllowed(env, ip)) return { ok: false, reason: 'ip' };
+  const country = (req && req.cf && req.cf.country) || '';
+  if (!countryAllowed(env, country)) return { ok: false, reason: 'country' };
+  const ua = (req && req.headers.get('User-Agent')) || '';
+  if (!uaAllowed(env, ua)) return { ok: false, reason: 'ua' };
+  return { ok: true };
+}
+// 新设备/新地区登录提醒（只保留最近 50 条 ip|country，1 读 1 写，登录才触发）
+async function loginSeenCheck(env, req) {
+  try {
+    const ci = clientInfo(req);
+    const key = (ci.ip || '') + '|' + (ci.country || '');
+    if (!ci.ip) return true;
+    const rec = (await kvCached('meta:loginseen', 5, async () => {
+      try { return await env.STORE.get('meta:loginseen', 'json') || []; } catch (e) { return []; }
+    })) || [];
+    const known = rec.some(x => x === key);
+    if (!known) {
+      const next = [key].concat(rec).slice(0, 50);
+      try { await env.STORE.put('meta:loginseen', JSON.stringify(next), { expirationTtl: 180 * 86400 }); } catch (e) {}
+      kvInvalidate('meta:loginseen');
+      try { await notifyWebhook(env, { event: 'login', path: '/', detail: '新设备登录 ' + key + ' ' + (ci.browser || '') + '/' + (ci.os || '') }); } catch (e) {}
+    }
+    return !known;
+  } catch (e) { return true; }
+}
 
 // ===== 会话 / 设备管理 =====
 async function handleListSessions(env, currentToken) {
-  const keys = await listKV(env, 'session:', 300);
+  const keys = await listKV(env, 'session:', 200);
   const out = [];
   for (const k of keys) {
     try {
@@ -971,32 +1819,36 @@ async function handleRevokeSession(env, id, all) {
       try { await env.STORE.delete(k); n++; } catch (e) {}
     }
   }
+  kvInvalidate('session@');
   return json({ ok: true, revoked: n });
 }
 
 // ===== Folder lock =====
 async function isPathLocked(env, dirPath, sessionToken) {
   dirPath = normPath(dirPath);
-  const parts = dirPath.split('/').filter(Boolean);
-  let check = '/';
+  // 先看"目录锁前缀列表"（带缓存）：没有锁时零 KV 读，避免每层路径一次 get
+  let all;
+  try { all = await getLockedPrefixes(env); } catch (e) { all = new Set(); }
+  if (!all.size) return false;
   const locked = [];
-  for (const seg of parts) {
-    check = check === '/' ? '/' + seg + '/' : check + seg + '/';
-    const pass = await env.STORE.get('dirpass:' + check, 'json');
-    if (pass) locked.push(check);
+  for (const lp of all) {
+    if (lp === '/' || dirPath === lp || dirPath.startsWith(lp)) locked.push(lp);
   }
   if (!locked.length) return false;
   if (!sessionToken) return true;
   for (const lp of locked) {
     try {
-      const u = await env.STORE.get('unlock:' + sessionToken + ':' + lp, 'json');
+      const u = await kvCached('unlock@' + sessionToken + ':' + lp, 10, async () => {
+        try { return await env.STORE.get('unlock:' + sessionToken + ':' + lp, 'json'); } catch (e) { return null; }
+      });
       if (!u || Date.now() >= u.exp) return true;
     } catch (e) { return true; }
   }
   return false;
 }
 async function guard(env, req, ...paths) {
-  const st = new URL(req.url).searchParams.get('token') || '';
+  // 会话令牌同时支持 ?token= 与 Authorization: Bearer（否则用头鉴权时锁目录永远解不开）
+  const st = extractToken(req);
   for (const p of paths) {
     if (!p) continue;
     const np = normPath(p);
@@ -1006,17 +1858,21 @@ async function guard(env, req, ...paths) {
 }
 
 // 收集被密码保护的目录，用于全局扫描接口过滤，避免泄露锁定目录内容
+// （LIST 属于较贵的操作，带 20 秒隔离级缓存；设置/移除目录密码时失效）
 async function getLockedPrefixes(env) {
-  const set = new Set();
-  try {
-    let cursor;
-    do {
-      const res = await env.STORE.list({ prefix: 'dirpass:', cursor });
-      for (const k of res.keys) set.add(k.name.substring('dirpass:'.length));
-      cursor = res.list_complete ? undefined : res.cursor;
-    } while (cursor);
-  } catch (e) {}
-  return set;
+  const arr = await kvCached('dirpass-list', 20, async () => {
+    const set = new Set();
+    try {
+      let cursor;
+      do {
+        const res = await env.STORE.list({ prefix: 'dirpass:', cursor, limit: 1000 });
+        for (const k of res.keys) set.add(k.name.substring('dirpass:'.length));
+        cursor = res.list_complete ? undefined : res.cursor;
+      } while (cursor);
+    } catch (e) {}
+    return Array.from(set);
+  });
+  return new Set(arr);
 }
 async function unlockedPrefixes(env, sessionToken) {
   const locked = await getLockedPrefixes(env);
@@ -1032,7 +1888,15 @@ async function unlockedPrefixes(env, sessionToken) {
   return out;
 }
 function insideLocked(p, locked) {
-  for (const lp of locked) { if (p !== lp && p.startsWith(lp)) return true; }
+  for (const lp of locked) {
+    if (lp === '/') return true;                 // 根目录锁：所有路径都在其内
+    if (p !== lp && p.startsWith(lp)) return true;
+  }
+  return false;
+}
+// p 自身是否就是被锁目录（用于"是否继续向下遍历"的判断）
+function isLockedPrefix(p, locked) {
+  for (const lp of locked) { if (lp === '/' || p === lp) return true; }
   return false;
 }
 
@@ -1054,16 +1918,20 @@ async function pushVersion(env, key, entry) {
   try {
     const oldObj = await env.DRIVE.get(key);
     if (!oldObj) return null;
+    // R2 防爆：大文件不保留历史版本（否则每次覆盖都会让占用成倍增长）
+    if ((oldObj.size || 0) > versionMaxBytes(env)) return null;
     const ts = Date.now();
     const vKey = VERSIONS_PREFIX + key + '/' + ts;
     await env.DRIVE.put(vKey, oldObj.body, { httpMetadata: oldObj.httpMetadata });
     let list = await listVersions(env, key);
     list.unshift({ ts, size: (entry && entry.size) || 0, mime: (entry && entry.mime) || '' });
-    while (list.length > MAX_VERSIONS) {
+    const maxV = maxVersions(env);
+    while (list.length > maxV) {
       const old = list.pop();
       try { await env.DRIVE.delete(VERSIONS_PREFIX + key + '/' + old.ts); } catch (e) {}
     }
-    await env.STORE.put('versions:' + key, JSON.stringify(list));
+    // 版本索引加 TTL，避免长期不动的文件永久占用 KV
+    await env.STORE.put('versions:' + key, JSON.stringify(list), { expirationTtl: versionsTtl(env) });
     return ts;
   } catch (e) { return null; }
 }
@@ -1087,7 +1955,7 @@ async function moveVersions(env, oldKey, newKey) {
         }
       } catch (e) {}
     }
-    await env.STORE.put('versions:' + newKey, JSON.stringify(list));
+    await env.STORE.put('versions:' + newKey, JSON.stringify(list), { expirationTtl: versionsTtl(env) });
     await env.STORE.delete('versions:' + oldKey);
   } catch (e) {}
 }
@@ -1095,6 +1963,20 @@ async function moveVersions(env, oldKey, newKey) {
 // ===== API =====
 async function handleLogin(req, env) {
   const ip = req.headers.get('CF-Connecting-IP') || 'unknown';
+  const bumpFail = async (loginUser) => {
+    try {
+      const attempts = JSON.parse(await env.STORE.get('login:' + ip) || '{"n":0,"t":0}');
+      attempts.n = Date.now() - attempts.t > 300000 ? 1 : attempts.n + 1;
+      attempts.t = Date.now();
+      await env.STORE.put('login:' + ip, JSON.stringify(attempts), { expirationTtl: 600 });
+      if (loginUser) {
+        const ua = JSON.parse(await env.STORE.get('login:u:' + loginUser) || '{"n":0,"t":0}');
+        ua.n = Date.now() - ua.t > 300000 ? 1 : ua.n + 1;
+        ua.t = Date.now();
+        await env.STORE.put('login:u:' + loginUser, JSON.stringify(ua), { expirationTtl: 600 });
+      }
+    } catch (e) {}
+  };
   try {
     const attempts = JSON.parse(await env.STORE.get('login:' + ip) || '{"n":0,"t":0}');
     if (attempts.n >= 5 && Date.now() - attempts.t < 300000) return json({ error: 'Too many attempts, wait 5min' }, 429);
@@ -1111,21 +1993,20 @@ async function handleLogin(req, env) {
   const configured = (await adminPasswordSet(env)) || !!env.DRIVE_PASSWORD;
   if (!configured) return json({ error: 'Server not configured' }, 500);
   if (!await checkAdminPassword(env, form.get('password') || '')) {
-    try {
-      const attempts = JSON.parse(await env.STORE.get('login:' + ip) || '{"n":0,"t":0}');
-      attempts.n = Date.now() - attempts.t > 300000 ? 1 : attempts.n + 1;
-      attempts.t = Date.now();
-      await env.STORE.put('login:' + ip, JSON.stringify(attempts), { expirationTtl: 600 });
-      if (loginUser) {
-        const ua = JSON.parse(await env.STORE.get('login:u:' + loginUser) || '{"n":0,"t":0}');
-        ua.n = Date.now() - ua.t > 300000 ? 1 : ua.n + 1;
-        ua.t = Date.now();
-        await env.STORE.put('login:u:' + loginUser, JSON.stringify(ua), { expirationTtl: 600 });
-      }
-    } catch (e) {}
+    await bumpFail(loginUser);
     return json({ error: 'Wrong password' }, 401);
   }
+  // 二次验证：启用后必须提供动态码或一次性备用码（失败同样计入爆破限频）
+  if (await totpEnabled(env)) {
+    const v = await totpCheck(env, form.get('code') || '');
+    if (!v.ok) {
+      await bumpFail(loginUser);
+      return json({ error: v.error || 'Wrong code', totp: true }, 401);
+    }
+  }
   await env.STORE.delete('login:' + ip); if (loginUser) { try { await env.STORE.delete('login:u:' + loginUser); } catch (e) {} }
+  // 新设备/新地区登录提醒（webhook）
+  try { await loginSeenCheck(env, req); } catch (e) {}
   return json({ token: await makeSession(env, req) });
 }
 
@@ -1157,6 +2038,7 @@ async function handleUnlockDir(env, sessionToken, dirPath, password) {
     try { await env.STORE.put('dirpass:' + dirPath, JSON.stringify({ hash, salt })); } catch (e) {}
   }
   await env.STORE.put('unlock:' + sessionToken + ':' + dirPath, JSON.stringify({ path: dirPath, exp: Date.now() + 3600000 }), { expirationTtl: 3700 });
+  kvInvalidate('unlock@' + sessionToken + ':' + dirPath);
   return json({ ok: true });
 }
 
@@ -1174,7 +2056,7 @@ async function handleUpload(req, env, path) {
   const thumb = form.get('thumb');
   const relPath = (form.get('relPath') || '').toString().replace(/^\/+/, '');
   if (!file || typeof file === 'string') return json({ error: 'No file' }, 400);
-  if (file.size > MAX_UPLOAD_SIZE) return json({ error: 'File too large', max: MAX_UPLOAD_SIZE }, 413);
+  if (file.size > maxUploadBytes(env)) return json({ error: 'File too large', max: maxUploadBytes(env) }, 413);
 
   let uploadDir = path;
   if (relPath) {
@@ -1194,15 +2076,23 @@ async function handleUpload(req, env, path) {
   const clientHash = String(form.get('hash') || '');
   uploadDir = await applyAutoArchive(env, uploadDir, safeName, file.type || '');
   const key = uploadDir.replace(/^\//, '') + safeName;
+  if (pathTooLong('/' + key)) return json({ error: 'Path too long', max: PATH_MAX }, 400);
 
   const oldRes = await findDirItem(env, uploadDir, safeName);
   const oldItem = oldRes.item;
+  if (!oldItem) {
+    const ruleChk = await checkDirRule(env, uploadDir, safeName, file.size);
+    if (ruleChk) return json({ error: ruleChk.error }, 403);
+    const room = await dirRoom(env, uploadDir, 1);
+    if (room) return json({ error: room.error, limit: room.limit }, 507);
+  }
   const upDelta = file.size - (oldItem ? (oldItem.size || 0) : 0);
   if (upDelta > 0) {
     const u = await getUsage(env);
     if ((u.used || 0) + upDelta > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413);
   }
-  if (oldItem) await pushVersion(env, key, oldItem);
+  let versionTs = null;
+  if (oldItem) versionTs = await pushVersion(env, key, oldItem);
 
   const putRes = await putAndMirror(env, key, file.stream(), { httpMetadata: { contentType: file.type || 'application/octet-stream' } });
   const etag = (putRes && putRes.etag) ? String(putRes.etag).replace(/"/g, '') : '';
@@ -1217,8 +2107,9 @@ async function handleUpload(req, env, path) {
 
   try {
     const entry = { name: safeName, type: 'file', size: file.size, mime: file.type || '', time: new Date().toISOString(), hash: etag, hasThumb };
-    await upsertDirItem(env, uploadDir, entry);
-    if (isHex64(clientHash)) { try { await env.STORE.put('hash:' + clientHash, JSON.stringify({ key, time: Date.now() })); } catch (e) {} }
+    const up = await upsertDirItem(env, uploadDir, entry);
+    if (up && up.ok === false) { const err = new Error(up.error || 'Metadata rejected'); err.dirFull = true; err.limit = up.limit; throw err; }
+    if (isHex64(clientHash)) { try { await env.STORE.put('hash:' + clientHash, JSON.stringify({ key, time: Date.now() }), { expirationTtl: hashTtl(env) }); } catch (e) {} }
     if (oldItem) {
       if (oldItem.hasThumb && !hasThumb) await deleteThumb(env, key);
       await addUsage(env, file.size - (oldItem.size || 0), 0);
@@ -1227,8 +2118,18 @@ async function handleUpload(req, env, path) {
       await addLog(env, 'up', uploadDir + safeName, file.size + ' bytes');
     }
   } catch (e) {
-    try { await env.DRIVE.delete(key); } catch (e2) {}
-    await deleteThumb(env, key);
+    // 元数据写入失败：回滚对象。若覆盖的是旧文件，先把旧内容从历史版本恢复回去，
+    // 否则目录条目会指向一个已被删除的 key（文件"消失"）。
+    let restored = false;
+    if (oldItem && versionTs) {
+      try {
+        const v = await env.DRIVE.get(VERSIONS_PREFIX + key + '/' + versionTs);
+        if (v) { await putAndMirror(env, key, v.body, { httpMetadata: v.httpMetadata }); restored = true; }
+      } catch (e2) {}
+    }
+    if (!restored) { try { await deleteAndMirror(env, key); } catch (e2) {} }
+    if (!hasThumb) await deleteThumb(env, key);
+    if (e && e.dirFull) return json({ error: e.message, limit: e.limit }, 507);
     return json({ error: 'Metadata update failed' }, 500);
   }
   return json({ ok: true, hasThumb, dir: uploadDir });
@@ -1263,25 +2164,38 @@ async function handleSaveText(env, path, content) {
   const dir = parentOf(norm);
   const name = sanitizeName(norm.split('/').filter(Boolean).pop() || 'untitled');
   const key = dir.replace(/^\//, '') + name;
+  if (pathTooLong(dir + name)) return json({ error: 'Path too long', max: PATH_MAX }, 400);
   const size = new TextEncoder().encode(content).byteLength;
 
   const oldRes = await findDirItem(env, dir, name);
-  if (oldRes.item) await pushVersion(env, key, oldRes.item);
+  const oldItem = oldRes.item;
+  if (!oldItem) {
+    const room = await dirRoom(env, dir, 1);
+    if (room) return json({ error: room.error, limit: room.limit }, 507);
+  }
+  const delta = size - (oldItem ? (oldItem.size || 0) : 0);
+  if (delta > 0) {
+    const u = await getUsage(env);
+    if ((u.used || 0) + delta > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413);
+  }
+  if (oldItem) await pushVersion(env, key, oldItem);
 
-  await putAndMirror(env, key, content, { httpMetadata: { contentType: 'text/plain' } });
+  const putRes = await putAndMirror(env, key, content, { httpMetadata: { contentType: 'text/plain' } });
+  const etag = (putRes && putRes.etag) ? String(putRes.etag).replace(/"/g, '') : '';
 
-  const old = oldRes.item || {};
+  const old = oldItem || {};
   const entry = {
     name, type: 'file', size, mime: 'text/plain',
     time: new Date().toISOString(),
-    hash: old.hash || '',
+    hash: etag || old.hash || '',
     hasThumb: !!old.hasThumb
   };
   await upsertDirItem(env, dir, entry);
-  if (oldRes.item) {
-    await addUsage(env, size - (oldRes.item.size || 0), 0);
+  if (oldItem) {
+    await addUsage(env, size - (oldItem.size || 0), 0);
   } else {
     await addUsage(env, size, 1);
+    try { await addLog(env, 'up', dir + name, size + ' bytes (text)'); } catch (e) {}
   }
   return json({ ok: true });
 }
@@ -1293,26 +2207,38 @@ async function handleDelete(env, path) {
   const entry = res.item;
   if (!entry) return json({ error: 'Not found' }, 404);
 
+  // M4: 锁定子树检查必须在移除目录条目之前，否则会返回 423 而条目已经被删掉
+  const dirPath = path.replace(/\/+$/, '') + '/';   // 统一成单个尾斜杠，避免记录出 "/box//"
+  if (entry.type === 'dir') {
+    const lockedSub = await hasLockedSubtree(env, dirPath);
+    if (lockedSub) return json({ error: 'Locked', path: lockedSub }, 423);
+  }
+
   await removeDirItem(env, dir, name);
+  const deletedAt = new Date().toISOString();
 
   if (entry.type === 'dir') {
-    // M4: 删除目录前检查子孙锁定子树，防止绕过锁定
-    const lockedSub = await hasLockedSubtree(env, path + '/');
-    if (lockedSub) return json({ error: 'Locked', path: lockedSub }, 423);
-    // 目录删除改为进入回收站（与文件一致，可恢复）：整体搬入 /trash/<id>/，不再永久销毁
+    // 目录删除进入回收站（可恢复）：整体搬入 /.trash/<id>/
     const tid = 'd' + randToken().substring(0, 8);
-    await recursiveMoveDir(env, path + '/', '/.trash/' + tid + '/');
-    const trash = await getDir(env, '/.trash/');
-    trash.push({ name, type: 'dir', size: entry.dirSize || 0, mime: '', originalPath: path + '/', deletedAt: new Date().toISOString(), id: tid });
-    await putDir(env, '/.trash/', trash);
-    try { await addLog(env, 'del', path + '/', '目录 → 回收站'); } catch (e) {}
+    await recursiveMoveDir(env, dirPath, TRASH_ROOT + tid + '/');
+    const trash = await getDir(env, TRASH_ROOT);
+    trash.push({ name, type: 'dir', size: entry.dirSize || 0, mime: '', originalPath: dirPath, deletedAt, id: tid });
+    await putDir(env, TRASH_ROOT, trash);
+    try { await addLog(env, 'del', dirPath, '目录 → 回收站'); } catch (e) {}
     return json({ ok: true });
   }
-  await deleteThumb(env, path.replace(/^\//, ''));
-  await deleteVersions(env, path.replace(/^\//, ''));
-  const trash = await getDir(env, '/.trash/');
-  trash.push({ name, type: 'file', size: entry.size || 0, mime: entry.mime || '', originalPath: path, deletedAt: new Date().toISOString(), id: randToken().substring(0, 8) });
-  await putDir(env, '/.trash/', trash);
+
+  // 文件删除同样把对象搬到 /.trash/<id>/<name>：避免原 key 被重新上传后被"清空回收站"误删
+  const tid = 'f' + randToken().substring(0, 8);
+  const srcKey = path.replace(/^\//, '');
+  const trashKey = TRASH_PREFIX + tid + '/' + name;
+  const moved = await copyObject(env, srcKey, trashKey);
+  if (moved) { try { await mirrorDelete(env, srcKey); } catch (e) {} }
+  await moveThumb(env, srcKey, trashKey);
+  await deleteVersions(env, srcKey);
+  const trash = await getDir(env, TRASH_ROOT);
+  trash.push({ name, type: 'file', size: entry.size || 0, mime: entry.mime || '', originalPath: path, deletedAt, id: tid, trashKey: moved ? trashKey : '' });
+  await putDir(env, TRASH_ROOT, trash);
   try { await addLog(env, 'del', path, (entry.size || 0) + ' bytes → 回收站'); } catch (e) {}
   try { await addDailyStat(env, 'del', entry.size || 0); } catch (e) {}
   return json({ ok: true });
@@ -1367,38 +2293,80 @@ async function recursiveDeleteDir(env, dirPath) {
 }
 
 async function handleTrash(env) {
-  const items = await getDir(env, '/.trash/');
+  // 顺手做一次有界的过期回收（即使用户没配 Cron 触发器，回收站也不会无限膨胀）
+  try { await gcTrash(env, 20); } catch (e) {}
+  const items = await getDir(env, TRASH_ROOT);
   const now = Date.now();
+  const days = trashDays(env);
   const enriched = items.map(it => {
     const dt = it.deletedAt ? new Date(it.deletedAt).getTime() : now;
-    const daysLeft = Math.max(0, 30 - Math.floor((now - (Number.isFinite(dt) ? dt : now)) / 86400000));
+    const daysLeft = Math.max(0, days - Math.floor((now - (Number.isFinite(dt) ? dt : now)) / 86400000));
     return { ...it, daysLeft };
   });
   return json({ items: enriched });
 }
+// 过期回收站清理（cron 与访问时共用），返回清理条数
+async function gcTrash(env, limit) {
+  const trash = await getDir(env, TRASH_ROOT);
+  const now = Date.now();
+  const maxAge = trashDays(env) * 86400 * 1000;
+  const keep = [];
+  let purged = 0, totalSize = 0, removedAny = false, handled = 0;
+  for (const item of trash) {
+    const dt = item.deletedAt ? new Date(item.deletedAt).getTime() : 0;
+    if (!Number.isFinite(dt) || dt <= 0) { keep.push(item); continue; }
+    if (maxAge >= 0 && now - dt >= maxAge && handled < limit) {
+      handled++;
+      removedAny = true;
+      if (item.type === 'dir' && item.id) {
+        await recursiveDeleteDir(env, TRASH_ROOT + item.id + '/');   // 内部已扣减用量
+      } else {
+        const k = item.trashKey ? item.trashKey : String(item.originalPath || '').replace(/^\//, '');
+        if (k) {
+          await deleteAndMirror(env, k);
+          await deleteThumb(env, k);
+          if (!item.trashKey) await deleteVersions(env, k);
+        }
+        totalSize += item.size || 0; purged++;
+      }
+    } else { keep.push(item); }
+  }
+  if (removedAny) {
+    await putDir(env, TRASH_ROOT, keep);
+    if (purged > 0) await addUsage(env, -totalSize, -purged);
+  }
+  return handled;
+}
 
 async function handleRestore(env, id) {
-  const trash = await getDir(env, '/.trash/');
+  const trash = await getDir(env, TRASH_ROOT);
   let idx = trash.findIndex(i => i.id === id);
   if (idx < 0) idx = trash.findIndex(i => i.name === id);
   if (idx < 0) return { error: 'Not in trash', status: 404 };
   const entry = trash[idx];
   if (entry.type === 'dir') {
-    // 恢复目录：把 /trash/<id>/ 整体搬回 originalPath，并重建父目录引用
+    // 恢复目录：把 /.trash/<id>/ 整体搬回 originalPath，并重建父目录引用
     const pdir = parentOf(entry.originalPath);
     const existing = await findDirItem(env, pdir, entry.name);
     if (existing.item) return { error: 'Name exists', status: 409 };
-    if (entry.id) await recursiveMoveDir(env, '/.trash/' + entry.id + '/', entry.originalPath);
+    if (entry.id) await recursiveMoveDir(env, TRASH_ROOT + entry.id + '/', entry.originalPath);
     await upsertDirItem(env, pdir, { name: entry.name, type: 'dir', time: entry.deletedAt, size: entry.size });
-    trash.splice(idx, 1); await putDir(env, '/.trash/', trash);
+    trash.splice(idx, 1); await putDir(env, TRASH_ROOT, trash);
     try { await addLog(env, 'res', entry.originalPath, '从回收站恢复目录'); } catch (e) {}
     return { ok: true };
   }
   const dir = parentOf(entry.originalPath);
   const existing = await findDirItem(env, dir, entry.name);
   if (existing.item) return { error: 'Name exists', status: 409 };
+  const srcKey = entry.originalPath.replace(/^\//, '');
+  if (entry.trashKey) {
+    const ok = await copyObject(env, entry.trashKey, srcKey);
+    if (!ok) return { error: 'File content missing', status: 410 };
+    await moveThumb(env, entry.trashKey, srcKey);
+    try { await mirrorPut(env, srcKey); } catch (e) {}
+  }
   await upsertDirItem(env, dir, { name: entry.name, type: entry.type, size: entry.size, mime: entry.mime, time: entry.deletedAt });
-  trash.splice(idx, 1); await putDir(env, '/.trash/', trash);
+  trash.splice(idx, 1); await putDir(env, TRASH_ROOT, trash);
   try { await addLog(env, 'res', entry.originalPath, '从回收站恢复'); } catch (e) {}
   return { ok: true };
 }
@@ -1412,39 +2380,41 @@ async function handleBatchRestore(env, ids) {
 }
 
 async function handlePurge(env, id) {
-  const trash = await getDir(env, '/.trash/');
+  const trash = await getDir(env, TRASH_ROOT);
+  // 回收站对象可能在 /.trash/<id>/<name>（新版），也可能是历史记录里的原始路径
+  const purgeFile = async (item) => {
+    const delKey = item.trashKey ? item.trashKey : String(item.originalPath || '').replace(/^\//, '');
+    if (!delKey) return;
+    await deleteAndMirror(env, delKey);
+    await deleteThumb(env, delKey);
+    if (!item.trashKey) await deleteVersions(env, delKey);
+  };
   if (id === 'ALL') {
     let sz = 0, ct = 0;
     for (const item of trash) {
       if (item.type === 'dir' && item.id) {
-        await recursiveDeleteDir(env, '/.trash/' + item.id + '/');  // 内部已扣减用量
+        await recursiveDeleteDir(env, TRASH_ROOT + item.id + '/');  // 内部已扣减用量
       } else {
-        const k = item.originalPath.replace(/^\//, '');
-        await deleteAndMirror(env, k);
-        await deleteThumb(env, k);
-        await deleteVersions(env, k);
+        await purgeFile(item);
         sz += item.size || 0; ct++;
       }
     }
-    await putDir(env, '/.trash/', []); await addUsage(env, -sz, -ct); return json({ ok: true });
+    await putDir(env, TRASH_ROOT, []); await addUsage(env, -sz, -ct); return json({ ok: true });
   }
   let idx = trash.findIndex(i => i.id === id);
   if (idx < 0) idx = trash.findIndex(i => i.name === id);
   if (idx < 0) return json({ error: 'Not in trash' }, 404);
   const entry = trash[idx];
   if (entry.type === 'dir' && entry.id) {
-    await recursiveDeleteDir(env, '/.trash/' + entry.id + '/');  // 内部已扣减用量
-    trash.splice(idx, 1); await putDir(env, '/.trash/', trash); return json({ ok: true });
+    await recursiveDeleteDir(env, TRASH_ROOT + entry.id + '/');  // 内部已扣减用量
+    trash.splice(idx, 1); await putDir(env, TRASH_ROOT, trash); return json({ ok: true });
   }
-  const k = entry.originalPath.replace(/^\//, '');
-  await deleteAndMirror(env, k);
-  await deleteThumb(env, k);
-  await deleteVersions(env, k);
-  trash.splice(idx, 1); await putDir(env, '/.trash/', trash); await addUsage(env, -(entry.size || 0), -1); return json({ ok: true });
+  await purgeFile(entry);
+  trash.splice(idx, 1); await putDir(env, TRASH_ROOT, trash); await addUsage(env, -(entry.size || 0), -1); return json({ ok: true });
 }
 
 async function handleBatchPurge(env, ids) {
-  for (const id of ids) { try { await handlePurge(env, id); } catch (e) {} }
+  for (const id of (Array.isArray(ids) ? ids : [])) { try { await handlePurge(env, id); } catch (e) {} }
   return json({ ok: true });
 }
 
@@ -1452,7 +2422,14 @@ async function handleMkdir(env, path, name) {
   path = normPath(path);
   const safeName = sanitizeName(name);
   if (!safeName) return json({ error: 'Bad name' }, 400);
-  await upsertDirItem(env, path, { name: safeName, type: 'dir', time: new Date().toISOString() });
+  if (pathTooLong(path + safeName + '/')) return json({ error: 'Path too long', max: PATH_MAX }, 400);
+  const existing = await findDirItem(env, path, safeName);
+  if (!existing.item) {
+    const room = await dirRoom(env, path, 1);
+    if (room) return json({ error: room.error, limit: room.limit }, 507);
+  }
+  const up = await upsertDirItem(env, path, { name: safeName, type: 'dir', time: new Date().toISOString() });
+  if (up && up.ok === false) return json({ error: up.error, limit: up.limit }, 507);
   return json({ ok: true });
 }
 
@@ -1507,7 +2484,7 @@ async function recursiveMoveDir(env, oldPrefix, newPrefix) {
   await destroyDir(env, oldPrefix);
   try {
     const dp = await env.STORE.get('dirpass:' + oldPrefix, 'json');
-    if (dp) { await env.STORE.put('dirpass:' + newPrefix, JSON.stringify(dp)); await env.STORE.delete('dirpass:' + oldPrefix); }
+    if (dp) { await env.STORE.put('dirpass:' + newPrefix, JSON.stringify(dp)); await env.STORE.delete('dirpass:' + oldPrefix); kvInvalidate('dirpass-list'); }
   } catch (e) {}
 }
 
@@ -1545,8 +2522,85 @@ async function handleMove(env, srcPath, targetDir) {
   return json({ ok: true });
 }
 
-async function handleBatchDelete(env, paths) {
-  let ok = 0, fail = 0;
+// 站内复制：把文件/目录复制到目标目录（同名自动加后缀，不覆盖）
+async function copyDirRecursive(env, srcPrefix, dstPrefix, depth, budget) {
+  if (depth > 12 || budget.n <= 0) return;
+  const items = await getDir(env, srcPrefix);
+  for (const it of items) {
+    if (budget.n <= 0) return;
+    if (it.type === 'dir') {
+      await ensureDir(env, dstPrefix, it.name);
+      await copyDirRecursive(env, srcPrefix + it.name + '/', dstPrefix + it.name + '/', depth + 1, budget);
+    } else {
+      const sk = srcPrefix.replace(/^\//, '') + it.name;
+      const dk = dstPrefix.replace(/^\//, '') + it.name;
+      if (await copyObjectKeep(env, sk, dk)) {
+        await copyThumb(env, sk, dk);
+        const up = await upsertDirItem(env, dstPrefix, Object.assign({}, it, { time: new Date().toISOString() }));
+        if (up && up.ok === false) { try { await deleteAndMirror(env, dk); } catch (e) {} return; }
+        await addUsage(env, it.size || 0, 1);
+        budget.n--; budget.bytes += it.size || 0;
+      }
+    }
+  }
+}
+async function handleCopy(env, paths, target, sessionToken) {
+  const t = normPath(target || '/');
+  const list = Array.isArray(paths) ? paths.filter(Boolean) : [];
+  if (!list.length) return json({ error: 'No paths' }, 400);
+  const items = [];
+  let copied = 0, failed = 0;
+  const budget = { n: 500, bytes: 0 };          // 单次复制上限，避免一次请求做太多工作
+  const u0 = await getUsage(env);
+  let usedNow = u0.used || 0;
+  for (const p of list) {
+    try {
+      const src = '/' + String(p || '').replace(/^\/+/, '');
+      const srcDir = src.endsWith('/') ? src : src + '/';
+      if (src === '/' || src === t || t === srcDir) { failed++; continue; }
+      if (t.startsWith(srcDir)) { items.push({ path: src, error: 'cannot copy into itself' }); failed++; continue; }
+      const sdir = parentOf(src), name = src.split('/').filter(Boolean).pop();
+      const res = await findDirItem(env, sdir, name);
+      if (!res.item) { items.push({ path: src, error: 'not found' }); failed++; continue; }
+      if (await isPathLocked(env, src, sessionToken) || await isPathLocked(env, sdir, sessionToken)) { items.push({ path: src, error: 'locked' }); failed++; continue; }
+      const entry = res.item;
+      // 目录先算体积，做配额与体量预检查
+      let needBytes = entry.size || 0;
+      if (entry.type === 'dir') {
+        needBytes = await calcDirSize(env, src + '/');
+        if (needBytes > 2 * 1024 * 1024 * 1024) { items.push({ path: src, error: 'folder too large to copy' }); failed++; continue; }
+      }
+      if (usedNow + needBytes > quotaTotal(env)) { items.push({ path: src, error: 'Quota exceeded' }); failed++; continue; }
+      const existing = await findDirItem(env, t, name);
+      const finalName = existing.item ? await uniqueFileName(env, t, name) : name;
+      const dst = t + finalName;
+      if (pathTooLong(dst + (entry.type === 'dir' ? '/' : ''))) { items.push({ path: src, error: 'path too long' }); failed++; continue; }
+      const room = await dirRoom(env, t, 1);
+      if (room) { items.push({ path: src, error: room.error }); failed++; continue; }
+
+      if (entry.type === 'dir') {
+        await ensureDir(env, t, finalName);
+        const dPre = dst.endsWith('/') ? dst : dst + '/';
+        await copyDirRecursive(env, srcDir, dPre, 0, budget);
+        await upsertDirItem(env, t, Object.assign({}, entry, { name: finalName, time: new Date().toISOString() }));
+      } else {
+        const sk = src.replace(/^\//, ''), dk = dst.replace(/^\//, '');
+        if (!await copyObjectKeep(env, sk, dk)) { items.push({ path: src, error: 'copy failed' }); failed++; continue; }
+        await copyThumb(env, sk, dk);
+        const up = await upsertDirItem(env, t, Object.assign({}, entry, { name: finalName, time: new Date().toISOString() }));
+        if (up && up.ok === false) { try { await deleteAndMirror(env, dk); } catch (e) {} items.push({ path: src, error: up.error }); failed++; continue; }
+        await addUsage(env, needBytes, 1);   // 副本是 R2 里真实多出来的一份，必须计入用量
+      }
+      usedNow += needBytes;
+      budget.bytes += needBytes;
+      copied++;
+      items.push({ path: src, name: finalName, target: dst });
+    } catch (e) { items.push({ path: String(p), error: 'failed' }); failed++; }
+  }
+  try { await addLog(env, 'cpy', t, copied + ' items copied'); } catch (e) {}
+  return json({ ok: true, copied, failed, target: t, items, truncated: budget.n <= 0 });
+}
+async function handleBatchDelete(env, paths) {  let ok = 0, fail = 0;
   for (const fp of (Array.isArray(paths) ? paths : [])) {
     try {
       const res = await handleDelete(env, fp);
@@ -1625,7 +2679,7 @@ async function handleDuplicates(env) {
         hashMap[it.hash].push({ name: it.name, path: dirPath, size: it.size });
       } else if (it.type === 'dir') {
         const sub = dirPath + it.name + '/';
-        if (locked.has(sub)) continue;
+        if (isLockedPrefix(sub, locked)) continue;
         await scanDir(sub);
       }
       if (Object.keys(hashMap).length >= 2000) return;
@@ -1638,22 +2692,11 @@ async function handleDuplicates(env) {
 
 // ===== 活动日志 =====
 async function addDailyStat(env, kind, bytes) {
-  try {
-    const day = new Date().toISOString().substring(0, 10);
-    const all = (await env.STORE.get('meta:daily', 'json')) || {};
-    const d = all[day] || { up: 0, upBytes: 0, dl: 0, dlBytes: 0 };
-    if (kind === 'up') { d.up = (d.up || 0) + 1; d.upBytes = (d.upBytes || 0) + (bytes || 0); }
-    else if (kind === 'del') { /* 只累计，不展示 */ }
-    else { d.dl = (d.dl || 0) + 1; d.dlBytes = (d.dlBytes || 0) + (bytes || 0); }
-    all[day] = d;
-    const keys = Object.keys(all).sort();
-    while (keys.length > 90) { delete all[keys.shift()]; }
-    await env.STORE.put('meta:daily', JSON.stringify(all));
-  } catch (e) {}
+  try { if (kind !== 'del') telBufDaily(kind, bytes); } catch (e) {}
 }
 async function handleStatsTrend(env, days) {
   const n = Math.min(Math.max(parseInt(days, 10) || 30, 7), 90);
-  const all = (await env.STORE.get('meta:daily', 'json')) || {};
+  const all = telMergeDaily((await env.STORE.get('meta:daily', 'json')) || {});
   const out = [];
   for (let i = n - 1; i >= 0; i--) {
     const d = new Date(Date.now() - i * 86400000).toISOString().substring(0, 10);
@@ -1663,28 +2706,30 @@ async function handleStatsTrend(env, days) {
   return json({ days: out });
 }
 async function addLog(env, action, path, detail) {
+  // 活动日志改为内存缓冲 + 定时合并写：原先每次上传/删除/移动都要读改写 meta:log
   try {
-    const logs = (await env.STORE.get('meta:log', 'json')) || [];
-    logs.unshift({ action, path, detail: detail || '', time: new Date().toISOString() });
-    if (logs.length > 200) logs.length = 200;
-    await env.STORE.put('meta:log', JSON.stringify(logs));
+    telBufLog({ action, path, detail: detail || '', time: new Date().toISOString() });
+    if (action === 'up') {
+      const m = /^(\d+)/.exec(String(detail || ''));
+      telBufDaily('up', m ? Number(m[1]) : 0);
+    }
   } catch (e) {}
-  if (action === 'up') {
-    const m = /^(\d+)/.exec(String(detail || ''));
-    await addDailyStat(env, 'up', m ? Number(m[1]) : 0);
-  }
   await notifyWebhook(env, { event: action, path: path || '', detail: detail || '' });
 }
 async function getLogs(env) {
-  try { return (await env.STORE.get('meta:log', 'json')) || []; } catch (e) { return []; }
+  try { return telMergeLogs(await env.STORE.get('meta:log', 'json')); } catch (e) { return telMergeLogs([]); }
 }
 
 // ===== Access Tokens =====
 async function getAccessTokens(env) {
-  try { return (await env.STORE.get('meta:tokens', 'json')) || []; } catch (e) { return []; }
+  // 每个请求的鉴权都会读它，加 30 秒隔离级缓存（创建/删除令牌时失效）
+  return await kvCached('meta:tokens', 30, async () => {
+    try { return (await env.STORE.get('meta:tokens', 'json')) || []; } catch (e) { return []; }
+  });
 }
 async function saveAccessTokens(env, tokens) {
   await env.STORE.put('meta:tokens', JSON.stringify(tokens));
+  kvInvalidate('meta:tokens');
 }
 // ===== Note =====
 async function handleGetNote(env, filePath) {
@@ -1692,40 +2737,313 @@ async function handleGetNote(env, filePath) {
   catch (e) { return json({ note: '' }); }
 }
 async function handleSetNote(env, filePath, note) {
-  await env.STORE.put('note:' + filePath, JSON.stringify(note || ''));
+  const s = JSON.stringify(note || '');
+  if (s.length > maxNoteBytes(env)) return json({ error: 'Note too large', max: maxNoteBytes(env) }, 413);
+  await env.STORE.put('note:' + filePath, s);
   return json({ ok: true });
 }
 
 // ===== Tag =====
 async function getFileTags(env, filePath) { try { return await env.STORE.get('tags:' + filePath, 'json') || []; } catch (e) { return []; } }
 async function setFileTags(env, filePath, tags) { await env.STORE.put('tags:' + filePath, JSON.stringify(tags)); }
-async function getAllTags(env) { try { return await env.STORE.get('meta:tags', 'json') || []; } catch (e) { return []; } }
-async function addGlobalTag(env, tag) { const tags = await getAllTags(env); if (!tags.find(t => t.name === tag.name)) tags.push(tag); await env.STORE.put('meta:tags', JSON.stringify(tags)); }
+async function getAllTags(env) {
+  return await kvCached('meta:tags', 15, async () => {
+    try { return await env.STORE.get('meta:tags', 'json') || []; } catch (e) { return []; }
+  });
+}
+// 批量登记全局标签：一次读改写（原先每个标签都要读写一遍 meta:tags）
+async function addGlobalTags(env, list) {
+  if (!Array.isArray(list) || !list.length) return;
+  const tags = (await getAllTags(env)).slice();
+  let changed = false;
+  for (const t of list) {
+    if (t && t.name && !tags.find(x => x.name === t.name)) {
+      if (tags.length >= 2000) break;                 // 全局标签数量上限
+      tags.push({ name: t.name, color: t.color });
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  const s = JSON.stringify(tags);
+  if (s.length > 512 * 1024) return;                  // 标签总表体积上限
+  await env.STORE.put('meta:tags', s);
+  kvInvalidate('meta:tags');
+}
+async function addGlobalTag(env, tag) { return addGlobalTags(env, [tag]); }
 async function handleTagFile(env, filePath, tags) {
   filePath = '/' + filePath.replace(/^\/+/, '');
-  await setFileTags(env, filePath, tags);
-  for (const t of tags) await addGlobalTag(env, t);
+  const list = Array.isArray(tags) ? tags : [];
+  if (JSON.stringify(list).length > maxTagsBytes(env)) return json({ error: 'Too many tags', max: maxTagsBytes(env) }, 413);
+  await setFileTags(env, filePath, list);
+  await addGlobalTags(env, list);
   return json({ ok: true });
 }
-async function handleGetTags(env) { return json({ tags: await getAllTags(env) }); }
-async function handleTagFilter(env, tagName) {
+async function handleGetTags(env) {
+  // 同时返回每个标签的引用计数（按需统计，带隔离级缓存，不产生额外热写）
+  const tags = await getAllTags(env);
+  const counts = await tagCounts(env);
+  return json({ tags: tags.map(t => ({ name: t.name, color: t.color || '', count: counts[t.name] || 0 })) });
+}
+// 标签引用计数：扫描所有 tags:* 键（KV list 有界），带 60 秒缓存
+async function tagCounts(env) {
+  return await kvCached('tagcounts', 60, async () => {
+    const counts = {};
+    let cursor = undefined, pages = 0;
+    try {
+      do {
+        const r = await env.STORE.list({ prefix: 'tags:', limit: 300, cursor });
+        for (const k of (r.keys || [])) {
+          let list = [];
+          try { list = await env.STORE.get(k.name, 'json') || []; } catch (e) { list = []; }
+          for (const t of list) { if (t && t.name) counts[t.name] = (counts[t.name] || 0) + 1; }
+        }
+        cursor = r.list_complete ? null : r.cursor;
+        pages++;
+      } while (cursor && pages < 20);
+    } catch (e) {}
+    return counts;
+  });
+}
+async function handleTagFilter(env, tagName, mode, extraTags) {
   const locked = await getLockedPrefixes(env);
+  const want = [tagName].concat(extraTags || []).filter(Boolean);
+  const all = mode === 'all';
   const results = [];
   const seen = new Set();
   async function scanDir(dirPath) {
     const items = await getDir(env, dirPath);
     for (const it of items) {
-      if (it.type === 'file') { const ft = await getFileTags(env, dirPath + it.name); if (ft.find(t => t.name === tagName)) { const k = dirPath + it.name; if (!seen.has(k)) { seen.add(k); results.push({ ...it, path: dirPath }); } } }
-      else if (it.type === 'dir') {
+      if (it.type === 'file') {
+        const k = dirPath + it.name;
+        const ft = await getFileTags(env, k);
+        const names = ft.map(t => t && t.name);
+        const hit = all ? want.every(w => names.indexOf(w) >= 0) : want.some(w => names.indexOf(w) >= 0);
+        if (hit && !seen.has(k)) { seen.add(k); results.push(Object.assign({}, it, { path: dirPath, tags: ft })); }
+      } else if (it.type === 'dir') {
         const sub = dirPath + it.name + '/';
-        if (locked.has(sub)) continue;
+        if (isLockedPrefix(sub, locked)) continue;
         await scanDir(sub);
       }
       if (results.length >= 500) return;
     }
   }
   await scanDir('/');
-  return json({ items: results });
+  return json({ items: results, tags: want, mode: all ? 'all' : 'any' });
+}
+// 标签重命名 / 合并（批量改写受影响文件的 tags: 键，有界）
+async function handleTagRename(env, from, to, color) {
+  from = String(from || '').trim();
+  to = String(to || '').trim();
+  if (!from || !to) return json({ error: 'Need from/to' }, 400);
+  if (to.length > 60) return json({ error: 'Tag too long' }, 413);
+  const tags = (await getAllTags(env)).slice();
+  const src = tags.find(t => t.name === from);
+  if (!to.length) return json({ error: 'Bad target' }, 400);
+  if (!tags.find(t => t.name === to)) tags.push({ name: to, color: color || (src && src.color) || '' });
+  else if (color) tags.find(t => t.name === to).color = color;
+  const next = tags.filter(t => t.name !== from);
+  if (next.length > 2000) return json({ error: 'Too many tags' }, 413);
+  await env.STORE.put('meta:tags', JSON.stringify(next));
+  kvInvalidate('meta:tags');
+  kvInvalidate('tagcounts');
+  // 改写文件标签
+  let files = 0, cursor = undefined, pages = 0;
+  try {
+    do {
+      const r = await env.STORE.list({ prefix: 'tags:', limit: 200, cursor });
+      for (const k of (r.keys || [])) {
+        if (files >= 2000) break;
+        let list = [];
+        try { list = await env.STORE.get(k.name, 'json') || []; } catch (e) { continue; }
+        if (!list.some(t => t && t.name === from)) continue;
+        const mapped = [];
+        const seen = {};
+        for (const t of list) {
+          const nm = (t && t.name === from) ? to : (t && t.name);
+          if (!nm || seen[nm]) continue;
+          seen[nm] = 1;
+          mapped.push({ name: nm, color: (t && t.color) || (nm === to ? (color || (src && src.color) || '') : '') });
+        }
+        await env.STORE.put(k.name, JSON.stringify(mapped));
+        files++;
+      }
+      cursor = r.list_complete ? null : r.cursor;
+      pages++;
+    } while (cursor && pages < 20 && files < 2000);
+  } catch (e) {}
+  return json({ ok: true, files, tags: next });
+}
+async function handleTagColor(env, name, color) {
+  const tags = (await getAllTags(env)).slice();
+  const t = tags.find(x => x.name === name);
+  if (!t) return json({ error: 'Not found' }, 404);
+  t.color = String(color || '').slice(0, 20);
+  await env.STORE.put('meta:tags', JSON.stringify(tags));
+  kvInvalidate('meta:tags');
+  return json({ ok: true, tags });
+}
+async function handleTagBatch(env, paths, add, remove, mode) {
+  const list = (Array.isArray(paths) ? paths : []).slice(0, 500);
+  const addL = (Array.isArray(add) ? add : []).filter(Boolean).slice(0, 20).map(n => ({ name: sanitizeName(String(n)).slice(0, 60), color: '' }));
+  const rm = (Array.isArray(remove) ? remove : []).filter(Boolean);
+  let changed = 0;
+  for (const p of list) {
+    const key = '/' + String(p || '').replace(/^\/+/, '');
+    if (!key || key === '/') continue;
+    let cur = [];
+    try { cur = await env.STORE.get('tags:' + key, 'json') || []; } catch (e) { cur = []; }
+    const map = {};
+    for (const t of cur) { if (t && t.name && rm.indexOf(t.name) < 0) map[t.name] = t.color || ''; }
+    for (const t of addL) { if (mode === 'replace') { } if (!(t.name in map)) map[t.name] = t.color || ''; }
+    if (mode === 'replace') { for (const k of Object.keys(map)) if (!addL.some(t => t.name === k)) delete map[k]; }
+    const out = Object.keys(map).map(n => ({ name: n, color: map[n] }));
+    if (JSON.stringify(out).length > maxTagsBytes(env)) continue;
+    await env.STORE.put('tags:' + key, JSON.stringify(out));
+    changed++;
+  }
+  if (addL.length) await addGlobalTags(env, addL);
+  kvInvalidate('tagcounts');
+  return json({ ok: true, changed, tags: addL.map(t => t.name) });
+}
+// 自动打标签：按扩展名/类型或拍摄/修改年月（预览或直接应用，有界）
+async function handleTagAuto(env, b) {
+  const dir = normPath((b && b.path) || '/');
+  const mode = (b && b.mode) === 'date' ? 'date' : 'type';
+  const apply = !!(b && b.apply);
+  const deep = !!(b && b.deep);
+  const items = [];
+  async function walk(p, depth) {
+    if (items.length >= 800) return;
+    const list = await getDir(env, p);
+    for (const it of list) {
+      if (!it || !it.name) continue;
+      if (it.type === 'dir') { if (deep && depth < 5) await walk(p + it.name + '/', depth + 1); continue; }
+      items.push(Object.assign({}, it, { path: p }));
+      if (items.length >= 800) return;
+    }
+  }
+  try { await walk(dir, 0); } catch (e) {}
+  const plan = {};
+  for (const it of items) {
+    let tag = '';
+    if (mode === 'type') {
+      const m = String(it.mime || ''), n = String(it.name).toLowerCase();
+      const ext = n.indexOf('.') >= 0 ? n.substring(n.lastIndexOf('.') + 1) : '';
+      if (m.indexOf('image/') === 0) tag = '图片';
+      else if (m.indexOf('video/') === 0) tag = '视频';
+      else if (m.indexOf('audio/') === 0) tag = '音频';
+      else if (m.indexOf('pdf') >= 0) tag = 'PDF';
+      else if (['doc', 'docx', 'md', 'txt', 'rtf'].indexOf(ext) >= 0) tag = '文档';
+      else if (['xls', 'xlsx', 'csv', 'ods'].indexOf(ext) >= 0) tag = '表格';
+      else if (['zip', 'rar', '7z', 'tar', 'gz'].indexOf(ext) >= 0) tag = '压缩包';
+      else if (m.indexOf('text/') === 0) tag = '文本';
+      else tag = '其他';
+    } else {
+      const t = it.time ? new Date(it.time) : null;
+      tag = (t && !isNaN(t.getTime())) ? (t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0')) : '未知时间';
+    }
+    if (!plan[tag]) plan[tag] = [];
+    plan[tag].push((it.path + it.name).replace(/^\//, ''));
+  }
+  const groups = Object.keys(plan).map(k => ({ tag: k, count: plan[k].length, sample: plan[k].slice(0, 5) }));
+  if (!apply) return json({ ok: true, dryRun: true, total: items.length, groups });
+  let changed = 0;
+  for (const tag of Object.keys(plan)) {
+    for (const p of plan[tag]) {
+      if (changed >= 800) break;
+      let cur = [];
+      try { cur = await env.STORE.get('tags:/' + p, 'json') || []; } catch (e) { cur = []; }
+      if (cur.some(t => t && t.name === tag)) continue;
+      cur.push({ name: tag, color: '' });
+      await env.STORE.put('tags:/' + p, JSON.stringify(cur));
+      changed++;
+    }
+    await addGlobalTag(env, { name: tag, color: '' });
+  }
+  kvInvalidate('tagcounts');
+  return json({ ok: true, total: items.length, changed, groups });
+}
+// ===== 高级查询（统一筛选器）=====
+function mimeGroupOf(mime, name) {
+  const m = String(mime || ''), n = String(name || '').toLowerCase();
+  if (m.indexOf('image/') === 0) return 'image';
+  if (m.indexOf('video/') === 0) return 'video';
+  if (m.indexOf('audio/') === 0) return 'audio';
+  if (['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz'].indexOf(n.indexOf('.') >= 0 ? n.substring(n.lastIndexOf('.') + 1) : '') >= 0) return 'zip';
+  if (m.indexOf('pdf') >= 0 || m.indexOf('text/') === 0 || ['doc', 'docx', 'md', 'txt', 'rtf', 'xls', 'xlsx', 'csv', 'ods', 'ppt', 'pptx'].indexOf(n.indexOf('.') >= 0 ? n.substring(n.lastIndexOf('.') + 1) : '') >= 0) return 'doc';
+  return 'other';
+}
+async function handleQuery(env, q, sessionToken) {
+  const scope = normPath(q.path || '/');
+  const locked = await unlockedPrefixes(env, sessionToken);
+  const deep = q.deep !== '0';
+  const wantType = String(q.type || '');
+  const exts = csvList(q.ext).map(s => s.toLowerCase().replace(/^\*/, ''));
+  const minSize = q.minSize ? Number(q.minSize) : 0;
+  const maxSize = q.maxSize ? Number(q.maxSize) : 0;
+  const after = q.after ? Date.parse(q.after) : 0;
+  const before = q.before ? Date.parse(q.before) : 0;
+  const wantTags = csvList(q.tags);
+  const tagMode = q.tagMode === 'all' ? 'all' : 'any';
+  const nameQ = String(q.q || '').trim().toLowerCase();
+  const favOnly = q.fav === '1';
+  const limit = Math.min(Math.max(parseInt(q.limit, 10) || 200, 1), 1000);
+  const offset = Math.max(0, parseInt(q.offset, 10) || 0);
+  let favs = null;
+  if (favOnly) { favs = new Set(await getFavs(env)); }
+  const out = [];
+  let scanned = 0, capped = false;
+  async function walk(dirPath, depth) {
+    if (out.length >= 3000) { capped = true; return; }
+    let items = [];
+    try { items = await getDir(env, dirPath); } catch (e) { return; }
+    for (const it of items) {
+      if (!it || !it.name) continue;
+      if (it.type === 'dir') {
+        if (!deep || depth >= 8) continue;
+        const sub = dirPath + it.name + '/';
+        if (isLockedPrefix(sub, locked)) continue;
+        await walk(sub, depth + 1);
+        continue;
+      }
+      scanned++;
+      const full = dirPath + it.name;
+      if (insideLocked(dirPath, locked)) continue;
+      if (nameQ && it.name.toLowerCase().indexOf(nameQ) < 0) continue;
+      if (wantType && mimeGroupOf(it.mime, it.name) !== wantType) continue;
+      if (exts.length) {
+        const n = it.name.toLowerCase();
+        if (!exts.some(e => n.endsWith(e))) continue;
+      }
+      if (minSize && (it.size || 0) < minSize) continue;
+      if (maxSize && (it.size || 0) > maxSize) continue;
+      const ts = it.time ? Date.parse(it.time) : 0;
+      if (after && (!ts || ts < after)) continue;
+      if (before && (!ts || ts > before)) continue;
+      if (favOnly && !favs.has(full)) continue;
+      if (wantTags.length) {
+        const ft = await getFileTags(env, full);
+        const names = ft.map(t => t && t.name);
+        const hit = tagMode === 'all' ? wantTags.every(w => names.indexOf(w) >= 0) : wantTags.some(w => names.indexOf(w) >= 0);
+        if (!hit) continue;
+      }
+      out.push(Object.assign({}, it, { path: dirPath }));
+      if (out.length >= 3000) { capped = true; return; }
+    }
+  }
+  await walk(scope, 0);
+  out.sort(function (x, y) {
+    const k = q.sort === 'size' ? 'size' : (q.sort === 'time' ? 'time' : 'name');
+    let r;
+    if (k === 'size') r = (x.size || 0) - (y.size || 0);
+    else if (k === 'time') r = String(x.time || '').localeCompare(String(y.time || ''));
+    else r = String(x.name).localeCompare(String(y.name));
+    return q.order === 'desc' ? -r : r;
+  });
+  return json({
+    items: out.slice(offset, offset + limit), total: out.length, scanned, capped,
+    offset, limit, hasMore: offset + limit < out.length, scope, deep
+  });
 }
 
 // ===== Version API =====
@@ -1753,34 +3071,43 @@ async function handleChunkInit(env, fileName, totalSize, hash, dirPath, mime) {
   const uploadId = randToken().substring(0, 16);
   dirPath = normPath(dirPath);
   const size = parseInt(totalSize, 10) || 0;
-  if (size > MAX_UPLOAD_SIZE) return json({ error: 'File too large', max: MAX_UPLOAD_SIZE }, 413);
+  if (size > maxUploadBytes(env)) return json({ error: 'File too large', max: maxUploadBytes(env) }, 413);
   if (size > 0) {
     const u = await getUsage(env);
     if ((u.used || 0) + size > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413);
   }
   await env.STORE.put('chunk:' + uploadId, JSON.stringify({ fileName: sanitizeName(fileName), totalSize: size, hash: hash || '', dirPath, mime: String(mime || ''), chunks: 0, created: Date.now() }), { expirationTtl: 86400 });
+  // 顺手回收一次过期分片（每 isolate 每小时最多一次，避免中途放弃的上传长期占用 R2）
+  if (Date.now() - TEL.lastChunkGc > 3600 * 1000) {
+    TEL.lastChunkGc = Date.now();
+    try { await gcChunks(env, 100); } catch (e) {}
+  }
   if (isHex64(hash)) {
     try {
       const r = await instantStore(env, hash, fileName, dirPath, size);
       if (r.hit) { try { await env.STORE.delete('chunk:' + uploadId); } catch (e) {} return json({ instant: true, name: r.name }); }
     } catch (e) {}
   }
-  return json({ uploadId, chunkSize: 5 * 1024 * 1024 });
+  return json({ uploadId, chunkSize: CHUNK_SIZE });
 }
 // 分片上传：每个分片用独立 KV 键记录已上传状态，避免并发覆盖
 async function handleChunkUpload(req, env, uploadId, chunkIndex) {
   const meta = await env.STORE.get('chunk:' + uploadId, 'json');
   if (!meta) return json({ error: 'Upload not found' }, 404);
-  const st = new URL(req.url).searchParams.get('token') || '';
+  const st = extractToken(req);
   if (await isPathLocked(env, meta.dirPath, st)) return json({ locked: true, path: meta.dirPath }, 423);
   const idx = parseInt(chunkIndex, 10);
-  if (!Number.isFinite(idx) || idx < 0 || idx > 100000) return json({ error: 'Bad chunk index' }, 400);
+  // R2 分片号上限 10000，且不得超过本次声明的总分片数
+  const declaredTotal = (Number(meta.totalSize) > 0) ? Math.ceil(Number(meta.totalSize) / CHUNK_SIZE) : 0;
+  if (!Number.isFinite(idx) || idx < 0 || idx > 10000) return json({ error: 'Bad chunk index' }, 400);
+  if (declaredTotal && idx >= declaredTotal) return json({ error: 'Chunk index out of range', total: declaredTotal }, 400);
   const body = await req.arrayBuffer();
-  if (body.byteLength > 5 * 1024 * 1024) return json({ error: 'Chunk too large' }, 413);
-  await env.DRIVE.put('chunks/' + uploadId + '/' + idx, body);
+  if (body.byteLength > CHUNK_SIZE) return json({ error: 'Chunk too large' }, 413);
+  await env.DRIVE.put(CHUNKS_PREFIX + uploadId + '/' + idx, body);
   // 每个分片独立 key，避免并发写入互相覆盖
   try { await env.STORE.put('chunkgot:' + uploadId + ':' + idx, '1', { expirationTtl: 86400 }); } catch (e) {}
-  if ((meta.chunks || 0) <= idx) {
+  // 并发上传时 KV 读改写会丢更新，只作为提示值；完整性以 chunkgot: 键 + totalSize 为准
+  if ((meta.chunks || 0) < idx + 1) {
     meta.chunks = idx + 1;
     try { await env.STORE.put('chunk:' + uploadId, JSON.stringify(meta), { expirationTtl: 86400 }); } catch (e) {}
   }
@@ -1805,14 +3132,17 @@ async function listGotChunks(env, uploadId) {
 async function handleChunkComplete(req, env, uploadId) {
   const meta = await env.STORE.get('chunk:' + uploadId, 'json');
   if (!meta) return json({ error: 'Upload not found' }, 404);
-  const st = new URL(req.url).searchParams.get('token') || '';
+  const st = extractToken(req);
   if (await isPathLocked(env, meta.dirPath, st)) return json({ locked: true, path: meta.dirPath }, 423);
 
   const name = sanitizeName(meta.fileName);
   const outDir = await applyAutoArchive(env, normPath(meta.dirPath), name, '');
   const key = outDir.replace(/^\//, '') + name;
-  const total = Math.max(0, parseInt(meta.chunks, 10) || 0);
+  // 总分片数由声明的 totalSize 推导（meta.chunks 在并发下可能丢更新），并做上限保护
+  const declared = Math.max(0, parseInt(meta.totalSize, 10) || 0);
+  const total = declared > 0 ? Math.ceil(declared / CHUNK_SIZE) : Math.max(0, parseInt(meta.chunks, 10) || 0);
   if (!total) return json({ error: 'No chunks uploaded' }, 400);
+  if (total > 10000) return json({ error: 'Too many chunks', max: 10000 }, 413);
 
   // 容错：以"已收到分片清单"为准校验完整性（不再单一依赖 meta.chunks），缺失则返回缺失下标便于前端续传
   const got = await listGotChunks(env, uploadId);
@@ -1823,6 +3153,10 @@ async function handleChunkComplete(req, env, uploadId) {
 
   const oldRes = await findDirItem(env, outDir, name);
   const oldItem = oldRes.item;
+  if (!oldItem) {
+    const ruleChk = await checkDirRule(env, outDir, name, declared);
+    if (ruleChk) return json({ error: ruleChk.error }, 403);
+  }
   if (oldItem) await pushVersion(env, key, oldItem);
 
   let done = false;
@@ -1835,7 +3169,7 @@ async function handleChunkComplete(req, env, uploadId) {
           const batch = [];
           for (let j = i; j < Math.min(i + 10, total); j++) {
             batch.push((async () => {
-              const chunk = await env.DRIVE.get('chunks/' + uploadId + '/' + j);
+              const chunk = await env.DRIVE.get(CHUNKS_PREFIX + uploadId + '/' + j);
               if (!chunk) throw new Error('Missing chunk ' + j);
               const buf = await chunk.arrayBuffer();
               return multipart.uploadPart(j + 1, buf);
@@ -1857,7 +3191,7 @@ async function handleChunkComplete(req, env, uploadId) {
     // 退化为内存拼装（上限 50MB，避免 Worker OOM）
     const parts = []; let totalLen = 0;
     for (let i = 0; i < total; i++) {
-      const chunk = await env.DRIVE.get('chunks/' + uploadId + '/' + i);
+      const chunk = await env.DRIVE.get(CHUNKS_PREFIX + uploadId + '/' + i);
       if (!chunk) return json({ error: 'Missing chunk ' + i }, 400);
       const ab = await chunk.arrayBuffer();
       totalLen += ab.byteLength;
@@ -1871,8 +3205,17 @@ async function handleChunkComplete(req, env, uploadId) {
   }
   try { await mirrorPut(env, key); } catch (e) {}
 
+  // 组装结果必须与声明大小一致，否则保留分片供续传，避免写入"截断但 size 正确"的坏文件
+  let actualSize = 0;
+  try { const h = await env.DRIVE.head(key); actualSize = h ? (h.size || 0) : 0; } catch (e) {}
+  if (!actualSize) return json({ error: 'Assembly failed', canResume: true }, 500);
+  if (declared > 0 && actualSize !== declared) {
+    try { await deleteAndMirror(env, key); } catch (e) {}
+    return json({ error: 'Size mismatch', expected: declared, actual: actualSize, canResume: true }, 400);
+  }
+
   const delPromises = [];
-  for (let i = 0; i < total; i++) { delPromises.push(env.DRIVE.delete('chunks/' + uploadId + '/' + i).catch(() => {})); }
+  for (let i = 0; i < total; i++) { delPromises.push(env.DRIVE.delete(CHUNKS_PREFIX + uploadId + '/' + i).catch(() => {})); }
   await Promise.all(delPromises);
   // 清理分片标记键
   try {
@@ -1884,22 +3227,22 @@ async function handleChunkComplete(req, env, uploadId) {
     } while (gcursor);
   } catch (e) {}
   await env.STORE.delete('chunk:' + uploadId);
-  if (meta.hash) { try { await env.STORE.put('hash:' + meta.hash, JSON.stringify({ key, time: Date.now() })); } catch (e) {} }
+  if (meta.hash) { try { await env.STORE.put('hash:' + meta.hash, JSON.stringify({ key, time: Date.now() }), { expirationTtl: hashTtl(env) }); } catch (e) {} }
 
-  const finalSize = meta.totalSize || 0;
+  const finalSize = actualSize;
   const entry = { name, type: 'file', size: finalSize, mime: meta.mime || '', time: new Date().toISOString(), hash: meta.hash || '' };
   await upsertDirItem(env, outDir, entry);
   if (oldItem) await addUsage(env, finalSize - (oldItem.size || 0), 0);
   else await addUsage(env, finalSize, 1);
   await addLog(env, 'up', key, finalSize + ' bytes (chunked)');
-  return json({ ok: true, key });
+  return json({ ok: true, key, size: finalSize });
 }
 async function handleChunkStatus(env, uploadId) {
   const meta = await env.STORE.get('chunk:' + uploadId, 'json');
   if (!meta) return json({ error: 'Not found' }, 404);
   const got = await listGotChunks(env, uploadId);
   return json({
-    chunks: meta.chunks, total: Math.ceil(meta.totalSize / (5 * 1024 * 1024)),
+    chunks: meta.chunks, total: Math.ceil(meta.totalSize / CHUNK_SIZE),
     got: got,
     fileName: meta.fileName, totalSize: meta.totalSize, dirPath: meta.dirPath
   });
@@ -1922,7 +3265,7 @@ async function handleTree(env, sessionToken) {
     if (!dirs.length) return node;
     for (const d of dirs) {
       const childPath = dirPath + d.name + '/';
-      if (locked.has(childPath)) { node.children.push({ name: d.name, path: childPath, children: [] }); continue; }
+      if (isLockedPrefix(childPath, locked)) { node.children.push({ name: d.name, path: childPath, children: [] }); continue; }
       const child = await buildNode(childPath, depth + 1);
       if (child) node.children.push(child);
     }
@@ -1933,7 +3276,39 @@ async function handleTree(env, sessionToken) {
 }
 
 // ===== Share（修复：访问计数在 /data 处 +1，/pv 和 /dl 仅检查配额） =====
-async function createShare(env, filePath, days, maxAccesses, password, isDir) {
+function normalizeShareView(v) {
+  const out = {};
+  if (v && typeof v === 'object') {
+    if (v.title !== undefined) out.title = String(v.title || '').slice(0, 80);
+    if (v.desc !== undefined) out.desc = String(v.desc || '').slice(0, 300);
+    if (v.color !== undefined) { const c = String(v.color || '').trim(); if (!c || /^#[0-9a-fA-F]{3,8}$/.test(c)) out.color = c; }
+    if (v.cover !== undefined) out.cover = String(v.cover || '').slice(0, 300);
+  }
+  return out;
+}
+const SHARE_SLUG_RE = /^[A-Za-z0-9_-]{2,32}$/;
+const SHARE_STAT_LAST = new Map();   // 分享统计落盘节流（防爆：避免每次访问都写 KV）
+function shareTtlFor(data) { return Math.max(60, Math.ceil(((data.exp || 0) - Date.now()) / 1000) + 60); }
+async function bumpShareStats(env, shareToken, data, kind, req) {
+  try {
+    data.stats = data.stats || { views: 0, downloads: 0 };
+    if (kind === 'download') data.stats.downloads = (data.stats.downloads || 0) + 1;
+    else data.stats.views = (data.stats.views || 0) + 1;
+    data.stats.lastAt = Date.now();
+    const ci = req ? clientInfo(req) : {};
+    const visits = Array.isArray(data.visits) ? data.visits : [];
+    visits.unshift({ t: Date.now(), k: kind, ip: ci.ip || '', c: ci.country || '', b: ci.browser || '', d: ci.device || '' });
+    if (visits.length > 20) visits.length = 20;
+    data.visits = visits;
+    const last = SHARE_STAT_LAST.get(shareToken) || 0;
+    if (Date.now() - last > 3000) {
+      SHARE_STAT_LAST.set(shareToken, Date.now());
+      await env.STORE.put('share:' + shareToken, JSON.stringify(data), { expirationTtl: shareTtlFor(data) });
+    }
+  } catch (e) {}
+}
+async function createShare(env, filePath, days, maxAccesses, password, isDir, opts) {
+  opts = opts || {};
   filePath = '/' + String(filePath || '').replace(/^\/+/, '');
   const t = randToken();
   const ttl = clampDays(days) * 86400;
@@ -1946,19 +3321,121 @@ async function createShare(env, filePath, days, maxAccesses, password, isDir) {
   const name = clean.split('/').filter(Boolean).pop() || (isDir ? 'root' : 'file');
   let size = 0, mime = '';
   if (!isDir) {
-    const obj = await env.DRIVE.get(filePath.replace(/^\//, ''));
-    size = obj ? obj.size : 0;
-    mime = (obj && obj.httpMetadata && obj.httpMetadata.contentType) || '';
+    // 只取元数据，避免为了 size 把整个对象 body 拉下来
+    try {
+      const head = await env.DRIVE.head(filePath.replace(/^\//, ''));
+      size = head ? (head.size || 0) : 0;
+      mime = (head && head.httpMetadata && head.httpMetadata.contentType) || '';
+    } catch (e) {}
   }
-  const rec = { path: filePath, type: isDir ? 'dir' : 'file', exp: Date.now() + ttl * 1000, max: clampCount(maxAccesses), hits: 0, pwHash, pwSalt, name, size, mime };
+  const rec = {
+    path: filePath, type: isDir ? 'dir' : 'file', exp: Date.now() + ttl * 1000,
+    max: clampCount(maxAccesses), hits: 0, pwHash, pwSalt, name, size, mime,
+    // 细粒度权限
+    allowDownload: opts.allowDownload !== false,
+    allowComment: opts.allowComment !== false,
+    once: !!opts.once,
+    downloaded: false,
+    ipAllow: String(opts.ipAllow || '').slice(0, 300),
+    ipDeny: String(opts.ipDeny || '').slice(0, 300),
+    countryAllow: String(opts.countryAllow || '').slice(0, 120),
+    countryDeny: String(opts.countryDeny || '').slice(0, 120),
+    uaDeny: String(opts.uaDeny || '').slice(0, 200),
+    note: String(opts.note || '').slice(0, 500),
+    slug: '',
+    view: normalizeShareView(opts.view),
+    stats: { views: 0, downloads: 0, lastAt: 0 },
+    visits: []
+  };
   await env.STORE.put('share:' + t, JSON.stringify(rec), { expirationTtl: ttl + 60 });
+  if (opts.slug && SHARE_SLUG_RE.test(String(opts.slug))) {
+    const sr = await setShareSlug(env, t, opts.slug);
+    if (sr.ok) rec.slug = sr.slug;
+  }
   try { await addLog(env, 'shr', filePath, isDir ? '文件夹分享' : '文件分享'); } catch (e) {}
-  return { ok: true, url: '/s/' + t, hasPassword: !!pwHash, path: filePath, name };
+  return { ok: true, url: '/s/' + (rec.slug || t), token: t, slug: rec.slug || '', hasPassword: !!pwHash, path: filePath, name };
 }
-async function handleShare(env, filePath, days, maxAccesses, password, isDir) {
-  const r = await createShare(env, filePath, days, maxAccesses, password, !!isDir);
+// 短链别名：slug:<name> → { token }
+async function setShareSlug(env, token, slug) {
+  const s = String(slug || '').trim();
+  const data = await env.STORE.get('share:' + token, 'json');
+  if (!data) return { ok: false, error: 'Not found' };
+  if (!s) {
+    if (data.slug) { try { await env.STORE.delete('slug:' + data.slug); } catch (e) {} }
+    data.slug = '';
+    await env.STORE.put('share:' + token, JSON.stringify(data), { expirationTtl: shareTtlFor(data) });
+    return { ok: true, slug: '' };
+  }
+  if (!SHARE_SLUG_RE.test(s)) return { ok: false, error: 'Bad slug (2-32 位字母数字_-)' };
+  const existing = await env.STORE.get('slug:' + s, 'json');
+  if (existing && existing.token && existing.token !== token) return { ok: false, error: 'Slug already used' };
+  if (s.indexOf('data') === 0 && s.length < 6) return { ok: false, error: 'Reserved slug' };
+  if (data.slug && data.slug !== s) { try { await env.STORE.delete('slug:' + data.slug); } catch (e) {} }
+  await env.STORE.put('slug:' + s, JSON.stringify({ token, path: data.path, at: Date.now() }), { expirationTtl: Math.max(60, Math.ceil((data.exp - Date.now()) / 1000) + 60) });
+  data.slug = s;
+  await env.STORE.put('share:' + token, JSON.stringify(data), { expirationTtl: shareTtlFor(data) });
+  kvInvalidate('share-slugs');
+  return { ok: true, slug: s };
+}
+// 把 /s/<name> 解析成真实 token（支持自定义短链）
+async function resolveShareToken(env, name) {
+  if (!name) return null;
+  const direct = await env.STORE.get('share:' + name, 'json');
+  if (direct) return { token: name, data: direct };
+  const mapped = await env.STORE.get('slug:' + name, 'json');
+  if (mapped && mapped.token) {
+    const d = await env.STORE.get('share:' + mapped.token, 'json');
+    if (d) return { token: mapped.token, data: d };
+  }
+  return null;
+}
+async function handleShare(env, filePath, days, maxAccesses, password, isDir, opts) {
+  const r = await createShare(env, filePath, days, maxAccesses, password, !!isDir, opts);
   if (r && r.ok === false && r.locked) return json({ error: 'Locked', path: r.path }, 423);
   return json(r);
+}
+// 分享设置：权限 / 外观 / 短链
+async function handleShareUpdate(env, token, b) {
+  const key = 'share:' + String(token || '');
+  const data = await env.STORE.get(key, 'json');
+  if (!data) return json({ error: 'Not found' }, 404);
+  if (b) {
+    if (b.allowDownload !== undefined) data.allowDownload = !!b.allowDownload;
+    if (b.allowComment !== undefined) data.allowComment = !!b.allowComment;
+    if (b.once !== undefined) { data.once = !!b.once; if (data.once) data.downloaded = false; }
+    if (b.note !== undefined) data.note = String(b.note || '').slice(0, 500);
+    if (b.ipAllow !== undefined) data.ipAllow = String(b.ipAllow || '').slice(0, 300);
+    if (b.ipDeny !== undefined) data.ipDeny = String(b.ipDeny || '').slice(0, 300);
+    if (b.countryAllow !== undefined) data.countryAllow = String(b.countryAllow || '').slice(0, 120);
+    if (b.countryDeny !== undefined) data.countryDeny = String(b.countryDeny || '').slice(0, 120);
+    if (b.uaDeny !== undefined) data.uaDeny = String(b.uaDeny || '').slice(0, 200);
+    if (b.view !== undefined && b.view && typeof b.view === 'object') data.view = normalizeShareView(b.view);
+  }
+  let slugResult = null;
+  if (b && b.slug !== undefined) {
+    slugResult = await setShareSlug(env, String(token), b.slug);
+    if (!slugResult.ok) return json({ error: slugResult.error }, 400);
+    data.slug = slugResult.slug;
+  }
+  await env.STORE.put(key, JSON.stringify(data), { expirationTtl: shareTtlFor(data) });
+  return json({ ok: true, slug: data.slug || '', token: String(token), url: '/s/' + (data.slug || token) });
+}
+async function handleShareStats(env, token) {
+  const data = await env.STORE.get('share:' + String(token || ''), 'json');
+  if (!data) return json({ error: 'Not found' }, 404);
+  return json({
+    token: String(token), name: data.name || '', path: data.path || '', type: data.type || 'file',
+    url: '/s/' + (data.slug || token), slug: data.slug || '',
+    hits: data.hits || 0, max: data.max || 0, exp: data.exp || 0,
+    allowDownload: data.allowDownload !== false, allowComment: data.allowComment !== false,
+    once: !!data.once, downloaded: !!data.downloaded,
+    note: data.note || '', view: data.view || {},
+    ipAllow: data.ipAllow || '', ipDeny: data.ipDeny || '',
+    countryAllow: data.countryAllow || '', countryDeny: data.countryDeny || '', uaDeny: data.uaDeny || '',
+    stats: data.stats || { views: 0, downloads: 0, lastAt: 0 },
+    visits: (data.visits || []).slice(0, 20),
+    hasPassword: !!data.pwHash
+  });
 }
 // 目录分享：相对路径解析为绝对 key，且必须落在被分享目录内（防 ../ 逃逸）
 function shareRelKey(data, rel) {
@@ -1969,7 +3446,7 @@ function shareRelKey(data, rel) {
   const k = full.replace(/^\/+/, '').replace(/\/+$/, '');
   return k || null;
 }
-// 分享访问校验：过期 / 次数 / 密码（可选），返回 {data} 或 {resp}
+// 分享访问校验：过期 / 次数 / 密码 / 地区 / IP / UA（可选），返回 {data} 或 {resp}
 async function shareGuard(env, shareToken, req, countHit, needPw) {
   const data = await env.STORE.get('share:' + shareToken, 'json');
   if (!data) return { resp: json({ error: 'Not found' }, 404) };
@@ -1981,13 +3458,23 @@ async function shareGuard(env, shareToken, req, countHit, needPw) {
   // H3: 分享访问同样校验目录锁（目录分享看目录本身，文件分享看父目录）
   const shareLockPath = (data.type === 'dir') ? (normPath(data.path) + '/') : parentOf(normPath(data.path));
   if (await isPathLocked(env, shareLockPath, '')) return { resp: json({ error: 'Locked' }, 423) };
+  // 分享级访问控制：IP / 地区 / UA
+  if (req) {
+    const ip = req.headers.get('CF-Connecting-IP') || '';
+    if (data.ipDeny && csvList(data.ipDeny).some(r => ipMatch(ip, r))) return { resp: json({ error: 'Forbidden', reason: 'ip' }, 403) };
+    if (data.ipAllow && !csvList(data.ipAllow).some(r => ipMatch(ip, r))) return { resp: json({ error: 'Forbidden', reason: 'ip' }, 403) };
+    const country = (req.cf && req.cf.country) || '';
+    if (!countryAllowed({ COUNTRY_ALLOW: data.countryAllow, COUNTRY_DENY: data.countryDeny }, country)) return { resp: json({ error: 'Forbidden', reason: 'country' }, 403) };
+    const ua = req.headers.get('User-Agent') || '';
+    if (!uaAllowed({ UA_DENY: data.uaDeny }, ua)) return { resp: json({ error: 'Forbidden', reason: 'ua' }, 403) };
+  }
   if (countHit) {
     const before = data.hits || 0;
     if (data.max > 0 && before >= data.max) return { resp: json({ error: 'Access limit reached', hits: data.max, max: data.max, name: data.name }, 403) };
     const atom = await counterAdd(env, 'share:' + shareToken, 1);
     const hits = (atom == null) ? (before + 1) : atom;
     data.hits = hits;
-    try { await env.STORE.put('share:' + shareToken, JSON.stringify(data), { expirationTtl: Math.max(60, Math.ceil((data.exp - Date.now()) / 1000) + 60) }); } catch (e) {}
+    try { await env.STORE.put('share:' + shareToken, JSON.stringify(data), { expirationTtl: shareTtlFor(data) }); } catch (e) {}
     if (data.max > 0 && hits > data.max) return { resp: json({ error: 'Access limit reached', hits: data.max, max: data.max, name: data.name }, 403) };
   } else if (data.max > 0 && (data.hits || 0) >= data.max) {
     return { resp: json({ error: 'Access limit reached' }, 403) };
@@ -2000,16 +3487,17 @@ async function shareGuard(env, shareToken, req, countHit, needPw) {
 }
 // 分享 /data：密码未通过前不返回真实元数据（仅返回 needPassword + hits/max）
 // 计入一次分享访问（仅当密码（如有）已通过时调用），同时校验访问上限
-async function shareCount(env, shareToken, data) {
+async function shareCount(env, shareToken, data, req) {
   if (data.max > 0) {
     const before = data.hits || 0;
     if (before >= data.max) return { resp: json({ error: 'Access limit reached', hits: data.max, max: data.max, name: data.name }, 403) };
     const atom = await counterAdd(env, 'share:' + shareToken, 1);
     const hits = (atom == null) ? (before + 1) : atom;
     data.hits = hits;
-    try { await env.STORE.put('share:' + shareToken, JSON.stringify(data), { expirationTtl: Math.max(60, Math.ceil((data.exp - Date.now()) / 1000) + 60) }); } catch (e) {}
+    try { await env.STORE.put('share:' + shareToken, JSON.stringify(data), { expirationTtl: shareTtlFor(data) }); } catch (e) {}
     if (data.max > 0 && hits > data.max) return { resp: json({ error: 'Access limit reached', hits: data.max, max: data.max, name: data.name }, 403) };
   }
+  await bumpShareStats(env, shareToken, data, 'view', req);
   return { ok: true };
 }
 async function handleShareData(env, shareToken, req) {
@@ -2021,14 +3509,87 @@ async function handleShareData(env, shareToken, req) {
     if (g.resp) return g.resp;
     const d = g.data;
     const stats = { hits: d.max > 0 ? Math.min(d.hits || 0, d.max) : (d.hits || 0), max: d.max || 0 };
+    const view = d.view || {};
     if (d.pwHash && !await verifyPassword(pw, { hash: d.pwHash, salt: d.pwSalt })) {
-      return json(Object.assign({ needPassword: true, hasPassword: true }, stats));
+      return json(Object.assign({ needPassword: true, hasPassword: true, view, note: d.note || '' }, stats));
     }
-    const c = await shareCount(env, shareToken, d);
+    const c = await shareCount(env, shareToken, d, req);
     if (c.resp) return c.resp;
     return json(Object.assign({
-      type: d.type || 'file', name: d.name, size: d.size || 0, mime: d.mime || ''
+      type: d.type || 'file', name: d.name, size: d.size || 0, mime: d.mime || '',
+      allowDownload: d.allowDownload !== false, allowComment: d.allowComment !== false,
+      once: !!d.once, note: d.note || '', view, slug: d.slug || '', token: shareToken
     }, stats));
+  } catch (e) { return json({ error: 'Invalid' }, 400); }
+}
+// ===== 文件评论（站内 + 分享访客）=====
+const COMMENT_MAX = 200;
+const COMMENT_TEXT_MAX = 2000;
+async function getComments(env, path) {
+  try { return await env.STORE.get('comments:' + path, 'json') || []; } catch (e) { return []; }
+}
+async function addComment(env, path, text, who, req) {
+  const t = String(text == null ? '' : text).trim();
+  if (!t) return { error: 'Empty comment' };
+  if (t.length > COMMENT_TEXT_MAX) return { error: 'Comment too long', max: COMMENT_TEXT_MAX };
+  const key = 'comments:' + path;
+  if (!kvKeyOk(key)) return { error: 'Path too long' };
+  const list = await getComments(env, path);
+  const ci = req ? clientInfo(req) : {};
+  const item = {
+    id: randToken().substring(0, 10), t: Date.now(),
+    by: String(who || 'owner').slice(0, 40),
+    ip: ci.ip || '', country: ci.country || '', text: t
+  };
+  list.unshift(item);
+  while (list.length > COMMENT_MAX) list.pop();
+  try { await env.STORE.put(key, JSON.stringify(list), { expirationTtl: 400 * 86400 }); } catch (e) { return { error: 'Save failed' }; }
+  try { await notifyWebhook(env, { event: 'comment', path, detail: item.by + ': ' + t.slice(0, 120) }); } catch (e) {}
+  return { ok: true, item, count: list.length };
+}
+async function handleComments(env, req, url) {
+  let body = null;
+  if (req.method === 'POST' || req.method === 'DELETE') { try { body = await req.json(); } catch (e) { body = null; } }
+  const path = String(url.searchParams.get('path') || (body && body.path) || '');
+  if (!path) return json({ error: 'No path' }, 400);
+  if (req.method === 'GET') return json({ comments: await getComments(env, path) });
+  if (req.method === 'POST') {
+    const b = body || {};
+    const r = await addComment(env, path, b.text, b.by || 'owner', req);
+    if (r.error) return json({ error: r.error }, r.error === 'Comment too long' ? 413 : 400);
+    try { await addLog(env, 'cmt', path, String(b.text || '').slice(0, 60)); } catch (e) {}
+    return json(r);
+  }
+  if (req.method === 'DELETE') {
+    const id = String(url.searchParams.get('id') || (body && body.id) || '');
+    const list = await getComments(env, path);
+    const next = list.filter(c => c.id !== id);
+    try { await env.STORE.put('comments:' + path, JSON.stringify(next), { expirationTtl: 400 * 86400 }); } catch (e) {}
+    return json({ ok: true, removed: list.length - next.length });
+  }
+  return json({ error: 'Method not allowed' }, 405);
+}
+// 分享访客评论（受限：必须在分享范围内，且分享允许评论）
+async function handleShareComment(env, shareToken, req) {
+  try {
+    const g = await shareGuard(env, shareToken, req, false, true);
+    if (g.resp) return g.resp;
+    const d = g.data;
+    if (d.allowComment === false) return json({ error: 'Comment disabled' }, 403);
+    const b = await req.json();
+    let target;
+    if (d.type === 'dir') {
+      const base = normPath(d.path);
+      const rel = String(b.p || '');
+      const full = normPath(base + rel);
+      if (!full.startsWith(base)) return json({ error: 'Forbidden' }, 403);
+      target = full.replace(/\/+$/, '') || '/';
+    } else {
+      target = '/' + String(d.path || '').replace(/^\/+/, '');
+    }
+    const r = await addComment(env, target, b.text, (b.name ? String(b.name).slice(0, 40) : 'guest'), req);
+    if (r.error) return json({ error: r.error }, r.error === 'Comment too long' ? 413 : 400);
+    return json({ ok: true, count: r.count });
   } catch (e) { return json({ error: 'Invalid' }, 400); }
 }
 async function handleShareList(env, shareToken, req) {
@@ -2041,6 +3602,8 @@ async function handleShareList(env, shareToken, req) {
     const base = normPath(d.path);
     const dir = normPath(base + rel);
     if (!dir.startsWith(base)) return json({ error: 'Forbidden' }, 403);
+    // H3: 分享根目录之下的加密子目录同样不能通过分享访问
+    if (await isPathLocked(env, dir, '')) return json({ error: 'Locked' }, 423);
     const items = await getDir(env, dir);
     const out = items
       .filter(it => it && it.name && it.name !== '.trash')
@@ -2055,6 +3618,7 @@ async function handleSharePreview(env, shareToken, req) {
     if (g.resp) return g.resp;
     const key = shareRelKey(g.data, new URL(req.url).searchParams.get('p') || '');
     if (!key) return json({ error: 'Not found' }, 404);
+    if (await isPathLocked(env, parentOf('/' + key), '')) return json({ error: 'Locked' }, 423);
     return await serveObject(env, req, key, { disposition: 'inline', sanitize: true, cacheControl: 'private, max-age=3600' });
   } catch (e) { return json({ error: 'Invalid' }, 400); }
 }
@@ -2062,12 +3626,21 @@ async function handleShareDownload(env, shareToken, req) {
   try {
     const g = await shareGuard(env, shareToken, req, false, true);
     if (g.resp) return g.resp;
-    const key = shareRelKey(g.data, new URL(req.url).searchParams.get('p') || '');
+    const d = g.data;
+    if (d.allowDownload === false) return json({ error: 'Download disabled' }, 403);
+    if (d.once && d.downloaded) return json({ error: 'Download already used', once: true }, 410);
+    const key = shareRelKey(d, new URL(req.url).searchParams.get('p') || '');
     if (!key) return json({ error: 'Not found' }, 404);
+    if (await isPathLocked(env, parentOf('/' + key), '')) return json({ error: 'Locked' }, 423);
     const name = key.split('/').pop();
     const resp = await serveObject(env, req, key, { disposition: 'attachment; filename="' + encodeURIComponent(name) + '"' });
     if (resp.status === 200) {
-      await addDownloadLog(env, Object.assign({ time: new Date().toISOString(), path: '/' + key, name, size: g.data.size || 0, source: 'share' }, clientInfo(req)));
+      await addDownloadLog(env, Object.assign({ time: new Date().toISOString(), path: '/' + key, name, size: d.size || 0, source: 'share' }, clientInfo(req)));
+      if (d.once && !d.downloaded) {
+        d.downloaded = true;
+        try { await env.STORE.put('share:' + shareToken, JSON.stringify(d), { expirationTtl: shareTtlFor(d) }); } catch (e) {}
+      }
+      await bumpShareStats(env, shareToken, d, 'download', req);
     }
     return resp;
   } catch (e) { return json({ error: 'Invalid' }, 400); }
@@ -2080,9 +3653,13 @@ async function handleBatchShare(env, paths, days, maxAccesses, password, session
       const fp = '/' + String(p || '').replace(/^\/+/, '');
       if (fp === '/') { failed++; continue; }
       if (await isPathLocked(env, fp, sessionToken || '') || await isPathLocked(env, parentOf(fp), sessionToken || '')) { items.push({ path: fp, error: 'locked' }); failed++; continue; }
-      const r = await createShare(env, fp, days, maxAccesses, password);
-      items.push({ path: fp, name: r.name, url: r.url });
-      created++;
+      const base = parentOf(fp);
+      const nm = fp.split('/').filter(Boolean).pop();
+      const found = await findDirItem(env, base, nm);
+      const isDir = !!(found.item && found.item.type === 'dir');
+      const r = await createShare(env, fp, days, maxAccesses, password, isDir);
+      if (r && r.ok) { items.push({ path: fp, name: r.name, url: r.url, type: isDir ? 'dir' : 'file' }); created++; }
+      else { items.push({ path: fp, error: (r && r.locked) ? 'locked' : 'failed' }); failed++; }
     } catch (e) { failed++; }
   }
   return json({ ok: true, created, failed, items });
@@ -2101,14 +3678,81 @@ async function handleBatchMove(env, paths, target) {
   return json({ ok: true, moved: ok, failed });
 }
 
-function sharePage(token) {
-  const title = '文件分享';
+// ===== 公共页面设计 token（分享页 / 相册页 / 上传页共用，与主应用同一套变量）=====
+function publicPageCss() {
+  return `
+/* 兼容旧变量名：页面原有 CSS 继续可用 */
+:root{--sys-blue:#0a84ff;--sys-blue-hover:#0066ff;--sys-blue-soft:rgba(10,132,255,.14);
+  --sys-card:rgba(255,255,255,.72);--sys-card-solid:#fff;--sys-fill:#f6f8fa;--sys-fill-2:#eef1f4;
+  --sys-separator:rgba(0,0,0,.08);--sys-separator-opaque:#d8dee4;--sys-text:#1f2328;--sys-text-2:#57606a;--sys-text-3:#8c959f;
+  --sys-green:#1a7f37;--sys-red:#cf222e;--sys-orange:#9a6700;--sys-shadow-sm:0 2px 8px rgba(31,35,40,.06);
+  --sys-shadow-md:0 10px 30px rgba(31,35,40,.12);--sys-blur:saturate(180%) blur(20px);
+  --bg:var(--sys-fill);--card:var(--sys-card-solid);--border:var(--sys-separator-opaque);--text:var(--sys-text);
+  --text2:var(--sys-text-2);--text3:var(--sys-text-3);--accent:var(--sys-blue);--accent-h:var(--sys-blue-hover);
+  --fill:var(--sys-fill);--red:var(--sys-red);--warn:var(--sys-orange)}
+:root.dark{--sys-card:rgba(22,27,34,.72);--sys-card-solid:#161b22;--sys-fill:#0d1117;--sys-fill-2:#21262d;
+  --sys-separator:rgba(255,255,255,.12);--sys-separator-opaque:#30363d;--sys-text:#e6edf3;--sys-text-2:#8b949e;--sys-text-3:#6e7681;
+  --sys-blue-soft:rgba(47,129,247,.18);--sys-green:#3fb950;--sys-red:#f85149;--sys-orange:#d29922;
+  --sys-shadow-sm:0 2px 10px rgba(0,0,0,.35);--sys-shadow-md:0 18px 44px rgba(0,0,0,.5);--bg:#0d1117;--card:#161b22}
+body{background:var(--sys-fill);color:var(--sys-text);-webkit-font-smoothing:antialiased}
+a{color:var(--sys-blue)}
+/* 顶栏 + 卡片 + 按钮：与主应用一致的分级 */
+.pg-bar{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:10px 14px;border-radius:16px;
+  background:var(--sys-card);border:.5px solid var(--sys-separator);backdrop-filter:var(--sys-blur);-webkit-backdrop-filter:var(--sys-blur);
+  box-shadow:var(--sys-shadow-sm)}
+.pg-bar .pg-logo{font-size:20px;line-height:1}
+.pg-bar .pg-title{font-weight:600;font-size:15px;letter-spacing:-.01em}
+.pg-bar .pg-sub{font-size:11.5px;color:var(--sys-text-3);font-family:ui-monospace,Menlo,monospace}
+.pg-bar .pg-actions{margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.pg-card{background:var(--sys-card-solid);border:.5px solid var(--sys-separator);border-radius:18px;padding:18px;box-shadow:var(--sys-shadow-md)}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:12px;border:1px solid var(--sys-separator);
+  background:var(--sys-card-solid);color:var(--sys-text);font-size:14px;font-weight:500;cursor:pointer;text-decoration:none;transition:filter .12s,background .12s}
+.btn:hover{background:var(--sys-fill-2)}
+.btn.primary{background:linear-gradient(180deg,var(--sys-blue),var(--sys-blue-hover));color:#fff;border-color:transparent}
+.btn.gray{background:var(--sys-fill);border-color:transparent;color:var(--sys-text)}
+.btn.tiny{padding:5px 11px;font-size:12.5px;border-radius:10px}
+.btn.danger{background:var(--sys-red);color:#fff;border-color:transparent}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:999px;border:1px solid var(--sys-separator);
+  background:var(--sys-fill);color:var(--sys-text);font-size:12.5px;cursor:pointer}
+.dup-path{font-size:11.5px;color:var(--sys-text-3);font-family:ui-monospace,Menlo,monospace;word-break:break-all}
+.theme-btn{position:fixed;top:16px;right:16px;z-index:999;width:42px;height:42px;border-radius:50%;border:1px solid var(--sys-separator);
+  background:var(--sys-card-solid);color:var(--sys-text);font-size:18px;cursor:pointer;box-shadow:var(--sys-shadow-md);
+  display:flex;align-items:center;justify-content:center;backdrop-filter:var(--sys-blur);-webkit-backdrop-filter:var(--sys-blur);transition:transform .12s}
+.theme-btn:active{transform:scale(.92)}
+:root[data-density="compact"] .pg-card{padding:13px}
+:root[data-density="compact"] .row{padding:7px 6px}
+:root[data-density="compact"] .list li{padding:5px 0}
+`;
+}
+function publicPageThemeJs() {
+  return "(function(){"
+    + "var dth=localStorage.getItem('dth')||'auto';"
+    + "function applyTheme(){var h=document.documentElement;var d=dth==='dark'||(dth==='auto'&&window.matchMedia&&window.matchMedia('(prefers-color-scheme:dark)').matches);h.classList.toggle('dark',!!d);var b=document.getElementById('themeBtn');if(b)b.textContent=dth==='auto'?'\\uD83C\\uDF17':(dth==='light'?'\\u2600\\uFE0F':'\\uD83C\\uDF19')}"
+    + "function hexA(x,a){var s=String(x||'').replace('#','');if(s.length===3)s=s[0]+s[0]+s[1]+s[1]+s[2]+s[2];var n=parseInt(s,16);if(!isFinite(n))return 'rgba(10,132,255,'+a+')';return 'rgba('+((n>>16)&255)+','+((n>>8)&255)+','+(n&255)+','+a+')'}"
+    + "function applyAccent(){try{var c=localStorage.getItem('dAccent');if(!/^#[0-9a-fA-F]{6}$/.test(String(c||'')))return;var r=document.documentElement;r.style.setProperty('--sys-blue',c);r.style.setProperty('--sys-blue-hover',c);r.style.setProperty('--sys-blue-soft',hexA(c,0.14))}catch(e){}}"
+    + "function applyDensity(){try{var v=localStorage.getItem('dDensity')==='compact'?'compact':'cozy';document.documentElement.setAttribute('data-density',v)}catch(e){}}"
+    + "applyTheme();applyAccent();applyDensity();"
+    + "var b=document.createElement('button');b.id='themeBtn';b.className='theme-btn';b.title='\\u5207\\u6362\\u4e3b\\u9898';b.textContent='\\uD83C\\uDF17';"
+    + "b.onclick=function(){dth=dth==='auto'?'light':(dth==='light'?'dark':'auto');localStorage.setItem('dth',dth);applyTheme()};"
+    + "document.body.appendChild(b);"
+    + "if(window.matchMedia){try{window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){if(dth==='auto')applyTheme()})}catch(e){}}"
+    + "})();";
+}
+
+function sharePage(token, rec) {
+  const view = (rec && rec.view) || {};
+  const title = escHtml(view.title || '文件分享');
+  const note = escHtml((rec && rec.note) || '');
+  const accent = (view.color && /^#[0-9a-fA-F]{3,8}$/.test(view.color)) ? view.color : '';
+  const allowDl = !(rec && rec.allowDownload === false);
+  const allowCmt = !(rec && rec.allowComment === false);
+  const desc = escHtml(view.desc || '');
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#f6f8fa;--card:#fff;--border:#d8dee4;--text:#1f2328;--text2:#57606a;--text3:#8c959f;--accent:#0a84ff;--accent-h:#0066ff;--fill:#f6f8fa;--red:#cf222e;--warn:#9a6700}
-:root.dark{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--text2:#8b949e;--text3:#6e7681;--accent:#0a84ff;--accent-h:#409cff;--fill:#21262d;--red:#f85149;--warn:#d29922}
+${publicPageCss()}
+${accent ? ':root{--sys-blue:' + accent + ';--sys-blue-hover:' + accent + ';--accent:' + accent + '}' : ''}
 body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;-webkit-font-smoothing:antialiased}
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:28px;max-width:560px;width:100%;text-align:center}
 h2{font-size:13px;color:var(--text2);margin-bottom:8px;font-weight:600;letter-spacing:.4px}
@@ -2136,18 +3780,23 @@ button:hover{background:var(--accent-h);border-color:var(--accent-h)}
 input,button,.zone{border-radius:11px}
 </style></head><body>
 <div class="card">
-<h2>📎 文件分享</h2>
+<h2>📎 ${title}</h2>
+${desc ? '<div class="meta" style="font-family:inherit;font-size:13px">' + desc + '</div>' : ''}
 <div class="meta" id="meta">加载中...</div>
 <div class="ficon" id="ficon">📄</div>
 <div class="name" id="fname">—</div>
+${note ? '<div style="font-size:12px;color:var(--warn);margin:6px 0 4px;white-space:pre-wrap;word-break:break-word">' + note + '</div>' : ''}
 <div class="pv hidden" id="pvBox"></div>
 <div class="row hidden" id="pwRow"><input type="password" id="pwInput" placeholder="请输入访问密码" autocomplete="off"><button id="btnPw">确定</button></div>
 <div class="row hidden" id="dlRow"><button id="btnDl">下载文件</button></div>
+${allowCmt ? '<div id="cmtWrap" style="margin-top:18px;text-align:left"><div style="font-size:12px;color:var(--text3);margin-bottom:6px">💬 留言</div><div id="cmtList" style="max-height:220px;overflow:auto;font-size:13px"></div><div class="row" style="margin-top:8px"><input id="cmtName" placeholder="昵称（可选）" style="flex:0 0 110px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--fill);color:inherit"><input id="cmtText" placeholder="说点什么..." style="flex:1;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--fill);color:inherit"><button id="cmtSend">发送</button></div></div>' : ''}
 <div class="msg" id="msg"></div>
 </div>
 <script>
 var tk=${JSON.stringify(token)};
 var pw='';
+var ALLOW_DL=${allowDl ? 'true' : 'false'};
+var ALLOW_CMT=${allowCmt ? 'true' : 'false'};
 var fname='',fmime='',fsize=0;
 function esc(s){return String(s==null?'':s).replace(/[&<>"'\`]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','\`':'&#96;'}[c]})}
 function fmt(b){if(!b||b===0)return'0 B';var u=['B','KB','MB','GB'];var i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(1)+' '+u[i]}
@@ -2177,9 +3826,31 @@ function loadData(){
     document.getElementById('ficon').textContent=iconFor(fmime);
     document.getElementById('meta').textContent=fmt(fsize)+' · '+(d.max>0?('已访问 '+d.hits+'/'+d.max):'');
     document.getElementById('pwRow').classList.add('hidden');
-    document.getElementById('dlRow').classList.remove('hidden');
+    if(ALLOW_DL)document.getElementById('dlRow').classList.remove('hidden');
+    else setMsg((d.once?'此链接为一次性下载，已被使用':'该分享仅允许在线预览，未开放下载'),false);
     tryPreview();
+    loadComments();
   }).catch(function(){setMsg('加载失败',true)});
+}
+function loadComments(){
+  if(!ALLOW_CMT)return;
+  fetch('/s/'+tk+'/comments',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+    var box=document.getElementById('cmtList');if(!box)return;
+    var list=d.comments||[];
+    if(!list.length){box.innerHTML='<div style="color:var(--text3);font-size:12px">还没有留言</div>';return}
+    box.innerHTML=list.map(function(c){
+      return '<div style="padding:6px 0;border-bottom:1px solid var(--border)"><span style="color:var(--text2);font-size:12px">'+esc(c.by||'guest')+' · '+esc(new Date(c.t).toLocaleString())+'</span><div style="white-space:pre-wrap;word-break:break-word">'+esc(c.text||'')+'</div></div>';
+    }).join('');
+  }).catch(function(){});
+}
+function sendComment(){
+  if(!ALLOW_CMT)return;
+  var t=document.getElementById('cmtText'),n=document.getElementById('cmtName');
+  var text=(t&&t.value||'').trim();if(!text)return;
+  fetch('/s/'+tk+'/comment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:text,name:(n&&n.value||'').trim()})}).then(function(r){return r.json()}).then(function(d){
+    if(d&&d.ok){if(t)t.value='';loadComments()}
+    else setMsg((d&&d.error)||'留言失败',true);
+  }).catch(function(){setMsg('留言失败',true)});
 }
 function tryPreview(){
   if(!fmime)return;
@@ -2214,26 +3885,36 @@ document.getElementById('btnPw').onclick=function(){
     document.getElementById('ficon').textContent=iconFor(fmime);
     document.getElementById('meta').textContent=fmt(fsize)+' · '+(d.max>0?('已访问 '+d.hits+'/'+d.max):'');
     document.getElementById('pwRow').classList.add('hidden');
-    document.getElementById('dlRow').classList.remove('hidden');
+    if(ALLOW_DL)document.getElementById('dlRow').classList.remove('hidden');
     tryPreview();
+    loadComments();
   }).catch(function(){setMsg('密码错误或加载失败',true)});
 };
 document.getElementById('pwInput').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnPw').click()};
+(function(){var b=document.getElementById('cmtSend');if(b)b.onclick=sendComment})();
+(function(){var b=document.getElementById('btnZipAll');if(b)b.onclick=function(){window.location='/s/'+tk+'/zip?p='+encodeURIComponent(rel||'')+'&pw='+encodeURIComponent(pw)}})();
 document.getElementById('btnDl').onclick=function(){
   window.location='/s/'+tk+'/dl?pw='+encodeURIComponent(pw);
 };
 loadData();
-</script><script>(function(){var dth=localStorage.getItem('dth')||'auto';function applyTheme(){var h=document.documentElement;var d=dth==='dark'||(dth==='auto'&&window.matchMedia&&window.matchMedia('(prefers-color-scheme:dark)').matches);h.classList.toggle('dark',!!d);var b=document.getElementById('themeBtn');if(b)b.textContent=dth==='auto'?'🌗':(dth==='light'?'☀️':'🌙')}applyTheme();var b=document.createElement('button');b.id='themeBtn';b.className='theme-btn';b.title='切换主题（跟随系统 / 浅色 / 深色）';b.textContent='🌗';b.onclick=function(){dth=dth==='auto'?'light':(dth==='light'?'dark':'auto');localStorage.setItem('dth',dth);applyTheme()};document.body.appendChild(b);if(window.matchMedia){try{window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){if(dth==='auto')applyTheme()})}catch(e){}}})();</script></body></html>`;
+</script><script>${publicPageThemeJs()}</script></body></html>`;
 }
 
-function shareDirPage(token) {
+function shareDirPage(token, rec) {
   const tk = JSON.stringify(token);
+  const dview = (rec && rec.view) || {};
+  const title = escHtml(dview.title || '文件夹分享');
+  const descD = escHtml(dview.desc || '');
+  const noteD = escHtml((rec && rec.note) || '');
+  const allowDlD = !(rec && rec.allowDownload === false);
+  const allowCmtD = !(rec && rec.allowComment === false);
+  const daccent = (dview.color && /^#[0-9a-fA-F]{3,8}$/.test(dview.color)) ? dview.color : '';
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>文件夹分享</title>
+<title>${title}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#f6f8fa;--card:#fff;--border:#d8dee4;--text:#1f2328;--text2:#57606a;--text3:#8c959f;--accent:#0a84ff;--accent-h:#0066ff;--fill:#f6f8fa;--red:#cf222e;--warn:#9a6700}
-:root.dark{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--text2:#8b949e;--text3:#6e7681;--accent:#0a84ff;--accent-h:#409cff;--fill:#21262d;--red:#f85149;--warn:#d29922}
+${publicPageCss()}
+${daccent ? ':root{--sys-blue:' + daccent + ';--sys-blue-hover:' + daccent + ';--accent:' + daccent + '}' : ''}
 body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;justify-content:center;padding:20px;-webkit-font-smoothing:antialiased}
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:22px;max-width:720px;width:100%;align-self:flex-start}
 h2{font-size:13px;color:var(--text2);margin-bottom:6px;font-weight:600;letter-spacing:.4px}
@@ -2270,18 +3951,41 @@ button.btn:hover{background:var(--accent-h);border-color:var(--accent-h)}
 input,button,.zone{border-radius:11px}
 </style></head><body>
 <div class="card">
-  <h2>📁 文件夹分享</h2>
+  <h2>📁 ${title}</h2>
+  ${descD ? '<div class="meta" style="font-family:inherit;font-size:13px">' + descD + '</div>' : ''}
   <div class="meta" id="meta">加载中...</div>
   <div class="name" id="fname">—</div>
+  ${noteD ? '<div style="font-size:12px;color:var(--warn);margin:0 0 8px;white-space:pre-wrap;word-break:break-word">' + noteD + '</div>' : ''}
   <div class="pwrow hidden" id="pwRow"><input type="password" id="pwInput" placeholder="请输入访问密码" autocomplete="off"><button class="btn" id="btnPw">确定</button></div>
-  <div class="hidden" id="box"><div class="bc" id="bc"></div><div id="list"></div></div>
+  <div class="hidden" id="box"><div class="bc" id="bc"></div><div id="list"></div>${allowDlD ? '<div style="margin-top:12px;text-align:right"><button class="btn" id="btnZipAll">📦 打包下载整个文件夹</button></div>' : ''}</div>
+  ${allowCmtD ? '<div id="cmtWrap" style="margin-top:18px"><div style="font-size:12px;color:var(--text3);margin-bottom:6px">💬 留言</div><div id="cmtList" style="max-height:200px;overflow:auto;font-size:13px"></div><div style="display:flex;gap:8px;margin-top:8px"><input id="cmtName" placeholder="昵称（可选）" style="flex:0 0 110px"><input id="cmtText" placeholder="说点什么..."><button class="btn" id="cmtSend">发送</button></div></div>' : ''}
   <div class="msg" id="msg"></div>
 </div>
 <script>
 var tk=${tk},pw='',rel='';
+var ALLOW_DL=${allowDlD ? 'true' : 'false'};
+var ALLOW_CMT=${allowCmtD ? 'true' : 'false'};
 function esc(s){return String(s==null?'':s).replace(/[&<>"'\`]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','\`':'&#96;'}[c]})}
 function fmt(b){if(!b||b===0)return'0 B';var u=['B','KB','MB','GB'];var i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(1)+' '+u[i]}
 function setMsg(s,isErr){var m=document.getElementById('msg');m.textContent=s||'';m.className='msg'+(isErr?' err':'')}
+function loadComments(){
+  if(!ALLOW_CMT)return;
+  fetch('/s/'+tk+'/comments?p='+encodeURIComponent(rel||''),{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+    var box=document.getElementById('cmtList');if(!box)return;
+    var list=d.comments||[];
+    if(!list.length){box.innerHTML='<div style="color:var(--text3);font-size:12px">还没有留言</div>';return}
+    box.innerHTML=list.map(function(c){
+      return '<div style="padding:6px 0;border-bottom:1px solid var(--border)"><span style="color:var(--text2);font-size:12px">'+esc(c.by||'guest')+' · '+esc(new Date(c.t).toLocaleString())+'</span><div style="white-space:pre-wrap;word-break:break-word">'+esc(c.text||'')+'</div></div>';
+    }).join('');
+  }).catch(function(){});
+}
+function sendComment(){
+  var t=document.getElementById('cmtText'),n=document.getElementById('cmtName');
+  var text=(t&&t.value||'').trim();if(!text)return;
+  fetch('/s/'+tk+'/comment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:text,name:(n&&n.value||'').trim(),p:rel||''})}).then(function(r){return r.json()}).then(function(d){
+    if(d&&d.ok){if(t)t.value='';loadComments()}else setMsg((d&&d.error)||'留言失败',true);
+  }).catch(function(){setMsg('留言失败',true)});
+}
 function iconFor(n,m){m=String(m||'').toLowerCase();n=String(n||'').toLowerCase();if(m.indexOf('image/')===0)return'🖼️';if(m.indexOf('video/')===0)return'🎬';if(m.indexOf('audio/')===0)return'🎵';if(n.endsWith('.zip'))return'📦';if(m.indexOf('pdf')>=0)return'📄';if(m.indexOf('sheet')>=0||n.endsWith('.xlsx')||n.endsWith('.xls'))return'📊';if(n.endsWith('.docx')||n.endsWith('.doc'))return'📃';if(m.indexOf('text/')===0||m.indexOf('json')>=0||n.endsWith('.md'))return'📝';return'📄'}
 function load(){
   fetch('/s/'+tk+'/data',{cache:'no-store'}).then(function(r){return r.json().then(function(d){return{r:r,d:d}})}).then(function(res){
@@ -2298,6 +4002,7 @@ function load(){
     document.getElementById('pwRow').classList.add('hidden');
     document.getElementById('box').classList.remove('hidden');
     render();
+    loadComments();
   }).catch(function(){setMsg('加载失败',true)});
 }
 function go(r){rel=r;render()}
@@ -2345,7 +4050,7 @@ document.getElementById('btnPw').onclick=function(){
 };
 document.getElementById('pwInput').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnPw').click()};
 load();
-</script><script>(function(){var dth=localStorage.getItem('dth')||'auto';function applyTheme(){var h=document.documentElement;var d=dth==='dark'||(dth==='auto'&&window.matchMedia&&window.matchMedia('(prefers-color-scheme:dark)').matches);h.classList.toggle('dark',!!d);var b=document.getElementById('themeBtn');if(b)b.textContent=dth==='auto'?'🌗':(dth==='light'?'☀️':'🌙')}applyTheme();var b=document.createElement('button');b.id='themeBtn';b.className='theme-btn';b.title='切换主题（跟随系统 / 浅色 / 深色）';b.textContent='🌗';b.onclick=function(){dth=dth==='auto'?'light':(dth==='light'?'dark':'auto');localStorage.setItem('dth',dth);applyTheme()};document.body.appendChild(b);if(window.matchMedia){try{window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){if(dth==='auto')applyTheme()})}catch(e){}}})();</script></body></html>`;
+</script><script>${publicPageThemeJs()}</script></body></html>`;
 }
 
 // ===== Upload Links =====
@@ -2358,24 +4063,24 @@ async function handleCreateUploadLink(env, dirPath, days, maxFiles) {
 function uploadPage(token) {
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件上传</title>
 <style>*{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#f6f8fa;--card:#fff;--border:#d8dee4;--text:#1f2328;--text2:#57606a;--text3:#8c959f;--accent:#0a84ff;--accent-h:#0066ff;--fill:#f6f8fa;--red:#cf222e;--warn:#9a6700}
-:root.dark{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--text2:#8b949e;--text3:#6e7681;--accent:#0a84ff;--accent-h:#409cff;--fill:#21262d;--red:#f85149;--warn:#d29922}
+${publicPageCss()}
 body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;-webkit-font-smoothing:antialiased}
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:32px;max-width:440px;width:100%;text-align:center}
 h2{font-size:18px;color:var(--text);margin-bottom:8px;font-weight:600}
 p{font-size:14px;color:var(--text2);margin-bottom:24px}
 .zone{border:1px dashed var(--border);border-radius:8px;padding:36px 20px;cursor:pointer;transition:all .15s;background:var(--fill)}
-.zone:hover,.zone.over{border-color:var(--accent);background:rgba(9,105,218,.08)}
+.zone:hover,.zone.over{border-color:var(--accent);background:var(--sys-blue-soft)}
 .zone p{margin:0;font-size:15px;color:var(--text2)}
 .list{margin-top:16px;text-align:left;font-size:14px}.list div{padding:8px 0;border-bottom:1px solid var(--border)}
 .ok{color:var(--accent)}.err{color:var(--red)}
-.theme-btn{position:fixed;top:16px;right:16px;z-index:999;width:42px;height:42px;border-radius:50%;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:18px;cursor:pointer;box-shadow:0 8px 22px rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);transition:transform .12s}
-.theme-btn:active{transform:scale(.92)}
-.card{box-shadow:0 14px 34px rgba(31,35,40,.12);border-radius:20px}
-:root.dark .card{box-shadow:0 18px 44px rgba(0,0,0,.5)}
+.card{box-shadow:var(--sys-shadow-md);border-radius:20px}
 input,button,.zone{border-radius:11px}
 </style></head><body>
-<div class="card"><h2>📤 文件上传</h2><p>有人给你分享了一个上传链接</p>
+<div class="card">
+<div class="pg-bar" style="margin-bottom:18px;background:var(--sys-fill);box-shadow:none">
+  <span class="pg-logo">📤</span>
+  <div style="text-align:left"><div class="pg-title">文件上传</div><div class="pg-sub">有人给你分享了一个上传链接</div></div>
+</div>
 <div class="zone" id="zone"><p>点击或拖拽文件到此处</p></div>
 <input type="file" id="fi" multiple style="display:none">
 <div class="list" id="list"></div></div>
@@ -2394,19 +4099,19 @@ fetch('/api/upload-link/'+tk,{method:'POST',body:fd}).then(function(r){return r.
 d.className=r.ok?'ok':'err';d.textContent=f.name+' - '+(r.ok?'完成':r.error||'失败');
 }).catch(function(){d.className='err';d.textContent=f.name+' - 失败'});
 })(files[i])}}
-</`+`script><script>(function(){var dth=localStorage.getItem('dth')||'auto';function applyTheme(){var h=document.documentElement;var d=dth==='dark'||(dth==='auto'&&window.matchMedia&&window.matchMedia('(prefers-color-scheme:dark)').matches);h.classList.toggle('dark',!!d);var b=document.getElementById('themeBtn');if(b)b.textContent=dth==='auto'?'🌗':(dth==='light'?'☀️':'🌙')}applyTheme();var b=document.createElement('button');b.id='themeBtn';b.className='theme-btn';b.title='切换主题（跟随系统 / 浅色 / 深色）';b.textContent='🌗';b.onclick=function(){dth=dth==='auto'?'light':(dth==='light'?'dark':'auto');localStorage.setItem('dth',dth);applyTheme()};document.body.appendChild(b);if(window.matchMedia){try{window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){if(dth==='auto')applyTheme()})}catch(e){}}})();</script></body></html>`;
+</`+`script><script>${publicPageThemeJs()}</script></body></html>`;
 }
 
 function errorPage(msg) {
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>访问受限</title>
-<style>:root{--bg:#f6f8fa;--card:#fff;--border:#d8dee4;--text:#1f2328;--text2:#57606a;--text3:#8c959f;--accent:#0a84ff;--accent-h:#0066ff;--fill:#f6f8fa;--red:#cf222e;--warn:#9a6700}:root.dark{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--text2:#8b949e;--text3:#6e7681;--accent:#0a84ff;--accent-h:#409cff;--fill:#21262d;--red:#f85149;--warn:#d29922}body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.c{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:36px;max-width:400px;width:100%;text-align:center}h1{font-size:20px;margin-bottom:8px;color:var(--red)}p{font-size:14px;color:var(--text2)}
+<style>${publicPageCss()}*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.c{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:36px;max-width:400px;width:100%;text-align:center}h1{font-size:20px;margin-bottom:8px;color:var(--red)}p{font-size:14px;color:var(--text2)}
 .theme-btn{position:fixed;top:16px;right:16px;z-index:999;width:42px;height:42px;border-radius:50%;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:18px;cursor:pointer;box-shadow:0 8px 22px rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);transition:transform .12s}
 .theme-btn:active{transform:scale(.92)}
 .card{box-shadow:0 14px 34px rgba(31,35,40,.12);border-radius:20px}
 :root.dark .card{box-shadow:0 18px 44px rgba(0,0,0,.5)}
 input,button,.zone{border-radius:11px}
 </style></head><body>
-<div class="c"><h1>⚠️ 链接不可用</h1><p>${escHtml(msg)}</p></div><script>(function(){var dth=localStorage.getItem('dth')||'auto';function applyTheme(){var h=document.documentElement;var d=dth==='dark'||(dth==='auto'&&window.matchMedia&&window.matchMedia('(prefers-color-scheme:dark)').matches);h.classList.toggle('dark',!!d);var b=document.getElementById('themeBtn');if(b)b.textContent=dth==='auto'?'🌗':(dth==='light'?'☀️':'🌙')}applyTheme();var b=document.createElement('button');b.id='themeBtn';b.className='theme-btn';b.title='切换主题（跟随系统 / 浅色 / 深色）';b.textContent='🌗';b.onclick=function(){dth=dth==='auto'?'light':(dth==='light'?'dark':'auto');localStorage.setItem('dth',dth);applyTheme()};document.body.appendChild(b);if(window.matchMedia){try{window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){if(dth==='auto')applyTheme()})}catch(e){}}})();</script></body></html>`;
+<div class="c"><h1>⚠️ 链接不可用</h1><p>${escHtml(msg)}</p></div><script>${publicPageThemeJs()}</script></body></html>`;
 }
 
 function publicUploadPage(env) {
@@ -2418,25 +4123,25 @@ function publicUploadPage(env) {
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件上传</title>
 ${tsHead}
 <style>*{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#f6f8fa;--card:#fff;--border:#d8dee4;--text:#1f2328;--text2:#57606a;--text3:#8c959f;--accent:#0a84ff;--accent-h:#0066ff;--fill:#f6f8fa;--red:#cf222e;--warn:#9a6700}
-:root.dark{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--text2:#8b949e;--text3:#6e7681;--accent:#0a84ff;--accent-h:#409cff;--fill:#21262d;--red:#f85149;--warn:#d29922}
+${publicPageCss()}
 body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;-webkit-font-smoothing:antialiased}
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:32px;max-width:460px;width:100%;text-align:center}
 h2{font-size:18px;color:var(--text);margin-bottom:8px;font-weight:600}
 p{font-size:14px;color:var(--text2);margin-bottom:20px}
 code{background:var(--fill);border:1px solid var(--border);padding:2px 6px;border-radius:4px;font-size:13px;font-family:ui-monospace,Menlo,monospace}
 .zone{border:1px dashed var(--border);border-radius:8px;padding:36px 20px;cursor:pointer;transition:all .15s;background:var(--fill)}
-.zone:hover,.zone.over{border-color:var(--accent);background:rgba(9,105,218,.08)}
+.zone:hover,.zone.over{border-color:var(--accent);background:var(--sys-blue-soft)}
 .zone p{margin:0;font-size:15px;color:var(--text2)}
 .list{margin-top:16px;text-align:left;font-size:14px}.list div{padding:8px 0;border-bottom:1px solid var(--border)}
 .ok{color:var(--accent)}.err{color:var(--red)}
-.theme-btn{position:fixed;top:16px;right:16px;z-index:999;width:42px;height:42px;border-radius:50%;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:18px;cursor:pointer;box-shadow:0 8px 22px rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);transition:transform .12s}
-.theme-btn:active{transform:scale(.92)}
-.card{box-shadow:0 14px 34px rgba(31,35,40,.12);border-radius:20px}
-:root.dark .card{box-shadow:0 18px 44px rgba(0,0,0,.5)}
+.card{box-shadow:var(--sys-shadow-md);border-radius:20px}
 input,button,.zone{border-radius:11px}
 </style></head><body>
-<div class="card"><h2>📤 公开上传</h2><p>文件将保存到 <code>${escHtml(dir)}</code></p>
+<div class="card">
+<div class="pg-bar" style="margin-bottom:18px;background:var(--sys-fill);box-shadow:none">
+  <span class="pg-logo">📤</span>
+  <div style="text-align:left;min-width:0"><div class="pg-title">公开上传</div><div class="pg-sub">${escHtml(dir)}</div></div>
+</div>
 <div class="zone" id="zone"><p>点击或拖拽文件到此处</p></div>
 <input type="file" id="fi" multiple style="display:none">
 ${tsWidget}${tsNote}
@@ -2458,7 +4163,7 @@ d.className=r.ok?'ok':'err';d.textContent=f.name+' - '+(r.ok?'完成':(r.error||
 if(window.turnstile&&turnstile.reset){try{turnstile.reset()}catch(e){}}
 }).catch(function(){d.className='err';d.textContent=f.name+' - 失败'});
 })(files[i])}}
-</scr` + `ipt><script>(function(){var dth=localStorage.getItem('dth')||'auto';function applyTheme(){var h=document.documentElement;var d=dth==='dark'||(dth==='auto'&&window.matchMedia&&window.matchMedia('(prefers-color-scheme:dark)').matches);h.classList.toggle('dark',!!d);var b=document.getElementById('themeBtn');if(b)b.textContent=dth==='auto'?'🌗':(dth==='light'?'☀️':'🌙')}applyTheme();var b=document.createElement('button');b.id='themeBtn';b.className='theme-btn';b.title='切换主题（跟随系统 / 浅色 / 深色）';b.textContent='🌗';b.onclick=function(){dth=dth==='auto'?'light':(dth==='light'?'dark':'auto');localStorage.setItem('dth',dth);applyTheme()};document.body.appendChild(b);if(window.matchMedia){try{window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){if(dth==='auto')applyTheme()})}catch(e){}}})();</script></body></html>`;
+</scr` + `ipt><script>${publicPageThemeJs()}</script></body></html>`;
 }
 
 // ===== 元数据快照备份（KV + 目录树 → R2 的 .backup/，不显示在文件列表） =====
@@ -2479,32 +4184,102 @@ async function collectDirs(env) {
   return out;
 }
 async function collectMeta(env) {
-  const singles = ['meta:tags', 'meta:favs', 'meta:recent', 'meta:tokens', 'meta:autorule', 'meta:usage', 'meta:dlstat'];
-  const prefixes = ['note:', 'tags:', 'share:', 'ulink:', 'dirpass:', 'versions:'];
+  // 注意：不纳入 meta:totp（二次验证密钥不应随快照/下载外泄，恢复时保留当前设置）
+  const singles = ['meta:tags', 'meta:favs', 'meta:recent', 'meta:tokens', 'meta:autorule', 'meta:usage', 'meta:dlstat',
+    'meta:favgroups', 'meta:albums', 'meta:config', 'meta:dirrules', 'meta:cron', 'meta:bookmarks'];
+  // 每个前缀限制读取条数；整体还有字节预算，防止备份本身把 KV 读配额/R2 体积吃满
+  const prefixes = [['note:', 400], ['tags:', 400], ['share:', 200], ['ulink:', 200], ['dirpass:', 100], ['versions:', 200]];
+  const budget = backupMaxBytes(env);
   const kv = {};
+  let bytes = 0, truncated = false;
   for (const key of singles) {
-    try { const v = await env.STORE.get(key); if (v !== null && v !== undefined) kv[key] = v; } catch (e) {}
+    try {
+      const v = await env.STORE.get(key);
+      if (v !== null && v !== undefined) { kv[key] = v; bytes += String(v).length; }
+    } catch (e) {}
   }
-  for (const p of prefixes) {
-    const keys = await listKV(env, p, 2000);
+  for (const [p, cap] of prefixes) {
+    if (bytes >= budget) { truncated = true; break; }
+    const keys = await listKV(env, p, cap);
     for (const k of keys) {
-      try { const v = await env.STORE.get(k); if (v !== null && v !== undefined) kv[k] = v; } catch (e) {}
+      if (bytes >= budget) { truncated = true; break; }
+      try {
+        const v = await env.STORE.get(k);
+        if (v !== null && v !== undefined) { kv[k] = v; bytes += String(v).length; }
+      } catch (e) {}
     }
   }
-  return kv;
+  return { kv, bytes, truncated: truncated || bytes >= budget };
+}
+async function dirChecksum(items) {
+  const s = (items || []).map(i => (i && i.name) ? (i.name + ':' + (i.size || 0) + ':' + (i.type || '')) : '').sort().join('|');
+  return (await sha256(s)).slice(0, 16);
+}
+async function backupIndex(env) {
+  try { return await env.STORE.get('meta:backupidx', 'json'); } catch (e) { return null; }
+}
+// 解析快照链（增量 → 基线），返回合并后的目录与 KV
+async function resolveSnapshot(env, key, withKv) {
+  const out = { dirs: {}, kv: {}, chain: 0, truncated: false, created: '' };
+  const seen = {};
+  const stack = [];
+  let cur = key;
+  while (cur && !seen[cur] && stack.length < 25) {
+    seen[cur] = 1;
+    let snap = null;
+    try {
+      const o = await env.DRIVE.get(cur);
+      if (o) snap = JSON.parse(new TextDecoder().decode(await o.arrayBuffer()));
+    } catch (e) { snap = null; }
+    if (!snap || typeof snap !== 'object') break;
+    stack.push(snap);
+    out.truncated = out.truncated || !!snap.truncated;
+    cur = snap.base || null;
+  }
+  for (let i = stack.length - 1; i >= 0; i--) {
+    const s = stack[i];
+    if (s.dirs && typeof s.dirs === 'object') for (const p of Object.keys(s.dirs)) out.dirs[p] = s.dirs[p];
+    if (Array.isArray(s.removed)) for (const p of s.removed) delete out.dirs[p];
+    if (withKv && s.kv && typeof s.kv === 'object') Object.assign(out.kv, s.kv);
+    if (!out.created) out.created = s.created || '';
+    out.chain++;
+  }
+  return out;
 }
 async function createBackup(env, reason) {
   const dirs = await collectDirs(env);
-  const kv = await collectMeta(env);
+  const checksums = {};
+  for (const p of Object.keys(dirs)) checksums[p] = await dirChecksum(dirs[p]);
+  // 增量：只存变化的目录 + 已删除目录清单，base 指向上一份快照
+  const idx = await backupIndex(env);
+  const useIncremental = cfgBool(env, 'BACKUP_INCREMENTAL', 'backupIncremental', true) && !!(idx && idx.key) && (idx.chain || 0) < 19;
+  let base = null, storeDirs = dirs, removed = [], chain = 0;
+  if (useIncremental) {
+    const prev = idx.checksums || {};
+    const changed = {};
+    for (const p of Object.keys(dirs)) { if (prev[p] !== checksums[p]) changed[p] = dirs[p]; }
+    for (const p of Object.keys(prev)) { if (!dirs[p]) removed.push(p); }
+    base = idx.key; storeDirs = changed; chain = (idx.chain || 0) + 1;
+  }
+  const meta = await collectMeta(env);
+  const kv = meta.kv;
   let dirCount = 0, fileCount = 0;
   for (const p of Object.keys(dirs)) {
     dirCount++;
     for (const it of dirs[p]) { if (it && it.type === 'file') fileCount++; }
   }
-  const snap = { version: APP_VERSION, created: new Date().toISOString(), reason: reason || 'manual', dirs, kv };
+  const snap = {
+    version: APP_VERSION, created: new Date().toISOString(), reason: reason || 'manual',
+    incremental: !!base, base, chain, removed, truncated: meta.truncated,
+    dirs: storeDirs, checksums, kv
+  };
   const body = JSON.stringify(snap);
   const key = BACKUP_PREFIX + new Date().toISOString().substring(0, 10) + '-' + Date.now().toString(36) + '-' + randToken().substring(0, 6) + '.json';
   await env.DRIVE.put(key, body, { httpMetadata: { contentType: 'application/json' } });
+  try {
+    await env.STORE.put('meta:backupidx', JSON.stringify({ key, created: snap.created, base, chain, checksums, dirs: dirCount }), { expirationTtl: 400 * 86400 });
+  } catch (e) {}
+  // 备份保留策略：既限制份数，也限制总占用（防止快照把 R2 撑爆）
   try {
     const listed = await env.DRIVE.list({ prefix: BACKUP_PREFIX, limit: 1000 });
     const objs = (listed.objects || []).slice().sort(function (a, b) {
@@ -2513,9 +4288,39 @@ async function createBackup(env, reason) {
       if (ta !== tb) return tb - ta;
       return String(b.key).localeCompare(String(a.key));
     });
-    for (const o of objs.slice(14)) { try { await env.DRIVE.delete(o.key); } catch (e) {} }
+    const keep = backupKeep(env);
+    const totalMax = backupTotalBytes(env);
+    let acc = 0;
+    for (let i = 0; i < objs.length; i++) {
+      const o = objs[i];
+      acc += o.size || 0;
+      if (i >= keep || acc > totalMax) { try { await env.DRIVE.delete(o.key); } catch (e) {} }
+    }
   } catch (e) {}
-  return { ok: true, key, size: body.length, dirs: dirCount, files: fileCount, kvKeys: Object.keys(kv).length, created: snap.created, version: APP_VERSION };
+  return {
+    ok: true, key, size: body.length, dirs: dirCount, files: fileCount, kvKeys: Object.keys(kv).length,
+    truncated: meta.truncated, created: snap.created, version: APP_VERSION,
+    incremental: !!base, base, chain, storedDirs: Object.keys(storeDirs).length, removedDirs: removed.length
+  };
+}
+// 恢复前预览：对比快照与当前目录树
+async function handleBackupDiff(env, key) {
+  if (!key || String(key).indexOf(BACKUP_PREFIX) !== 0) return json({ error: 'Bad key' }, 400);
+  const snap = await resolveSnapshot(env, key, false);
+  if (!snap.chain) return json({ error: 'Not found' }, 404);
+  const cur = await collectDirs(env);
+  const added = [], removed = [], changed = [];
+  for (const p of Object.keys(snap.dirs)) {
+    if (!cur[p]) removed.push(p);
+    else if (JSON.stringify(cur[p] || []) !== JSON.stringify(snap.dirs[p] || [])) changed.push(p);
+  }
+  for (const p of Object.keys(cur)) { if (!snap.dirs[p]) added.push(p); }
+  return json({
+    key, chain: snap.chain, truncated: snap.truncated, created: snap.created,
+    snapshotDirs: Object.keys(snap.dirs).length, currentDirs: Object.keys(cur).length,
+    added: added.slice(0, 200), removed: removed.slice(0, 200), changed: changed.slice(0, 200),
+    addedTotal: added.length, removedTotal: removed.length, changedTotal: changed.length
+  });
 }
 async function handleBackupList(env) {
   let items = [];
@@ -2531,17 +4336,15 @@ async function handleBackupList(env) {
       return String(b.key).localeCompare(String(a.key));
     });
   } catch (e) {}
-  return json({ backups: items, version: APP_VERSION });
+  const idx = await backupIndex(env);
+  return json({ backups: items, version: APP_VERSION, last: idx ? { key: idx.key, created: idx.created, base: idx.base || null, chain: idx.chain || 0, dirs: idx.dirs || 0 } : null });
 }
 async function handleBackupRestore(env, key, password) {
   if (!await checkAdminPassword(env, password || '')) return json({ error: 'Wrong password' }, 403);
   if (!key || String(key).indexOf(BACKUP_PREFIX) !== 0) return json({ error: 'Bad key' }, 400);
-  let obj = null;
-  try { obj = await env.DRIVE.get(String(key)); } catch (e) {}
-  if (!obj) return json({ error: 'Not found' }, 404);
-  let snap = null;
-  try { snap = JSON.parse(new TextDecoder().decode(await obj.arrayBuffer())); } catch (e) { return json({ error: 'Bad snapshot' }, 400); }
-  if (!snap || typeof snap !== 'object') return json({ error: 'Bad snapshot' }, 400);
+  const resolved = await resolveSnapshot(env, String(key), true);
+  if (!resolved.chain) return json({ error: 'Not found' }, 404);
+  const snap = { dirs: resolved.dirs, kv: resolved.kv, created: resolved.created, truncated: resolved.truncated };
   let dirs = 0, kvN = 0;
   if (snap.dirs && typeof snap.dirs === 'object') {
     for (const p of Object.keys(snap.dirs)) {
@@ -2559,10 +4362,432 @@ async function handleBackupRestore(env, key, password) {
     }
   }
   try { await addLog(env, 'res', '(备份恢复)', String(key)); } catch (e) {}
-  return json({ ok: true, dirs, kvKeys: kvN, snapshot: snap.created || '' });
+  return json({ ok: true, dirs, kvKeys: kvN, snapshot: snap.created || '', truncated: !!snap.truncated, chain: resolved.chain });
+}
+
+// ===== 站点配置面板 =====
+async function handleConfigGet(env) {
+  await loadConfig(env, true);
+  const eff = {
+    title: siteTitle(env), logo: siteLogo(env),
+    quotaGB: Math.round(quotaTotal(env) / 1073741824 * 100) / 100,
+    maxDirItems: maxDirItems(env), kvValueMB: Math.round(kvValueMax(env) / 1048576),
+    versionMaxMB: Math.round(versionMaxBytes(env) / 1048576), versionsMax: maxVersions(env),
+    versionsTtlDays: Math.round(versionsTtl(env) / 86400), hashTtlDays: Math.round(hashTtl(env) / 86400),
+    trashDays: trashDays(env), chunkGcHours: chunkGcHours(env),
+    backupKeep: backupKeep(env), backupMaxMB: Math.round(backupMaxBytes(env) / 1048576),
+    backupTotalMB: Math.round(backupTotalBytes(env) / 1048576), backupIncremental: cfgBool(env, 'BACKUP_INCREMENTAL', 'backupIncremental', true),
+    telemetryMaxPerDay: telemetryMaxPerDay(env), telemetryFlushMs: telemetryFlushMs(env),
+    sessionCacheSec: sessionCacheSec(env), kvBudgetPerMin: kvBudgetPerMin(env),
+    rlReadPerMin: rlReadPerMin(env), rlWritePerMin: rlWritePerMin(env),
+    maxUploadMB: Math.round(maxUploadBytes(env) / 1048576),
+    publicUploadDir: publicUploadDir(env) || '', publicUploadMaxMB: Math.round(publicUploadMax(env) / 1048576),
+    ipAllow: cfgStr(env, 'IP_ALLOW', 'ipAllow', ''), ipDeny: cfgStr(env, 'IP_DENY', 'ipDeny', ''),
+    countryAllow: cfgStr(env, 'COUNTRY_ALLOW', 'countryAllow', ''), countryDeny: cfgStr(env, 'COUNTRY_DENY', 'countryDeny', ''),
+    uaAllow: cfgStr(env, 'UA_ALLOW', 'uaAllow', ''), uaDeny: cfgStr(env, 'UA_DENY', 'uaDeny', ''),
+    disableUrlFetch: cfgBool(env, 'DISABLE_URL_FETCH', 'disableUrlFetch', false),
+    signTtlMin: cfgNum(env, 'SIGN_TTL_MIN', 'signTtlMin', 60),
+    shareZipMaxMB: cfgNum(env, 'SHARE_ZIP_MAX_MB', 'shareZipMaxMB', 512),
+    notice: cfgStr(env, 'DRIVE_NOTICE', 'notice', '')
+  };
+  const envKeys = {
+    title: 'DRIVE_TITLE', logo: 'DRIVE_LOGO', quotaGB: 'DRIVE_QUOTA', maxDirItems: 'MAX_DIR_ITEMS',
+    maxUploadMB: 'MAX_UPLOAD_MB', trashDays: 'TRASH_DAYS', chunkGcHours: 'CHUNK_GC_HOURS',
+    ipAllow: 'IP_ALLOW', ipDeny: 'IP_DENY', countryAllow: 'COUNTRY_ALLOW', countryDeny: 'COUNTRY_DENY',
+    uaAllow: 'UA_ALLOW', uaDeny: 'UA_DENY', publicUploadDir: 'PUBLIC_UPLOAD_DIR', publicUploadMaxMB: 'PUBLIC_UPLOAD_MAX',
+    disableUrlFetch: 'DISABLE_URL_FETCH', rlReadPerMin: 'RL_READ_PER_MIN', rlWritePerMin: 'RL_WRITE_PER_MIN'
+  };
+  const sources = {};
+  for (const k of Object.keys(CONFIG_SPEC)) {
+    const envSet = envKeys[k] && env && env[envKeys[k]] != null && env[envKeys[k]] !== '';
+    sources[k] = (CFG[k] !== undefined && CFG[k] !== null) ? 'kv' : (envSet ? 'env' : 'default');
+  }
+  return json({ config: CFG, effective: eff, sources, spec: CONFIG_SPEC, envKeys });
+}
+async function handleConfigSet(env, b) {
+  const patch = (b && b.patch) ? b.patch : (b || {});
+  const { out, errs } = validateConfig(patch);
+  if (errs.length) return json({ error: errs.join('; '), errors: errs }, 400);
+  const cur = (await env.STORE.get('meta:config', 'json')) || {};
+  for (const k of Object.keys(out)) {
+    if (out[k] === null) delete cur[k];
+    else cur[k] = out[k];
+  }
+  const s = JSON.stringify(cur);
+  if (s.length > 8 * 1024) return json({ error: 'Config too large' }, 413);
+  await env.STORE.put('meta:config', s);
+  kvInvalidate('meta:config');
+  await loadConfig(env, true);
+  try { await addLog(env, 'sec', '(站点配置)', Object.keys(out).join(',')); } catch (e) {}
+  return json({ ok: true, config: cur });
+}
+async function handleConfigReset(env) {
+  try { await env.STORE.delete('meta:config'); } catch (e) {}
+  CFG = {}; CFG_AT = Date.now(); CFG_OK = true;
+  return json({ ok: true });
+}
+
+// ===== 目录级规则 =====
+async function getDirRules(env) {
+  return await kvCached('dirrules', 15, async () => {
+    try { const r = await env.STORE.get('meta:dirrules', 'json'); return Array.isArray(r) ? r : []; } catch (e) { return []; }
+  });
+}
+function ruleFor(rules, dirPath) {
+  const np = normPath(dirPath);
+  let best = null;
+  for (const r of (rules || [])) {
+    if (!r || !r.path) continue;
+    const rp = normPath(r.path);
+    if (np === rp || np.startsWith(rp)) { if (!best || rp.length > normPath(best.path).length) best = r; }
+  }
+  return best ? Object.assign({}, best, { path: normPath(best.path) }) : null;
+}
+async function checkDirRule(env, dirPath, name, size) {
+  try {
+    const rules = await getDirRules(env);
+    if (!rules.length) return null;
+    const r = ruleFor(rules, dirPath);
+    if (!r) return null;
+    const nm = String(name || '').toLowerCase();
+    const ext = nm.indexOf('.') >= 0 ? nm.substring(nm.lastIndexOf('.')) : '';
+    if (r.extDeny) {
+      const list = csvList(r.extDeny).map(x => x.toLowerCase().replace(/^\*/, ''));
+      if (list.some(x => x && (x === ext || nm.endsWith(x)))) return { error: '该目录不允许此类文件（' + ext + '）' };
+    }
+    if (r.extAllow) {
+      const list = csvList(r.extAllow).map(x => x.toLowerCase().replace(/^\*/, ''));
+      if (list.length && !list.some(x => x && (x === ext || nm.endsWith(x)))) return { error: '该目录只允许：' + r.extAllow };
+    }
+    if (r.maxFileMB && size > r.maxFileMB * 1048576) return { error: '该目录单文件上限 ' + r.maxFileMB + 'MB' };
+    if (r.maxItems || r.maxBytes) {
+      const items = await getDir(env, dirPath);
+      const files = items.filter(i => i && i.type === 'file');
+      const exists = files.some(i => i.name === name);
+      if (!exists && r.maxItems && files.length >= r.maxItems) return { error: '该目录文件数已达上限 ' + r.maxItems };
+      if (r.maxBytes && !exists) {
+        let used = 0;
+        for (const i of files) used += i.size || 0;
+        if (used + (size || 0) > r.maxBytes * 1048576) return { error: '该目录容量上限 ' + r.maxBytes + 'MB' };
+      }
+    }
+    return null;
+  } catch (e) { return null; }
+}
+async function handleDirRules(env, req) {
+  if (req.method === 'GET') return json({ rules: await getDirRules(env) });
+  const b = await req.json();
+  if (b && b.delete) {
+    const list = (await getDirRules(env)).filter(r => normPath(r.path) !== normPath(b.delete));
+    await env.STORE.put('meta:dirrules', JSON.stringify(list));
+    kvInvalidate('dirrules');
+    return json({ ok: true, rules: list });
+  }
+  const path = normPath((b && b.path) || '/');
+  const rule = { path };
+  if (b.maxItems !== undefined) rule.maxItems = Math.max(0, parseInt(b.maxItems, 10) || 0);
+  if (b.maxBytes !== undefined) rule.maxBytes = Math.max(0, parseInt(b.maxBytes, 10) || 0);
+  if (b.maxFileMB !== undefined) rule.maxFileMB = Math.max(0, parseInt(b.maxFileMB, 10) || 0);
+  if (b.extAllow !== undefined) rule.extAllow = String(b.extAllow || '').slice(0, 300);
+  if (b.extDeny !== undefined) rule.extDeny = String(b.extDeny || '').slice(0, 300);
+  const list = (await getDirRules(env)).filter(r => normPath(r.path) !== path);
+  if (rule.maxItems || rule.maxBytes || rule.maxFileMB || rule.extAllow || rule.extDeny) list.push(rule);
+  if (list.length > 200) return json({ error: 'Too many rules (max 200)' }, 413);
+  await env.STORE.put('meta:dirrules', JSON.stringify(list));
+  kvInvalidate('dirrules');
+  return json({ ok: true, rules: list });
+}
+
+// ===== 定时任务（TTL 目录 / 清空目录 / 自动归档）=====
+async function getCronJobs(env) {
+  try { const r = await env.STORE.get('meta:cron', 'json'); return Array.isArray(r) ? r : []; } catch (e) { return []; }
+}
+async function handleCron(env, req, url) {
+  if (req.method === 'GET') return json({ jobs: await getCronJobs(env) });
+  const b = await req.json();
+  if (b && b.delete) {
+    const list = (await getCronJobs(env)).filter(j => j.id !== b.delete);
+    await env.STORE.put('meta:cron', JSON.stringify(list));
+    return json({ ok: true, jobs: list });
+  }
+  if (b && b.run) {
+    const jobs = await getCronJobs(env);
+    const job = jobs.find(j => j.id === b.run);
+    if (!job) return json({ error: 'Not found' }, 404);
+    const r = await runCronJob(env, job);
+    await env.STORE.put('meta:cron', JSON.stringify(jobs));
+    return json({ ok: true, result: r, jobs });
+  }
+  const kind = String((b && b.kind) || 'ttl-dir');
+  if (['ttl-dir', 'clean-dir', 'archive'].indexOf(kind) < 0) return json({ error: 'Bad kind' }, 400);
+  const path = normPath((b && b.path) || '/');
+  if (path === '/') return json({ error: 'Refusing to run on root' }, 400);
+  const daysRaw = parseInt((b && b.days), 10);
+  const job = {
+    id: randToken().substring(0, 10), kind, path,
+    days: Number.isFinite(daysRaw) ? Math.max(0, daysRaw) : 30,
+    toTrash: !(b && b.toTrash === false),
+    enabled: !(b && b.enabled === false),
+    created: new Date().toISOString(), lastRun: '', lastResult: ''
+  };
+  const list = await getCronJobs(env);
+  if (list.length >= 50) return json({ error: 'Too many jobs (max 50)' }, 413);
+  list.push(job);
+  await env.STORE.put('meta:cron', JSON.stringify(list));
+  return json({ ok: true, job, jobs: list });
+}
+async function runCronJob(env, job) {
+  const out = { id: job.id, kind: job.kind, path: job.path, moved: 0, deleted: 0, bytes: 0, errors: 0 };
+  try {
+    const items = await getDir(env, job.path);
+    const cutoff = Date.now() - (job.days || 0) * 86400000;
+    for (const it of items) {
+      if (!it || !it.name) continue;
+      if (out.moved + out.deleted >= 500) break;
+      const srcRel = job.path.replace(/^\//, '') + it.name;
+      if (job.kind === 'clean-dir') {
+        const r = await handleDelete(env, srcRel);
+        if (r && r.status === 200) out.deleted++; else out.errors++;
+        continue;
+      }
+      if (it.type === 'dir') continue;
+      const ts = it.time ? Date.parse(it.time) : 0;
+      if (!ts || ts > cutoff) continue;   // 早于阈值（days=0 表示立即生效）
+      if (job.kind === 'ttl-dir') {
+        if (job.toTrash) {
+          const r = await handleDelete(env, srcRel);
+          if (r && r.status === 200) out.deleted++; else out.errors++;
+        } else {
+          await deleteAndMirror(env, srcRel); await deleteThumb(env, srcRel); await deleteVersions(env, srcRel);
+          await removeDirItem(env, job.path, it.name);
+          await addUsage(env, -(it.size || 0), -1);
+          out.deleted++; out.bytes += it.size || 0;
+        }
+      } else if (job.kind === 'archive') {
+        const sub = new Date(ts).toISOString().substring(0, 7).replace('-', '/');
+        await ensureDir(env, job.path, 'archive');
+        await ensureDir(env, job.path + 'archive/', sub.replace(/\/$/, ''));
+        const r = await handleMove(env, srcRel, job.path + 'archive/' + sub + '/');
+        if (r && r.status === 200) out.moved++; else out.errors++;
+      }
+    }
+    job.lastRun = new Date().toISOString();
+    job.lastResult = 'moved=' + out.moved + ' deleted=' + out.deleted + ' errors=' + out.errors;
+    try { await addLog(env, 'mov', job.path, '定时任务 ' + job.kind + ' → ' + job.lastResult); } catch (e) {}
+  } catch (e) { out.errors++; job.lastResult = 'failed: ' + ((e && e.message) || ''); }
+  return out;
+}
+async function runAllCronJobs(env, limit) {
+  const jobs = await getCronJobs(env);
+  let n = 0;
+  for (const j of jobs) {
+    if (!j.enabled) continue;
+    if (n >= (limit || 10)) break;
+    n++;
+    await runCronJob(env, j);
+  }
+  if (n) { try { await env.STORE.put('meta:cron', JSON.stringify(jobs)); } catch (e) {} }
+  return n;
+}
+
+// ===== 从 WebDAV 导入（有界：深度 ≤3 / ≤200 文件 / ≤500MB）=====
+async function handleImportWebdav(env, b) {
+  const base = String((b && b.url) || '').trim();
+  if (!base) return json({ error: 'No url' }, 400);
+  let u;
+  try { u = new URL(base); } catch (e) { return json({ error: 'Bad url' }, 400); }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return json({ error: 'Only http(s)' }, 400);
+  if (await resolveAndCheckHost(u.hostname)) return json({ error: 'Blocked host' }, 403);
+  const target = normPath((b && b.path) || '/');
+  if (await isPathLocked(env, target, '')) return json({ locked: true, path: target }, 423);
+  const auth = (b && b.user) ? 'Basic ' + btoa(String(b.user) + ':' + String(b.pass || '')) : '';
+  const maxFiles = Math.min(Math.max(parseInt((b && b.maxFiles), 10) || 100, 1), 200);
+  const maxBytes = 500 * 1024 * 1024;
+
+  async function listDav(dirUrl) {
+    const out = [];
+    const r = await fetch(dirUrl, {
+      method: 'PROPFIND',
+      headers: Object.assign({ Depth: '1', 'Content-Type': 'application/xml' }, auth ? { Authorization: auth } : {}),
+      body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/><D:getcontentlength/></D:prop></D:propfind>'
+    });
+    if (!r.ok) throw new Error('PROPFIND HTTP ' + r.status);
+    const xml = await r.text();
+    const blocks = xml.match(/<(?:D:)?response[\s\S]*?<\/(?:D:)?response>/gi) || [];
+    for (const blk of blocks) {
+      const hrefM = /<(?:D:)?href>([\s\S]*?)<\/(?:D:)?href>/i.exec(blk);
+      if (!hrefM) continue;
+      let href = hrefM[1].trim();
+      try { href = decodeURIComponent(href); } catch (e) {}
+      const isDir = /<(?:D:)?collection\s*\/?>/i.test(blk);
+      const sizeM = /<(?:D:)?getcontentlength>(\d+)</i.exec(blk);
+      const full = new URL(href, dirUrl).toString();
+      if (full.replace(/\/+$/, '') === dirUrl.replace(/\/+$/, '')) continue;
+      out.push({ url: full, name: href.replace(/\/+$/, '').split('/').pop(), dir: isDir, size: sizeM ? parseInt(sizeM[1], 10) : 0 });
+    }
+    return out;
+  }
+  let files = 0, bytes = 0, skipped = 0, failed = 0;
+  const queue = [{ url: u.toString(), depth: 0, dir: target }];
+  while (queue.length) {
+    const cur = queue.shift();
+    if (cur.depth > 3) continue;
+    let entries = [];
+    try { entries = await listDav(cur.url); } catch (e) { failed++; continue; }
+    for (const e of entries) {
+      if (files >= maxFiles || bytes >= maxBytes) break;
+      if (e.dir) { queue.push({ url: e.url, depth: cur.depth + 1, dir: normPath(cur.dir + e.name + '/') }); continue; }
+      const name = sanitizeName(e.name || 'file');
+      const existing = await findDirItem(env, cur.dir, name);
+      if (existing.item && (existing.item.size || 0) === (e.size || 0)) { skipped++; continue; }
+      const chk = await checkDirRule(env, cur.dir, name, e.size || 0);
+      if (chk) { skipped++; continue; }
+      try {
+        const rr = await fetch(e.url, { headers: auth ? { Authorization: auth } : {} });
+        if (!rr.ok) { failed++; continue; }
+        const ab = await rr.arrayBuffer();
+        if (bytes + ab.byteLength > maxBytes) { failed++; continue; }
+        const key = cur.dir.replace(/^\//, '') + name;
+        if (pathTooLong('/' + key)) { failed++; continue; }
+        await putAndMirror(env, key, ab, { httpMetadata: { contentType: rr.headers.get('Content-Type') || 'application/octet-stream' } });
+        const up = await upsertDirItem(env, cur.dir, { name, type: 'file', size: ab.byteLength, mime: rr.headers.get('Content-Type') || '', time: new Date().toISOString(), hasThumb: false });
+        if (up && up.ok === false) { failed++; continue; }
+        await addUsage(env, ab.byteLength, 1);
+        files++; bytes += ab.byteLength;
+      } catch (e) { failed++; }
+    }
+  }
+  try { await addLog(env, 'up', target, 'WebDAV 导入 ' + files + ' 个文件 / ' + bytes + ' 字节（跳过 ' + skipped + '，失败 ' + failed + '）'); } catch (e) {}
+  return json({ ok: true, imported: files, bytes, skipped, failed, path: target });
+}
+
+// ===== 仪表盘聚合（首页一次性取数；隔离级 30 秒缓存，避免多次 KV 读）=====
+async function topDirsBySize(env, limit) {
+  const direct = {};
+  let dirs = 0;
+  async function walk(p, depth) {
+    if (depth > 6 || dirs > 400) return;
+    let list = [];
+    try { list = await getDir(env, p); } catch (e) { return; }
+    dirs++;
+    let sum = 0;
+    const subs = [];
+    for (const it of list) {
+      if (!it || !it.name) continue;
+      if (it.type === 'file') sum += it.size || 0;
+      else subs.push(p + it.name + '/');
+    }
+    direct[p] = sum;
+    for (const s of subs) await walk(s, depth + 1);
+  }
+  try { await walk('/', 0); } catch (e) {}
+  const total = {};
+  for (const p of Object.keys(direct)) {
+    let cur = p;
+    for (let guard = 0; guard < 12; guard++) {
+      total[cur] = (total[cur] || 0) + direct[p];
+      if (cur === '/') break;
+      const parts = cur.split('/').filter(Boolean);
+      parts.pop();
+      cur = parts.length ? '/' + parts.join('/') + '/' : '/';
+    }
+  }
+  return {
+    dirs,
+    top: Object.keys(total).filter(p => p !== '/').map(p => ({ path: p, bytes: total[p] }))
+      .sort((a, b) => b.bytes - a.bytes).slice(0, limit || 6)
+  };
+}
+async function handleDashboard(env, sessionToken) {
+  const data = await kvCached('dashboard', 30, async () => {
+    const usage = await getUsage(env);
+    const daily = telMergeDaily((await env.STORE.get('meta:daily', 'json')) || {});
+    const today = new Date().toISOString().substring(0, 10);
+    const t = daily[today] || {};
+    let shares = 0, ulinks = 0, trash = 0;
+    try { shares = (await listKV(env, 'share:', 500)).length; } catch (e) {}
+    try { ulinks = (await listKV(env, 'ulink:', 500)).length; } catch (e) {}
+    try { trash = (await listKV(env, 'trash:', 500)).length; } catch (e) {}
+    const topInfo = await topDirsBySize(env, 6);
+    let recent = [], favs = [], tags = [];
+    try { recent = (await getRecent(env)).slice(0, 12).map(r => (r && r.path) || '').filter(Boolean); } catch (e) {}
+    try { favs = (await getFavs(env)).slice(0, 12); } catch (e) {}
+    try { tags = (await getAllTags(env)).slice(0, 24); } catch (e) {}
+    return {
+      usage: { used: usage.used || 0, count: usage.files || usage.count || 0, total: quotaTotal(env) },
+      dirs: topInfo.dirs,
+      shares, ulinks, trash,
+      today: { up: t.up || 0, dl: t.dl || 0, upBytes: t.upBytes || 0, dlBytes: t.dlBytes || 0 },
+      trend: (function () {
+        const out = [];
+        for (let i = 6; i >= 0; i--) {
+          const d = new Date(Date.now() - i * 86400000).toISOString().substring(0, 10);
+          const v = daily[d] || {};
+          out.push({ date: d, up: v.up || 0, dl: v.dl || 0 });
+        }
+        return out;
+      })(),
+      topDirs: topInfo.top,
+      recentPaths: recent, favPaths: favs, tags
+    };
+  });
+  // 路径类数据实时富化（不缓存，保证点开就是最新）
+  let recentItems = [], favItems = [];
+  try { recentItems = await enrichPathItems(env, data.recentPaths || []); } catch (e) {}
+  try { favItems = await enrichPathItems(env, data.favPaths || []); } catch (e) {}
+  return json(Object.assign({}, data, { recentItems, favItems, generated: new Date().toISOString() }));
 }
 
 // ===== 健康自检 =====
+// 有界采样 R2 占用，用于和"用量计数"对照，及时发现漂移（防止配额形同虚设）
+async function guardStats(env, u) {
+  const out = {
+    kv: {
+      cacheEntries: KV_CACHE.size,
+      writesLastMin: kvWritesLastMin(),
+      budgetPerMin: kvBudgetPerMin(env),
+      telemetryBuffered: telPending(),
+      sessionCacheSec: sessionCacheSec(env),
+      flushMs: telemetryFlushMs(env),
+      telemetryMaxPerDay: telemetryMaxPerDay(env),
+      dayCount: TEL.dayCount,
+      mirrorDir: kvMirrorDir(env)
+    },
+    limits: {
+      maxDirItems: maxDirItems(env),
+      kvValueMaxMB: Math.round(kvValueMax(env) / 1048576),
+      pathMax: PATH_MAX,
+      versionMaxMB: Math.round(versionMaxBytes(env) / 1048576),
+      versionsTtlDays: Math.round(versionsTtl(env) / 86400),
+      versionsMax: maxVersions(env),
+      hashTtlDays: Math.round(hashTtl(env) / 86400),
+      trashDays: trashDays(env),
+      chunkGcHours: chunkGcHours(env),
+      backupMaxMB: Math.round(backupMaxBytes(env) / 1048576),
+      backupKeep: backupKeep(env)
+    },
+    usage: { tracked: (u && u.used) || 0, files: (u && u.files) || 0 },
+    r2: { objects: 0, bytes: 0, capped: false, internal: { chunks: 0, thumbs: 0, versions: 0, trash: 0, backup: 0 } }
+  };
+  try {
+    let cursor, n = 0;
+    do {
+      const l = await env.DRIVE.list({ prefix: '', limit: 1000, cursor });
+      for (const o of (l.objects || [])) {
+        n++; out.r2.objects++; out.r2.bytes += o.size || 0;
+        const k = o.key, sz = o.size || 0;
+        if (k.indexOf(CHUNKS_PREFIX) === 0) out.r2.internal.chunks += sz;
+        else if (k.indexOf(THUMB_PREFIX) === 0) out.r2.internal.thumbs += sz;
+        else if (k.indexOf(VERSIONS_PREFIX) === 0) out.r2.internal.versions += sz;
+        else if (k.indexOf(TRASH_PREFIX) === 0) out.r2.internal.trash += sz;
+        else if (k.indexOf(BACKUP_PREFIX) === 0) out.r2.internal.backup += sz;
+        if (n >= 5000) { out.r2.capped = true; return out; }
+      }
+      cursor = l.truncated ? l.cursor : undefined;
+    } while (cursor);
+  } catch (e) {}
+  return out;
+}
 async function handleHealth(env) {
   const checks = [];
   async function run(name, fn) {
@@ -2579,7 +4804,9 @@ async function handleHealth(env) {
   else checks.push({ name: 'S3 后端', ok: true, ms: 0, info: '未配置' });
   await run('回收站', async () => { const t = await getDir(env, '/.trash/'); return (t.length || 0) + ' items'; });
   const u = await getUsage(env);
-  return json({ version: APP_VERSION, checks, usage: { used: u.used || 0, files: u.files || 0, total: quotaTotal(env) } });
+  let guard = null;
+  try { guard = await guardStats(env, u); } catch (e) {}
+  return json({ version: APP_VERSION, checks, usage: { used: u.used || 0, files: u.files || 0, total: quotaTotal(env) }, guard });
 }
 
 // ===== 孤儿文件扫描 =====
@@ -2612,16 +4839,23 @@ async function scanOrphans(env) {
   const present = new Set(listed.keys);
   const orphanFiles = [], orphanInternal = [], missing = [];
   for (const k of listed.keys) {
-    if (referenced.has(k) || k.indexOf(BACKUP_PREFIX) === 0) continue;
+    if (referenced.has(k) || k.indexOf(BACKUP_PREFIX) === 0 || k.indexOf(TRASH_PREFIX) === 0) continue;
     if (k.indexOf(THUMB_PREFIX) === 0) {
       const base = k.substring(THUMB_PREFIX.length);
+      if (base.indexOf(TRASH_PREFIX) === 0) continue;   // 回收站内文件的缩略图，随恢复/清理一起处理
       if (!referenced.has(base)) orphanInternal.push({ key: k, size: listed.sizes[k] || 0, base });
     } else if (k.indexOf(VERSIONS_PREFIX) === 0) {
       const rest = k.substring(VERSIONS_PREFIX.length);
       const base = rest.substring(0, rest.lastIndexOf('/'));
+      if (base.indexOf(TRASH_PREFIX) === 0) continue;
       if (!base || !referenced.has(base)) orphanInternal.push({ key: k, size: listed.sizes[k] || 0, base });
-    } else if (k.indexOf('chunks/') === 0) {
-      // M5: chunks/ 由上传会话管理，24 小时内视为活跃，不归孤儿
+    } else if (k.indexOf(CHUNKS_PREFIX) === 0) {
+      // M5: 分片由上传会话管理，24 小时内视为活跃，不归孤儿
+      const upAt = listed.ages[k] ? new Date(listed.ages[k]).getTime() : 0;
+      if (upAt && Date.now() - upAt < 24 * 3600 * 1000) continue;
+      orphanInternal.push({ key: k, size: listed.sizes[k] || 0, base: '' });
+    } else if (/^chunks\/[0-9a-f]{16}\/\d+$/.test(k)) {
+      // 兼容旧版分片路径（严格的 <id>/<idx> 形态，不会误伤用户目录）
       const upAt = listed.ages[k] ? new Date(listed.ages[k]).getTime() : 0;
       if (upAt && Date.now() - upAt < 24 * 3600 * 1000) continue;
       orphanInternal.push({ key: k, size: listed.sizes[k] || 0, base: '' });
@@ -2638,7 +4872,67 @@ async function scanOrphans(env) {
   };
 }
 async function handleScanOrphans(env) { return json(await scanOrphans(env)); }
-async function handlePurgeOrphans(env, mode) {
+
+// ===== 自动内务回收（R2 防爆）=====
+// 只回收"肯定没人引用"的内部对象，不需要遍历整棵树：
+//   1) .chunks/  超过 CHUNK_GC_HOURS 未更新的上传分片（会话键早已 TTL 过期）
+//   2) .versions/<key>/<ts>  版本索引里已经不存在的条目
+//   3) .thumb/<key>  目录里已不存在的文件缩略图
+async function gcChunks(env, limit) {
+  const cutoff = Date.now() - chunkGcHours(env) * 3600 * 1000;
+  let checked = 0, deleted = 0, cursor;
+  try {
+    do {
+      const listed = await env.DRIVE.list({ prefix: CHUNKS_PREFIX, limit: 500, cursor });
+      for (const o of (listed.objects || [])) {
+        if (checked++ >= limit) return deleted;
+        const up = o.uploaded ? new Date(o.uploaded).getTime() : 0;
+        if (up && up <= cutoff) { try { await env.DRIVE.delete(o.key); deleted++; } catch (e) {} }
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor && checked < limit);
+  } catch (e) {}
+  return deleted;
+}
+async function gcInternalObjects(env, limit) {
+  let removed = 0, checked = 0;
+  // 版本对象：索引不存在则删除
+  try {
+    let cursor;
+    do {
+      const listed = await env.DRIVE.list({ prefix: VERSIONS_PREFIX, limit: 300, cursor });
+      for (const o of (listed.objects || [])) {
+        if (checked++ >= limit) return removed;
+        const rest = o.key.substring(VERSIONS_PREFIX.length);
+        const base = rest.substring(0, rest.lastIndexOf('/'));
+        const ts = parseInt(rest.substring(rest.lastIndexOf('/') + 1), 10);
+        if (!base || !Number.isFinite(ts)) { try { await env.DRIVE.delete(o.key); removed++; } catch (e) {} continue; }
+        const idx = await listVersions(env, base);
+        if (!idx.some(v => Number(v.ts) === ts)) { try { await env.DRIVE.delete(o.key); removed++; } catch (e) {} }
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor && checked < limit);
+  } catch (e) {}
+  // 缩略图：对应文件已不存在则删除
+  try {
+    let cursor;
+    do {
+      const listed = await env.DRIVE.list({ prefix: THUMB_PREFIX, limit: 300, cursor });
+      for (const o of (listed.objects || [])) {
+        if (checked++ >= limit) return removed;
+        const key = o.key.substring(THUMB_PREFIX.length);
+        if (key.indexOf(TRASH_PREFIX) === 0 || key.indexOf(CHUNKS_PREFIX) === 0) continue;   // 回收站/分片由各自流程处理
+        const dir = parentOf('/' + key);
+        const name = key.split('/').pop();
+        let found = false;
+        try { const f = await findDirItem(env, dir, name); found = !!(f && f.item); } catch (e) { found = true; }
+        if (!found) { try { await env.DRIVE.delete(o.key); removed++; } catch (e) {} }
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor && checked < limit);
+  } catch (e) {}
+  return removed;
+}async function handlePurgeOrphans(env, mode) {
   const data = await scanOrphans(env);
   // R3: 扫描被截断（对象数超过 2 万上限）时拒绝清理，防止误删
   if (data.capped) return json({ error: 'Scan incomplete, purge refused', capped: true }, 409);
@@ -2656,11 +4950,13 @@ async function handlePurgeOrphans(env, mode) {
 
 // ===== Webhook 通知 =====
 async function getWebhook(env) {
-  try {
-    const r = await env.STORE.get('meta:webhook', 'json');
-    if (r && typeof r === 'object') return { enabled: !!r.enabled, url: String(r.url || ''), secret: String(r.secret || ''), events: Array.isArray(r.events) ? r.events : ['up', 'del', 'shr', 'mov'] };
-  } catch (e) {}
-  return { enabled: false, url: '', secret: '', events: ['up', 'del', 'shr', 'mov'] };
+  return await kvCached('meta:webhook', 30, async () => {
+    try {
+      const r = await env.STORE.get('meta:webhook', 'json');
+      if (r && typeof r === 'object') return { enabled: !!r.enabled, url: String(r.url || ''), secret: String(r.secret || ''), events: Array.isArray(r.events) ? r.events : ['up', 'del', 'shr', 'mov'] };
+    } catch (e) {}
+    return { enabled: false, url: '', secret: '', events: ['up', 'del', 'shr', 'mov'] };
+  });
 }
 async function handleGetWebhook(env) { const w = await getWebhook(env); return json({ enabled: w.enabled, url: w.url, hasSecret: !!w.secret, events: w.events }); }
 async function handleSetWebhook(env, b) {
@@ -2672,12 +4968,20 @@ async function handleSetWebhook(env, b) {
       if (await resolveAndCheckHost(u.hostname)) return json({ error: 'Blocked host' }, 403);
     } catch (e) { return json({ error: 'Bad url' }, 400); }
   }
+  const prev = await getWebhook(env);
+  // 密钥留空表示"不修改"（GET 不会回传明文）；需要清除时显式传 null
+  let secret = prev.secret || '';
+  if (b && Object.prototype.hasOwnProperty.call(b, 'secret')) {
+    if (b.secret === null) secret = '';
+    else if (String(b.secret || '') !== '') secret = String(b.secret);
+  }
   const w = {
     enabled: !!(b && b.enabled), url,
-    secret: String((b && b.secret) || ''),
+    secret,
     events: Array.isArray(b && b.events) ? b.events.filter(function (x) { return typeof x === 'string' && x.length < 12; }).slice(0, 10) : []
   };
   await env.STORE.put('meta:webhook', JSON.stringify(w));
+  kvInvalidate('meta:webhook');
   return json({ ok: true });
 }
 async function notifyWebhook(env, payload) {
@@ -2706,53 +5010,142 @@ async function handleWebhookTest(env) {
 }
 
 // ===== 公开只读相册 =====
-async function getAlbums(env) { try { const a = await env.STORE.get('meta:albums', 'json'); return Array.isArray(a) ? a : []; } catch (e) { return []; } }
-async function handleListAlbums(env) { return json({ albums: await getAlbums(env) }); }
-async function handleCreateAlbum(env, path, name) {
+async function getAlbums(env) {
+  return await kvCached('meta:albums', 30, async () => {
+    try { const a = await env.STORE.get('meta:albums', 'json'); return Array.isArray(a) ? a : []; } catch (e) { return []; }
+  });
+}
+async function handleListAlbums(env) {
+  const albums = (await getAlbums(env)).map(a => ({
+    id: a.id, path: a.path, name: a.name, created: a.created,
+    hasPassword: !!a.pwHash, count: a.count || 0
+  }));
+  return json({ albums });
+}
+async function handleCreateAlbum(env, path, name, password) {
   const dir = normPath(path || '/');
   if (await isPathLocked(env, dir, '')) return json({ locked: true, path: dir }, 423);
-  const albums = await getAlbums(env);
+  const albums = (await getAlbums(env)).slice();
   const id = randToken().substring(0, 16);
   const nm = sanitizeName(name || dir.split('/').filter(Boolean).pop() || '相册');
-  albums.push({ id, path: dir, name: nm, created: new Date().toISOString() });
+  const rec = { id, path: dir, name: nm, created: new Date().toISOString() };
+  if (password) {
+    rec.pwSalt = randToken().substring(0, 16);
+    rec.pwHash = await hashPassword(String(password), rec.pwSalt);
+  }
+  albums.push(rec);
   await env.STORE.put('meta:albums', JSON.stringify(albums));
-  return json({ ok: true, id, url: '/a/' + id, name: nm });
+  kvInvalidate('meta:albums');
+  return json({ ok: true, id, url: '/a/' + id, name: nm, hasPassword: !!rec.pwHash });
+}
+async function handleAlbumUpdate(env, id, b) {
+  const albums = (await getAlbums(env)).slice();
+  const a = albums.find(x => x.id === id);
+  if (!a) return json({ error: 'Not found' }, 404);
+  if (b && b.name !== undefined) a.name = sanitizeName(String(b.name || a.name));
+  if (b && b.password !== undefined) {
+    if (!b.password) { delete a.pwHash; delete a.pwSalt; }
+    else {
+      a.pwSalt = randToken().substring(0, 16);
+      a.pwHash = await hashPassword(String(b.password), a.pwSalt);
+    }
+  }
+  await env.STORE.put('meta:albums', JSON.stringify(albums));
+  kvInvalidate('meta:albums');
+  return json({ ok: true, hasPassword: !!a.pwHash });
 }
 async function handleDeleteAlbum(env, id) {
   await env.STORE.put('meta:albums', JSON.stringify((await getAlbums(env)).filter(a => a.id !== id)));
+  kvInvalidate('meta:albums');
   return json({ ok: true });
 }
-async function collectMedia(env, dirPath, out, depth) {
-  if (depth > 8 || out.length >= 300) return;
+// 相册密码校验（?pw=）
+async function albumGuard(env, req, a) {
+  if (await isPathLocked(env, a.path, '')) return { resp: json({ error: 'Locked' }, 423) };
+  if (a.pwHash) {
+    const pw = (req ? (new URL(req.url).searchParams.get('pw') || '') : '');
+    if (!await verifyPassword(pw, { hash: a.pwHash, salt: a.pwSalt })) return { resp: json({ error: 'Wrong password', needPassword: true, hasPassword: true, name: a.name }, 403) };
+  }
+  return { ok: true };
+}
+async function collectMedia(env, dirPath, out, depth, kind, cap) {
+  const limit = cap || 300;
+  if (depth > 8 || out.length >= limit) return;
   let items = [];
   try { items = await getDir(env, dirPath); } catch (e) {}
   for (const it of items) {
-    if (out.length >= 300) return;
+    if (out.length >= limit) return;
     if (!it || !it.name) continue;
-    if (it.type === 'dir') { await collectMedia(env, dirPath + it.name + '/', out, depth + 1); continue; }
+    if (it.type === 'dir') { await collectMedia(env, dirPath + it.name + '/', out, depth + 1, kind, limit); continue; }
     const m = String(it.mime || '');
-    if (m.indexOf('image/') === 0 || m.indexOf('video/') === 0) {
-      out.push({ k: (dirPath + it.name).replace(/^\//, ''), name: it.name, mime: m, size: it.size || 0, time: it.time || '', hasThumb: !!it.hasThumb });
-    }
+    const isImg = m.indexOf('image/') === 0;
+    const isVid = m.indexOf('video/') === 0;
+    const isAud = m.indexOf('audio/') === 0;
+    const match = (kind === 'image') ? isImg : ((kind === 'audio') ? isAud : (isImg || isVid || isAud));
+    if (!match) continue;
+    out.push({
+      k: (dirPath + it.name).replace(/^\//, ''), name: it.name, mime: m, size: it.size || 0,
+      time: it.time || '', hasThumb: !!it.hasThumb, ph: it.ph || '', path: dirPath
+    });
   }
 }
-async function handleAlbumList(env, id) {
+// 媒体清单（相似图片/相册等复用；带 ph 感知哈希）
+async function handleMediaList(env, q) {
+  const dir = normPath(q.path || '/');
+  const kind = String(q.kind || 'media');
+  const limit = Math.min(Math.max(parseInt(q.limit, 10) || 500, 1), 2000);
+  const out = [];
+  await collectMedia(env, dir, out, 0, kind, limit);
+  out.sort(function (x, y) { return String(y.time).localeCompare(String(x.time)); });
+  return json({ path: dir, kind, count: out.length, items: out, capped: out.length >= limit });
+}
+// 记录图片感知哈希（客户端计算 dHash，64bit hex）
+async function handleSetPhash(env, b) {
+  const p = '/' + String((b && b.path) || '').replace(/^\/+/, '');
+  const h = String((b && b.hash) || '').toLowerCase();
+  if (!/^[0-9a-f]{16}$/.test(h)) return json({ error: 'Bad hash' }, 400);
+  const dir = parentOf(p), name = p.split('/').filter(Boolean).pop();
+  if (!name) return json({ error: 'Bad path' }, 400);
+  const cur = await findDirItem(env, dir, name);
+  if (!cur.item) return json({ error: 'Not found' }, 404);
+  if (cur.item.ph === h) return json({ ok: true, unchanged: true });
+  await upsertDirItem(env, dir, Object.assign({}, cur.item, { ph: h }));
+  return json({ ok: true });
+}
+async function handleAlbumList(env, req, id) {
   const a = (await getAlbums(env)).find(x => x.id === id);
   if (!a) return json({ error: 'Not found' }, 404);
-  if (await isPathLocked(env, a.path, '')) return json({ error: 'Locked' }, 423);
+  const g = await albumGuard(env, req, a);
+  if (g.resp) return g.resp;
+  const url = new URL(req.url);
+  const offset = Math.max(0, parseInt(url.searchParams.get('offset'), 10) || 0);
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit'), 10) || 60, 1), 300);
   const out = [];
-  await collectMedia(env, a.path, out, 0);
+  await collectMedia(env, a.path, out, 0, 'media', 600);
   out.sort(function (x, y) { return String(y.time).localeCompare(String(x.time)); });
-  return json({ name: a.name, count: out.length, items: out });
+  const page = out.slice(offset, offset + limit);
+  return json({
+    name: a.name, count: out.length, total: out.length, offset, limit,
+    items: page, hasMore: offset + limit < out.length,
+    hasPassword: !!a.pwHash, path: a.path
+  });
 }
 async function handleAlbumRaw(env, req, id) {
   const a = (await getAlbums(env)).find(x => x.id === id);
   if (!a) return json({ error: 'Not found' }, 404);
-  if (await isPathLocked(env, a.path, '')) return json({ error: 'Locked' }, 423);
-  const k = String(new URL(req.url).searchParams.get('k') || '');
+  const g = await albumGuard(env, req, a);
+  if (g.resp) return g.resp;
+  const q = new URL(req.url);
+  const k = String(q.searchParams.get('k') || '');
   const base = a.path.replace(/^\/+/, '');
   if (!k || k.indexOf(base) !== 0 || k.indexOf('..') >= 0) return json({ error: 'Forbidden' }, 403);
-  return await serveObject(env, req, k, { disposition: 'inline', sanitize: true, cacheControl: 'public, max-age=3600' });
+  // 内部对象（.backup/.versions/.thumb/.trash/.chunks）不得通过公开相册读取
+  if (k.split('/').some(seg => seg.charAt(0) === '.')) return json({ error: 'Forbidden' }, 403);
+  const dl = q.searchParams.get('dl') === '1';
+  const filename = k.split('/').pop() || 'file';
+  return await serveObject(env, req, k, dl
+    ? { disposition: 'attachment; filename="' + encodeURIComponent(filename) + '"', sanitize: true, cacheControl: 'private, max-age=3600' }
+    : { disposition: 'inline', sanitize: true, cacheControl: 'public, max-age=3600' });
 }
 
 // ===== 公开相册页 =====
@@ -2762,8 +5155,7 @@ function albumPage(id) {
 <title>相册</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#f6f8fa;--card:#fff;--border:#d8dee4;--text:#1f2328;--text2:#57606a;--text3:#8c959f;--accent:#0a84ff;--accent-h:#0066ff;--fill:#f6f8fa;--red:#cf222e;--warn:#9a6700}
-:root.dark{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--text2:#8b949e;--text3:#6e7681;--accent:#0a84ff;--accent-h:#409cff;--fill:#21262d;--red:#f85149;--warn:#d29922}
+${publicPageCss()}
 body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",system-ui,sans-serif;background:var(--bg);color:var(--text);padding:20px;-webkit-font-smoothing:antialiased}
 .hd{max-width:1200px;margin:0 auto 16px}
 h1{font-size:20px;font-weight:700;letter-spacing:-.02em}
@@ -2779,6 +5171,15 @@ h1{font-size:20px;font-weight:700;letter-spacing:-.02em}
 .lb .x{position:absolute;top:16px;right:20px;color:#fff;font-size:26px;cursor:pointer;opacity:.8;line-height:1}
 .lb .x:hover{opacity:1}
 .msg{max-width:1200px;margin:0 auto;color:var(--text3);font-size:14px;padding:24px 0}
+.pw{max-width:1200px;margin:20px auto;display:flex;gap:8px;align-items:center}
+.pw input{flex:1;padding:10px 14px;border-radius:10px;border:1px solid var(--border);background:var(--fill);color:inherit;font-size:14px}
+.pw button{padding:10px 18px;border-radius:10px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer;font-size:14px}
+.day{max-width:1200px;margin:16px auto 6px;font-size:13px;font-weight:600;color:var(--text2)}
+.more{max-width:1200px;margin:18px auto;text-align:center}
+.more button{padding:9px 20px;border-radius:10px;border:1px solid var(--border);background:var(--fill);color:inherit;cursor:pointer}
+.it .dl{position:absolute;top:6px;right:6px;background:rgba(0,0,0,.5);color:#fff;border:none;border-radius:8px;padding:3px 7px;font-size:12px;cursor:pointer;opacity:0;transition:opacity .15s}
+.it:hover .dl{opacity:1}
+.it .geo{position:absolute;top:6px;left:6px;background:rgba(0,0,0,.5);color:#fff;border-radius:8px;padding:3px 7px;font-size:12px;text-decoration:none}
 
 .theme-btn{position:fixed;top:16px;right:16px;z-index:999;width:42px;height:42px;border-radius:50%;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:18px;cursor:pointer;box-shadow:0 8px 22px rgba(0,0,0,.18);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);transition:transform .12s}
 .theme-btn:active{transform:scale(.92)}
@@ -2786,50 +5187,145 @@ h1{font-size:20px;font-weight:700;letter-spacing:-.02em}
 :root.dark .card{box-shadow:0 18px 44px rgba(0,0,0,.5)}
 input,button,.zone{border-radius:11px}
 </style></head><body>
-<div class="hd"><h1 id="ttl">相册</h1><div class="sub" id="sub"></div></div>
-<div class="grid" id="grid"></div>
+<div class="pg-bar" style="max-width:1200px;margin:0 auto 16px">
+  <span class="pg-logo">🖼</span>
+  <div style="min-width:0"><div class="pg-title" id="ttl">相册</div><div class="pg-sub" id="sub"></div></div>
+  <div class="pg-actions"><button class="btn gray tiny" id="albTheme" title="切换主题">🌗</button></div>
+</div>
+<div class="pw" id="pwRow" style="display:none"><input id="pwInput" type="password" placeholder="请输入相册密码" autocomplete="off"><button id="btnPw">进入</button></div>
+<div id="grid"></div>
+<div class="more" id="moreWrap" style="display:none"><button id="btnMore">加载更多</button></div>
 <div class="msg" id="msg" style="display:none"></div>
 <div class="lb" id="lb"><span class="x" id="lbx">✕</span><div id="lbbody" style="max-width:100%;max-height:100%;display:flex;align-items:center;justify-content:center"></div></div>
 <script>
 var ID=${aid};
+var PW='',OFFSET=0,LIMIT=60,TOTAL=0,LOADED=0;
 function esc(s){return String(s==null?'':s).replace(/[&<>"'\`]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','\`':'&#96;'}[c]})}
 function closeLb(){document.getElementById('lb').classList.remove('show');document.getElementById('lbbody').innerHTML=''}
-fetch('/album/'+ID+'/list',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
-  if(d.error){document.getElementById('msg').style.display='block';document.getElementById('msg').textContent=d.error;return}
-  document.getElementById('ttl').textContent=d.name||'相册';
-  document.getElementById('sub').textContent=(d.count||0)+' 项';
-  var g=document.getElementById('grid');var h='';
-  (d.items||[]).forEach(function(it){
-    var isV=String(it.mime||'').indexOf('video/')===0;
-    var src='/album/'+ID+'/raw?k='+encodeURIComponent(it.k);
-    h+='<div class="it" data-k="'+esc(it.k)+'" data-v="'+(isV?1:0)+'">';
-    h+=isV?('<video src="'+src+'" muted preload="metadata"></video>'):('<img loading="lazy" src="'+src+'" alt="">');
-    h+='<div class="nm">'+esc(it.name)+'</div></div>';
-  });
-  g.innerHTML=h;
+function rawUrl(k,dl){return '/album/'+ID+'/raw?k='+encodeURIComponent(k)+(PW?('&pw='+encodeURIComponent(PW)):'')+(dl?'&dl=1':'')}
+function loadMore(reset){
+  if(reset){OFFSET=0;LOADED=0;document.getElementById('grid').innerHTML=''}
+  fetch('/album/'+ID+'/list?offset='+OFFSET+'&limit='+LIMIT+(PW?('&pw='+encodeURIComponent(PW)):''),{cache:'no-store'}).then(function(r){return r.json().then(function(d){return{r:r,d:d}})}).then(function(res){
+    var d=res.d;
+    if(res.r.status===403&&d.needPassword){
+      document.getElementById('pwRow').style.display='flex';
+      document.getElementById('msg').style.display='none';
+      if(d.name)document.getElementById('ttl').textContent=d.name;
+      return;
+    }
+    if(d.error){document.getElementById('msg').style.display='block';document.getElementById('msg').textContent=d.error;return}
+    document.getElementById('pwRow').style.display='none';
+    document.getElementById('ttl').textContent=d.name||'相册';
+    document.getElementById('msg').style.display='none';
+    TOTAL=d.total||d.count||0;LOADED+= (d.items||[]).length;OFFSET=LOADED;
+    document.getElementById('sub').textContent=TOTAL+' 项'+(PW?' · 🔒':'');
+    var g=document.getElementById('grid');
+    var h='';
+    var lastDay='';
+    (d.items||[]).forEach(function(it){
+      var isV=String(it.mime||'').indexOf('video/')===0;
+      var src=rawUrl(it.k,false);
+      h+='<div class="it" data-k="'+esc(it.k)+'" data-v="'+(isV?1:0)+'" data-n="'+esc(it.name)+'" data-t="'+esc(it.time||'')+'">';
+      h+=isV?('<video src="'+src+'" muted preload="metadata"></video>'):('<img loading="lazy" src="'+src+'" alt="">');
+      h+='<button class="dl" data-dl="'+esc(it.k)+'">⬇</button>';
+      h+='<div class="nm">'+esc(it.name)+'</div></div>';
+    });
+    g.insertAdjacentHTML('beforeend',h);
+    var mw=document.getElementById('moreWrap');
+    mw.style.display=d.hasMore?'block':'none';
+    document.getElementById('btnMore').textContent='加载更多（'+LOADED+'/'+TOTAL+'）';
+    bindItems();
+    if(reset)groupByDay();
+  }).catch(function(){document.getElementById('msg').style.display='block';document.getElementById('msg').textContent='加载失败'});
+}
+function bindItems(){
+  var g=document.getElementById('grid');
   g.querySelectorAll('.it').forEach(function(el){
-    el.onclick=function(){
-      var src='/album/'+ID+'/raw?k='+encodeURIComponent(el.getAttribute('data-k'));
+    if(el.__b)return;el.__b=1;
+    el.onclick=function(ev){
+      if(ev.target&&ev.target.getAttribute&&ev.target.getAttribute('data-dl'))return;
+      var k=el.getAttribute('data-k');
       var isV=el.getAttribute('data-v')==='1';
-      document.getElementById('lbbody').innerHTML=isV?('<video src="'+src+'" controls autoplay></video>'):('<img src="'+src+'" alt="">');
+      document.getElementById('lbbody').innerHTML=isV?('<video src="'+rawUrl(k,false)+'" controls autoplay></video>'):('<img src="'+rawUrl(k,false)+'" alt="">');
       document.getElementById('lb').classList.add('show');
     };
   });
-}).catch(function(){document.getElementById('msg').style.display='block';document.getElementById('msg').textContent='加载失败'});
+  g.querySelectorAll('[data-dl]').forEach(function(b){
+    if(b.__b)return;b.__b=1;
+    b.onclick=function(ev){ev.stopPropagation();location.href=rawUrl(b.getAttribute('data-dl'),true)};
+  });
+}
+// EXIF：读取前 128KB 解析拍摄时间与 GPS，按天分组并给出地图链接
+function groupByDay(){
+  if(typeof ExifReader==='undefined'||!window.ExifReader)return;
+  var g=document.getElementById('grid');
+  var els=[].slice.call(g.querySelectorAll('.it')).filter(function(el){return el.getAttribute('data-v')!=='1'}).slice(0,40);
+  els.forEach(function(el){
+    fetch(rawUrl(el.getAttribute('data-k'),false),{headers:{Range:'bytes=0-131071'}}).then(function(r){return r.arrayBuffer()}).then(function(buf){
+      var tags=ExifReader.load(buf,{expanded:true});
+      var dt=(tags.exif&&tags.exif.DateTimeOriginal&&tags.exif.DateTimeOriginal.description)||'';
+      var lat=(tags.gps&&tags.gps.Latitude)||null,lng=(tags.gps&&tags.gps.Longitude)||null;
+      if(dt){el.setAttribute('data-day',String(dt).substring(0,10))}
+      if(lat&&lng){
+        var a=document.createElement('a');
+        a.className='geo';a.target='_blank';a.rel='noopener';
+        a.href='https://www.openstreetmap.org/?mlat='+lat+'&mlon='+lng+'#map=15/'+lat+'/'+lng;
+        a.textContent='📍';
+        el.appendChild(a);
+      }
+      applyDays();
+    }).catch(function(){});
+  });
+}
+function applyDays(){
+  var g=document.getElementById('grid');
+  var kids=[].slice.call(g.children);
+  kids.forEach(function(el){if(el.classList&&el.classList.contains('day-h'))el.remove()});
+  var items=[].slice.call(g.querySelectorAll('.it'));
+  var seen={},lastEl=null;
+  items.forEach(function(el){
+    var day=el.getAttribute('data-day');
+    if(!day)return;
+    if(seen[day])return;
+    seen[day]=1;
+    var h=document.createElement('div');h.className='day-h';h.className+=' day';h.textContent=day;
+    g.insertBefore(h,el);
+  });
+}
+(function(){var b=document.getElementById('albTheme');if(b)b.onclick=function(){var t=document.getElementById('themeBtn');if(t)t.click()}})();
+loadMore(true);
+document.getElementById('btnMore').onclick=function(){loadMore(false)};
+document.getElementById('btnPw').onclick=function(){PW=document.getElementById('pwInput').value;loadMore(true)};
+document.getElementById('pwInput').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnPw').click()};
 document.getElementById('lbx').onclick=closeLb;
 document.getElementById('lb').onclick=function(e){if(e.target===this)closeLb()};
 document.addEventListener('keydown',function(e){if(e.key==='Escape')closeLb()});
-</script><script>(function(){var dth=localStorage.getItem('dth')||'auto';function applyTheme(){var h=document.documentElement;var d=dth==='dark'||(dth==='auto'&&window.matchMedia&&window.matchMedia('(prefers-color-scheme:dark)').matches);h.classList.toggle('dark',!!d);var b=document.getElementById('themeBtn');if(b)b.textContent=dth==='auto'?'🌗':(dth==='light'?'☀️':'🌙')}applyTheme();var b=document.createElement('button');b.id='themeBtn';b.className='theme-btn';b.title='切换主题（跟随系统 / 浅色 / 深色）';b.textContent='🌗';b.onclick=function(){dth=dth==='auto'?'light':(dth==='light'?'dark':'auto');localStorage.setItem('dth',dth);applyTheme()};document.body.appendChild(b);if(window.matchMedia){try{window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){if(dth==='auto')applyTheme()})}catch(e){}}})();</script></body></html>`;
+(function(){var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/exifreader@4.23.3/dist/exif-reader.js';s.async=true;s.onload=function(){groupByDay()};document.head.appendChild(s)})();
+</script><script>${publicPageThemeJs()}</script></body></html>`;
 }
 
 // ===== PWA：manifest / 图标 / Service Worker =====
 function manifestJSON(env) {
-  const title = String((env && env.DRIVE_TITLE) || '云端网盘');
+  const title = siteTitle(env);
   return {
     name: title, short_name: title.slice(0, 12),
     start_url: '/', scope: '/', display: 'standalone',
     background_color: '#0d1117', theme_color: '#0d1117',
-    icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' }]
+    icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' }],
+    // 手机系统分享面板 → 分享即上传
+    share_target: {
+      action: '/share-target',
+      method: 'POST',
+      enctype: 'multipart/form-data',
+      params: {
+        files: [{ name: 'files', accept: ['*/*'] }],
+        title: 'title', text: 'text', url: 'url'
+      }
+    },
+    shortcuts: [
+      { name: '收藏', url: '/?fav=1' },
+      { name: '最近', url: '/?recent=1' }
+    ]
   };
 }
 function iconSvg() {
@@ -2837,16 +5333,66 @@ function iconSvg() {
 }
 function swJS() {
   return [
-    "const C='bluedrift-v1';",
+    "const SHELL='bluedrift-shell-v2', DATA='bluedrift-data-v1', SHARE='bluedrift-share-v1';",
     "self.addEventListener('install',()=>self.skipWaiting());",
-    "self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));",
+    "self.addEventListener('activate',e=>e.waitUntil((async()=>{",
+    "  const ks=await caches.keys();",
+    "  await Promise.all(ks.filter(k=>k!==SHELL&&k!==DATA&&k!==SHARE).map(k=>caches.delete(k)));",
+    "  await self.clients.claim();",
+    "})()));",
+    // 分享目标：把文件暂存到缓存，通知页面并跳转回去
+    "async function handleShare(req){",
+    "  try{",
+    "    const fd=await req.formData();",
+    "    const files=(fd.getAll('files')||[]).filter(f=>f&&typeof f!=='string'&&f.size>0).slice(0,20);",
+    "    const text=String(fd.get('text')||fd.get('title')||fd.get('url')||'');",
+    "    const cache=await caches.open(SHARE);",
+    "    const old=await cache.keys();",
+    "    for(const k of old){await cache.delete(k)}",
+    "    let i=0;",
+    "    for(const f of files){",
+    "      const name=f.name||('shared-'+i);",
+    "      await cache.put('/shared/'+i,new Response(f,{headers:{'Content-Type':f.type||'application/octet-stream','X-File-Name':encodeURIComponent(name)}}));",
+    "      i++;",
+    "    }",
+    "    if(!files.length&&text){await cache.put('/shared/0',new Response(text,{headers:{'Content-Type':'text/plain','X-File-Name':encodeURIComponent('shared-note.txt')}}));i=1}",
+    "    const cs=await self.clients.matchAll({includeUncontrolled:true,type:'window'});",
+    "    cs.forEach(c=>{try{c.postMessage({type:'shared-files',count:i})}catch(_){}});",
+    "    return Response.redirect('/?shared='+i,303);",
+    "  }catch(err){return Response.redirect('/?shared=0',303)}",
+    "}",
+    "async function putCapped(cacheName,key,resp,max){",
+    "  try{const c=await caches.open(cacheName);await c.put(key,resp);const ks=await c.keys();if(ks.length>max){for(let i=0;i<ks.length-max;i++)await c.delete(ks[i])}}catch(_){}",
+    "}",
     "self.addEventListener('fetch',e=>{",
     "  const r=e.request;",
-    "  if(r.method!=='GET')return;",
-    "  const u=new URL(r.url);",
+    "  let u;try{u=new URL(r.url)}catch(_){return}",
     "  if(u.origin!==location.origin)return;",
-    "  if(u.pathname!=='/')return;",
-    "  e.respondWith(fetch(r).then(x=>{try{const c=x.clone();caches.open(C).then(k=>k.put('/',c))}catch(_){}return x}).catch(()=>caches.match('/')));",
+    "  if(r.method==='POST'&&u.pathname==='/share-target'){e.respondWith(handleShare(r));return}",
+    "  if(r.method!=='GET')return;",
+    // 分享暂存文件回传给页面
+    "  if(u.pathname.indexOf('/shared/')===0){",
+    "    e.respondWith(caches.open(SHARE).then(c=>c.match(u.pathname)).then(x=>x||new Response('',{status:404})));",
+    "    return;",
+    "  }",
+    "  if(u.pathname==='/'){",
+    "    e.respondWith(fetch(r).then(x=>{try{if(x&&x.ok){const c=x.clone();caches.open(SHELL).then(k=>k.put('/',c))}}catch(_){}return x}).catch(()=>caches.match('/')));",
+    "    return;",
+    "  }",
+    // 目录列表/用量：网络优先，离线回退到上次结果（离线只读）
+    "  if(u.pathname==='/api/list'||u.pathname==='/api/usage'||u.pathname==='/api/tree'){",
+    "    e.respondWith(fetch(r).then(x=>{if(x&&x.ok){const c=x.clone();putCapped(DATA,r.url,c,60)}return x}).catch(()=>caches.open(DATA).then(c=>c.match(r.url)).then(x=>x||new Response('{\"offline\":true,\"items\":[]}',{status:200,headers:{'Content-Type':'application/json'}}))));",
+    "    return;",
+    "  }",
+    // 缩略图/预览：缓存优先（有上限，避免离线缓存无限膨胀）
+    "  if(u.pathname==='/api/thumb'){",
+    "    e.respondWith(caches.open(DATA).then(c=>c.match(r.url)).then(x=>x||fetch(r).then(y=>{if(y&&y.ok){const z=y.clone();putCapped(DATA,r.url,z,200)}return y})));",
+    "    return;",
+    "  }",
+    "  if(u.pathname==='/api/preview'){",
+    "    e.respondWith(fetch(r).then(x=>{if(x&&x.ok){const c=x.clone();putCapped(DATA,r.url,c,40)}return x}).catch(()=>caches.open(DATA).then(c=>c.match(r.url)).then(x=>x||new Response('',{status:504}))));",
+    "    return;",
+    "  }",
     "});"
   ].join('\n');
 }
@@ -2860,15 +5406,23 @@ async function handleUploadViaLink(req, env, linkToken) {
 
     const form = await req.formData(); const file = form.get('file');
     if (!file || typeof file === 'string') return json({ error: 'No file' }, 400);
+    if (file.size > maxUploadBytes(env)) return json({ error: 'File too large', max: maxUploadBytes(env) }, 413);
 
     const dirPath = normPath(data.path);
     if (await isPathLocked(env, dirPath, '')) return json({ locked: true, path: dirPath }, 423);
 
     const safeName = sanitizeName(file.name);
     const key = dirPath.replace(/^\//, '') + safeName;
+    if (pathTooLong('/' + key)) return json({ error: 'Path too long', max: PATH_MAX }, 400);
 
     const oldRes = await findDirItem(env, dirPath, safeName);
     const oldItem = oldRes.item;
+    if (!oldItem) {
+      const ruleChk = await checkDirRule(env, dirPath, safeName, file.size);
+      if (ruleChk) return json({ error: ruleChk.error }, 403);
+      const room = await dirRoom(env, dirPath, 1);
+      if (room) return json({ error: room.error, limit: room.limit }, 507);
+    }
     const delta = file.size - (oldItem ? (oldItem.size || 0) : 0);
     if (delta > 0) {
       const u = await getUsage(env);
@@ -2881,7 +5435,8 @@ async function handleUploadViaLink(req, env, linkToken) {
     const etag = (putRes && putRes.etag) ? String(putRes.etag).replace(/"/g, '') : '';
 
     const entry = { name: safeName, type: 'file', size: file.size, mime: file.type || '', time: new Date().toISOString(), hash: etag, hasThumb: false };
-    await upsertDirItem(env, dirPath, entry);
+    const up = await upsertDirItem(env, dirPath, entry);
+    if (up && up.ok === false) { try { await deleteAndMirror(env, key); } catch (e2) {} return json({ error: up.error, limit: up.limit }, 507); }
     if (oldItem) { await addUsage(env, delta, 0); }
     else { await addUsage(env, file.size, 1); }
     await addLog(env, 'up', dirPath + safeName, file.size + ' bytes (link)');
@@ -2909,6 +5464,8 @@ async function handlePublicUpload(req, env) {
   if (file.size > publicUploadMax(env)) return json({ error: 'File too large' }, 413);
   const u = await getUsage(env);
   if ((u.used || 0) + file.size > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413);
+  const pubRule = await checkDirRule(env, dir, sanitizeName(file.name), file.size);
+  if (pubRule) return json({ error: pubRule.error }, 403);
   try {
     const base = sanitizeName(file.name);
     const existing = await findDirItem(env, dir, base);
@@ -2931,7 +5488,7 @@ async function handlePublicUpload(req, env) {
 
 // ===== 分享 / 上传链接 管理面板 =====
 async function handleListShares(env) {
-  const keys = await listKV(env, 'share:', 500);
+  const keys = await listKV(env, 'share:', LIST_PANEL_MAX);
   const shares = [];
   for (const k of keys) {
     try {
@@ -2951,7 +5508,7 @@ async function handleDeleteShare(env, token) {
   return json({ ok: true });
 }
 async function handleListUploadLinks(env) {
-  const keys = await listKV(env, 'ulink:', 500);
+  const keys = await listKV(env, 'ulink:', LIST_PANEL_MAX);
   const links = [];
   for (const k of keys) {
     try {
@@ -2970,8 +5527,8 @@ async function handleDeleteUploadLink(env, token) {
   return json({ ok: true });
 }
 async function handleDlStats(env) {
-  const logs = (await env.STORE.get('meta:dllog', 'json')) || [];
-  const agg = (await env.STORE.get('meta:dlstat', 'json')) || { total: 0, bytes: 0 };
+  const logs = telMergeDlLogs((await env.STORE.get('meta:dllog', 'json')) || []);
+  const agg = telMergeDlStat((await env.STORE.get('meta:dlstat', 'json')) || { total: 0, bytes: 0 });
   const byDay = {};
   for (const l of logs) {
     const d = String(l.time || '').substring(0, 10);
@@ -2984,7 +5541,7 @@ async function handleDlStats(env) {
 async function handleStatsFull(env) {
   const u = await getUsage(env);
   const logs = await getLogs(env);
-  const dl = (await env.STORE.get('meta:dlstat', 'json')) || { total: 0, bytes: 0 };
+  const dl = telMergeDlStat((await env.STORE.get('meta:dlstat', 'json')) || { total: 0, bytes: 0 });
   let shares = 0, ulinks = 0, trash = 0, tokens = 0;
   try { shares = (await listKV(env, 'share:', 500)).length; } catch (e) {}
   try { ulinks = (await listKV(env, 'ulink:', 500)).length; } catch (e) {}
@@ -2998,6 +5555,7 @@ async function handleStatsFull(env) {
   });
 }
 async function handleClearDlStats(env) {
+  TEL.dllog = []; TEL.dl = { total: 0, bytes: 0 };
   try { await env.STORE.delete('meta:dllog'); } catch (e) {}
   try { await env.STORE.put('meta:dlstat', JSON.stringify({ total: 0, bytes: 0 })); } catch (e) {}
   return json({ ok: true });
@@ -3006,22 +5564,115 @@ async function handleClearDlStats(env) {
 // ===== Folder Password =====
 async function handleSetFolderPass(env, dirPath, password) {
   dirPath = normPath(dirPath);
-  if (!password) { await env.STORE.delete('dirpass:' + dirPath); return json({ ok: true, removed: true }); }
+  if (!password) {
+    await env.STORE.delete('dirpass:' + dirPath);
+    kvInvalidate('dirpass-list'); kvInvalidate('dirpass:' + dirPath);
+    return json({ ok: true, removed: true });
+  }
   const salt = randToken().substring(0, 16);
   const hash = await hashPassword(password, salt);
   await env.STORE.put('dirpass:' + dirPath, JSON.stringify({ hash, salt }));
+  kvInvalidate('dirpass-list'); kvInvalidate('dirpass:' + dirPath);
   return json({ ok: true });
 }
 
 // ===== ZIP =====
+function crc32Table() {
+  let table = crc32Table.t;
+  if (!table) {
+    table = crc32Table.t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; table[n] = c; }
+  }
+  return table;
+}
 function crc32(buf) {
-  let table = crc32.table;
-  if (!table) { table = crc32.table = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; table[n] = c; } }
+  const table = crc32Table();
   let crc = 0xFFFFFFFF;
   for (let i = 0; i < buf.length; i++) crc = table[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
   return (crc ^ 0xFFFFFFFF) >>> 0;
 }
-function buildZip(files) {
+function crc32Update(crc, buf) {
+  const table = crc32Table();
+  let c = crc;
+  for (let i = 0; i < buf.length; i++) c = table[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return c;
+}
+// ===== 流式打包（边读边写，不再受 Worker 内存限制）=====
+// files: [{ key, name, size }]；上限由调用方保证
+function streamZip(env, files, filename) {
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      let offset = 0;
+      const central = [];
+      const put = (u8) => { controller.enqueue(u8); offset += u8.length; };
+      try {
+        for (const f of files) {
+          const nameBytes = enc.encode(f.name);
+          const localOffset = offset;
+          const lh = new Uint8Array(30);
+          const lv = new DataView(lh.buffer);
+          lv.setUint32(0, 0x04034B50, true); lv.setUint16(4, 20, true);
+          lv.setUint16(6, 0x0008, true);                     // 使用数据描述符（CRC/大小后置）
+          lv.setUint16(8, 0, true); lv.setUint16(10, 0, true); lv.setUint16(12, 0, true);
+          lv.setUint32(14, 0, true); lv.setUint32(18, 0, true); lv.setUint32(22, 0, true);
+          lv.setUint16(26, nameBytes.length, true); lv.setUint16(28, 0, true);
+          put(lh); put(nameBytes);
+          let crc = 0xFFFFFFFF, size = 0;
+          let obj = null;
+          try { obj = await env.DRIVE.get(f.key); } catch (e) { obj = null; }
+          if (obj && obj.body) {
+            const reader = obj.body.getReader();
+            for (;;) {
+              const r = await reader.read();
+              if (r.done) break;
+              const chunk = r.value instanceof Uint8Array ? r.value : new Uint8Array(r.value);
+              crc = crc32Update(crc, chunk);
+              size += chunk.length;
+              put(chunk);
+            }
+          }
+          const crcFinal = (crc ^ 0xFFFFFFFF) >>> 0;
+          const dd = new Uint8Array(16);
+          const dv = new DataView(dd.buffer);
+          dv.setUint32(0, 0x08074B50, true);
+          dv.setUint32(4, crcFinal, true);
+          dv.setUint32(8, size, true);
+          dv.setUint32(12, size, true);
+          put(dd);
+          const ch = new Uint8Array(46 + nameBytes.length);
+          const cv = new DataView(ch.buffer);
+          cv.setUint32(0, 0x02014B50, true); cv.setUint16(4, 20, true); cv.setUint16(6, 20, true);
+          cv.setUint16(8, 0x0008, true); cv.setUint16(10, 0, true); cv.setUint16(12, 0, true); cv.setUint16(14, 0, true);
+          cv.setUint32(16, crcFinal, true); cv.setUint32(20, size, true); cv.setUint32(24, size, true);
+          cv.setUint16(28, nameBytes.length, true); cv.setUint32(42, localOffset, true);
+          ch.set(nameBytes, 46);
+          central.push(ch);
+        }
+        let cdSize = 0;
+        for (const c of central) { put(c); cdSize += c.length; }
+        const eocd = new Uint8Array(22);
+        const ev = new DataView(eocd.buffer);
+        ev.setUint32(0, 0x06054B50, true);
+        ev.setUint16(8, central.length, true); ev.setUint16(10, central.length, true);
+        ev.setUint32(12, cdSize, true); ev.setUint32(16, offset, true);
+        put(eocd);
+        controller.close();
+      } catch (e) {
+        try { controller.error(e); } catch (e2) {}
+      }
+    }
+  });
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': 'attachment; filename="' + encodeURIComponent(filename || 'files.zip') + '"',
+      'Cache-Control': 'private, no-store'
+    }
+  });
+}
+// 打包下载时的对象读取（单独抽出便于测试替换）
+async function buildZip(files) {
   const enc = new TextEncoder(); let offset = 0; const locals = []; const centrals = [];
   for (const f of files) {
     const nameBytes = enc.encode(f.name); const data = new Uint8Array(f.data); const crc = crc32(data);
@@ -3047,71 +5698,84 @@ function buildZip(files) {
   result.set(end, pos);
   return result.buffer;
 }
-async function handleZip(env, dirPath, sessionToken) {
-  dirPath = normPath(dirPath);
-  const prefix = dirPath.replace(/^\//, '');
+// 目录打包：流式输出（边读边写），上限只受"文件数/总量/时间"约束，不再受 Worker 内存限制
+async function collectZipFiles(env, dirPath, sessionToken, opts) {
+  opts = opts || {};
+  const maxFiles = opts.maxFiles || 2000;
+  const maxBytes = opts.maxBytes || 2 * 1024 * 1024 * 1024;
+  const dir = normPath(dirPath);
+  const prefix = dir.replace(/^\//, '');
   const locked = await unlockedPrefixes(env, sessionToken || '');
   const files = [];
-  let totalBytes = 0;
-  let cursor;
-  const MAX_FILES = 200;
-  const MAX_BYTES = 25 * 1024 * 1024;
-  let hitLimit = false;
-  const pending = [];
+  let totalBytes = 0, cursor, hitLimit = false;
   do {
-    const listed = await env.DRIVE.list({ prefix: prefix, limit: 500, cursor });
-    for (const obj of listed.objects) {
+    const listed = await env.DRIVE.list({ prefix, limit: 1000, cursor });
+    for (const obj of (listed.objects || [])) {
       const rel = obj.key.slice(prefix.length);
-      if (!rel || rel.startsWith('chunks/') || rel.startsWith('.trash/') || rel.startsWith(THUMB_PREFIX) || rel.startsWith(VERSIONS_PREFIX)) continue;
-      // 过滤掉被密码保护的子目录内容
+      if (!rel) continue;
+      if (obj.key.indexOf(CHUNKS_PREFIX) === 0 || obj.key.indexOf(BACKUP_PREFIX) === 0 || obj.key.indexOf(TRASH_PREFIX) === 0 || obj.key.indexOf(THUMB_PREFIX) === 0 || obj.key.indexOf(VERSIONS_PREFIX) === 0) continue;
       if (insideLocked('/' + obj.key, locked)) continue;
-      if (files.length + pending.length >= MAX_FILES || totalBytes >= MAX_BYTES) { hitLimit = true; break; }
-      totalBytes += obj.size;
-      pending.push(env.DRIVE.get(obj.key).then(o => o ? o.arrayBuffer().then(buf => ({ name: rel, data: buf })) : null));
-      if (pending.length >= 10) {
-        const done = await Promise.all(pending.splice(0));
-        for (const f of done) if (f) files.push(f);
-      }
+      if (files.length >= maxFiles || totalBytes + (obj.size || 0) > maxBytes) { hitLimit = true; break; }
+      totalBytes += obj.size || 0;
+      files.push({ key: obj.key, name: rel, size: obj.size || 0 });
     }
     if (hitLimit) break;
     cursor = listed.truncated ? listed.cursor : undefined;
   } while (cursor);
-  const done = await Promise.all(pending);
-  for (const f of done) if (f) files.push(f);
-  if (!files.length) return json({ error: 'Empty folder' }, 404);
-  if (hitLimit) return json({ error: 'Too large to zip (max 200 files, 25MB)' }, 413);
-  const zip = buildZip(files);
-  const folderName = dirPath.replace(/\/+$/, '').split('/').pop() || 'files';
-  return new Response(zip, { headers: { 'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="' + encodeURIComponent(folderName) + '.zip"' } });
+  return { files, totalBytes, hitLimit, dir };
 }
-// 多选打包下载：把选中的若干个文件打成一个 zip
+async function handleZip(env, dirPath, sessionToken) {
+  const r = await collectZipFiles(env, dirPath, sessionToken, {});
+  if (!r.files.length) return json({ error: 'Empty folder' }, 404);
+  if (r.hitLimit) return json({ error: 'Too large to zip (max 2000 files / 2GB)' }, 413);
+  const folderName = r.dir.replace(/\/+$/, '').split('/').pop() || 'files';
+  return streamZip(env, r.files, folderName + '.zip');
+}
+// 多选打包下载：把选中的若干个文件打成一个 zip（同样流式）
 async function handleZipPaths(env, paths) {
   const list = Array.isArray(paths) ? paths.filter(Boolean) : [];
   if (!list.length) return json({ error: 'No files' }, 400);
-  const MAX_FILES = 200, MAX_BYTES = 25 * 1024 * 1024;
+  const MAX_FILES = 2000, MAX_BYTES = 2 * 1024 * 1024 * 1024;
   const files = []; let totalBytes = 0, hitLimit = false;
   const used = {};
   for (const p of list) {
     if (files.length >= MAX_FILES || totalBytes >= MAX_BYTES) { hitLimit = true; break; }
     const key = String(p).replace(/^\/+/, '').replace(/\/+$/, '');
     if (!key) continue;
-    let obj = null;
-    try { obj = await env.DRIVE.get(key); } catch (e) {}
-    if (!obj) continue;
-    const size = obj.size || 0;
+    let head = null;
+    try { head = await env.DRIVE.head(key); } catch (e) {}
+    if (!head) continue;
+    const size = head.size || 0;
     if (totalBytes + size > MAX_BYTES) { hitLimit = true; break; }
     totalBytes += size;
     let name = key.split('/').pop() || 'file';
     if (used[name]) { used[name]++; name = used[name] + '_' + name; } else used[name] = 1;
-    try { files.push({ name, data: await obj.arrayBuffer() }); } catch (e) {}
+    files.push({ key, name, size });
   }
   if (!files.length) return json({ error: 'Empty' }, 404);
-  if (hitLimit) return json({ error: 'Too large to zip (max 200 files, 25MB)' }, 413);
-  const zip = buildZip(files);
-  return new Response(zip, { headers: { 'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="files.zip"' } });
+  if (hitLimit) return json({ error: 'Too large to zip (max 2000 files / 2GB)' }, 413);
+  return streamZip(env, files, 'files.zip');
+}
+// 分享目录打包下载（公开路由，走分享的权限校验）
+async function handleShareZip(env, req, shareToken, g) {
+  const d = g.data;
+  if (d.type !== 'dir') return json({ error: 'Not a folder share' }, 400);
+  if (d.allowDownload === false) return json({ error: 'Download disabled' }, 403);
+  const base = normPath(d.path);
+  const rel = new URL(req.url).searchParams.get('p') || '';
+  const dir = normPath(base + rel);
+  if (!dir.startsWith(base)) return json({ error: 'Forbidden' }, 403);
+  if (await isPathLocked(env, dir, '')) return json({ error: 'Locked' }, 423);
+  const r = await collectZipFiles(env, dir, '', { maxFiles: 500, maxBytes: 512 * 1024 * 1024 });
+  if (!r.files.length) return json({ error: 'Empty folder' }, 404);
+  if (r.hitLimit) return json({ error: 'Too large to zip (max 500 files / 512MB)' }, 413);
+  await shareCount(env, shareToken, d);   // 打包下载计入一次访问
+  const folderName = r.dir.replace(/\/+$/, '').split('/').pop() || 'files';
+  return streamZip(env, r.files, folderName + '.zip');
 }
 
 // ===== 远程 URL 抓取（离线下载）：带 SSRF 防护 =====
+const DNS_CACHE = new Map();   // host -> {t, blocked}，避免每条通知都做一次 DoH 查询
 function isBlockedHost(hostname) {
   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
   if (!h) return true;
@@ -3135,20 +5799,28 @@ async function resolveAndCheckHost(hostname) {
   if (!h) return true;
   if (isBlockedHost(h)) return true;
   if (/^[\d.]+$/.test(h) || h.indexOf(':') >= 0) return isBlockedHost(h);
+  // 结果缓存 5 分钟：notifyWebhook 每次通知都要校验，避免重复 DoH 查询与延迟
+  const now = Date.now();
+  const hit = DNS_CACHE.get(h);
+  if (hit && now - hit.t < 300000) return hit.blocked;
+  let blocked = false;
   try {
-    const dns = await fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(h) + '&type=A', { headers: { 'accept': 'application/dns-json' } });
-    if (!dns.ok) return false;
-    const dj = await dns.json();
-    const answers = (dj && dj.Answer) || [];
-    for (const a of answers) {
-      if (a && a.type === 1 && isBlockedHost(String(a.data))) return true;
+    const dns = await fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(h) + '&type=A', { headers: { accept: 'application/dns-json' } });
+    if (dns.ok) {
+      const dj = await dns.json();
+      const answers = (dj && dj.Answer) || [];
+      for (const a of answers) {
+        if (a && a.type === 1 && isBlockedHost(String(a.data))) { blocked = true; break; }
+      }
     }
-  } catch (e) {}
-  return false;
+  } catch (e) { return false; }   // 查询失败时不缓存，保持原有放行语义
+  if (DNS_CACHE.size > 500) DNS_CACHE.clear();
+  DNS_CACHE.set(h, { t: now, blocked });
+  return blocked;
 }
 // 手动跟随重定向，逐跳校验主机（防 SSRF）
 async function handleFetchUrl(req, env, b) {
-  if (env && env.DISABLE_URL_FETCH === '1') return json({ error: 'URL fetch disabled' }, 403);
+  if (cfgBool(env, 'DISABLE_URL_FETCH', 'disableUrlFetch', false)) return json({ error: 'URL fetch disabled' }, 403);
   const raw = String((b && b.url) || '').trim();
   if (!raw) return json({ error: 'No url' }, 400);
   let u;
@@ -3242,10 +5914,14 @@ async function instantStore(env, hash, name, dir, size) {
   const key = dir.replace(/^\//, '') + finalName;
   const mime = (obj.httpMetadata && obj.httpMetadata.contentType) || '';
   const sz = obj.size || size || 0;
+  if (pathTooLong('/' + key)) return { hit: false };
+  const room = await dirRoom(env, dir, 1);
+  if (room) return { hit: false };
   try {
     if (key !== idx.key) await putAndMirror(env, key, obj.body, { httpMetadata: obj.httpMetadata });
   } catch (e) { return { hit: false }; }
-  await upsertDirItem(env, dir, { name: finalName, type: 'file', size: sz, mime, time: new Date().toISOString(), hash, hasThumb: false });
+  const up = await upsertDirItem(env, dir, { name: finalName, type: 'file', size: sz, mime, time: new Date().toISOString(), hash, hasThumb: false });
+  if (up && up.ok === false) { try { if (key !== idx.key) await deleteAndMirror(env, key); } catch (e) {} return { hit: false }; }
   await addUsage(env, sz, 1);
   await addLog(env, 'up', dir + finalName, sz + ' bytes (instant)');
   return { hit: true, name: finalName, size: sz };
@@ -3258,16 +5934,19 @@ async function handleInstantCheck(env, b) {
   catch (e) { return json({ hit: false }); }
 }
 async function getAutoRule(env) {
-  try {
-    const r = await env.STORE.get('meta:autorule', 'json');
-    if (r && typeof r === 'object') return { enabled: !!r.enabled, mode: r.mode === 'type' ? 'type' : 'date', base: normPath(r.base || '/') };
-  } catch (e) {}
-  return { enabled: false, mode: 'date', base: '/' };
+  return await kvCached('meta:autorule', 30, async () => {
+    try {
+      const r = await env.STORE.get('meta:autorule', 'json');
+      if (r && typeof r === 'object') return { enabled: !!r.enabled, mode: r.mode === 'type' ? 'type' : 'date', base: normPath(r.base || '/') };
+    } catch (e) {}
+    return { enabled: false, mode: 'date', base: '/' };
+  });
 }
 async function handleGetAutoRule(env) { return json(await getAutoRule(env)); }
 async function handleSetAutoRule(env, b) {
   const rule = { enabled: !!(b && b.enabled), mode: (b && b.mode) === 'type' ? 'type' : 'date', base: normPath((b && b.base) || '/') };
   await env.STORE.put('meta:autorule', JSON.stringify(rule));
+  kvInvalidate('meta:autorule');
   return json({ ok: true, rule });
 }
 function archiveSubdir(mode, name, mime) {
@@ -3356,6 +6035,8 @@ async function handleUnzip(env, zipPath) {
   const parsed = parseZip(buf);
   if (parsed.error) return json({ error: parsed.error }, 400);
   if (!parsed.entries || !parsed.entries.length) return json({ error: '空 ZIP' }, 400);
+  // 反解压炸弹：限制条目数（此前同一段数据可被数万条目重复引用）
+  if (parsed.entries.length > UNZIP_MAX_ENTRIES) return json({ error: 'ZIP 条目过多（最多 ' + UNZIP_MAX_ENTRIES + ' 个）' }, 413);
 
   const parentDir = parentOf(zipPath);
   const zipName = key.split('/').pop();
@@ -3363,8 +6044,13 @@ async function handleUnzip(env, zipPath) {
   await ensureDir(env, parentDir, folderName);
   const targetDir = parentDir + folderName + '/';
 
+  const usage0 = await getUsage(env);
+  let usedNow = usage0.used || 0;
   let created = 0, totalSize = 0;
   for (const e of parsed.entries) {
+    // 总量与配额双重上限
+    if (e.size > UNZIP_MAX_OUT_BYTES || totalSize + e.size > UNZIP_MAX_OUT_BYTES) return json({ error: '解压总量过大（上限 ' + Math.round(UNZIP_MAX_OUT_BYTES / 1048576) + 'MB，已解出 ' + Math.round(totalSize / 1048576) + 'MB）' }, 413);
+    if (usedNow + e.size > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413);
     const cleanRel = normPath('/' + e.name).replace(/^\//, '');
     if (!cleanRel) continue;
     const relParts = cleanRel.split('/').filter(Boolean);
@@ -3380,8 +6066,15 @@ async function handleUnzip(env, zipPath) {
     await putAndMirror(env, targetKey, e.data, { httpMetadata: { contentType: 'application/octet-stream' } });
     const existing = await findDirItem(env, curDir, fname);
     if (!existing.item) {
-      await upsertDirItem(env, curDir, { name: fname, type: 'file', size: e.size, mime: '', time: new Date().toISOString() });
+      const up = await upsertDirItem(env, curDir, { name: fname, type: 'file', size: e.size, mime: '', time: new Date().toISOString() });
+      if (up && up.ok === false) return json({ error: up.error, limit: up.limit }, 507);
       await addUsage(env, e.size, 1);
+      usedNow += e.size;
+    } else if ((existing.item.size || 0) !== e.size) {
+      // 覆盖已有文件时同步修正记录大小，避免出现"大小与实际不符"的条目
+      await addUsage(env, e.size - (existing.item.size || 0), 0);
+      usedNow += e.size - (existing.item.size || 0);
+      await upsertDirItem(env, curDir, Object.assign({}, existing.item, { size: e.size, time: new Date().toISOString() }));
     }
     created++; totalSize += e.size;
   }
@@ -3391,8 +6084,8 @@ async function handleUnzip(env, zipPath) {
 // ===== Frontend (Apple Style, refined toolbar) =====
 function page(env) {
   const brand = {
-    title: env.DRIVE_TITLE || '云端网盘',
-    logo: env.DRIVE_LOGO || '☁️'
+    title: siteTitle(env),
+    logo: siteLogo(env)
   };
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
@@ -3402,7 +6095,7 @@ function page(env) {
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/icon.svg">
 <link rel="apple-touch-icon" href="/icon.svg">
-<title>${brand.title}</title>
+<title>${escHtml(brand.title)}</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js" defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" defer></script>
@@ -3762,6 +6455,156 @@ textarea{width:100%;min-height:340px;resize:vertical;
 
 .uplist{margin-bottom:14px}
 .uplist:empty{display:none}
+.upqbar{display:none;align-items:center;gap:8px;margin-bottom:8px;padding:8px 12px;background:var(--sys-card);border:.5px solid var(--sys-separator);border-radius:12px;font-size:12px;color:var(--sys-text-2);flex-wrap:wrap}
+.upqbar .upq-t{font-weight:600;color:var(--sys-text)}
+.upqbar .upq-l{display:flex;align-items:center;gap:4px}
+.upqbar select{padding:3px 6px;border-radius:7px;border:none;background:var(--sys-fill);color:var(--sys-text);font-size:12px}
+.upacts{display:flex;gap:2px;margin-left:6px}
+.upacts button{border:none;background:var(--sys-fill);color:var(--sys-text-2);border-radius:7px;width:24px;height:24px;font-size:12px;cursor:pointer;padding:0;line-height:1}
+.upacts button:hover{background:var(--sys-fill-2);color:var(--sys-blue)}
+.clipbar{display:none;align-items:center;gap:8px;margin-bottom:8px;padding:8px 12px;background:var(--sys-blue-soft);border:.5px solid var(--sys-blue);border-radius:12px;font-size:12px;color:var(--sys-text)}
+.upitem.paused{opacity:.75}
+
+/* 命令面板 */
+.palette{position:fixed;inset:0;z-index:1200;display:none;align-items:flex-start;justify-content:center;padding:12vh 16px 16px;background:rgba(0,0,0,.28);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.palette.show{display:flex}
+.palette-box{width:100%;max-width:620px;background:var(--sys-card-solid);border:.5px solid var(--sys-separator);border-radius:16px;box-shadow:0 24px 60px rgba(0,0,0,.32);overflow:hidden}
+.palette-box input{width:100%;padding:15px 18px;border:none;border-radius:0;background:transparent;font-size:16px;color:var(--sys-text);outline:none}
+.palette-list{max-height:52vh;overflow:auto;border-top:.5px solid var(--sys-separator)}
+.palette-item{display:flex;align-items:center;gap:10px;padding:10px 16px;font-size:14px;cursor:pointer;color:var(--sys-text)}
+.palette-item .pi-ic{width:22px;text-align:center}
+.palette-item .pi-sub{font-size:11.5px;color:var(--sys-text-3);margin-left:auto;font-family:ui-monospace,Menlo,monospace}
+.palette-item.active{background:var(--sys-blue-soft);color:var(--sys-blue)}
+.palette-foot{padding:8px 16px;font-size:11.5px;color:var(--sys-text-3);border-top:.5px solid var(--sys-separator)}
+
+/* 虚拟滚动容器 + 列视图 */
+.vscroll{max-height:calc(100vh - 340px);overflow:auto;contain:strict}
+.vscroll .file-list{margin:0}
+.col-table{width:100%;border-collapse:collapse;font-size:13.5px}
+.col-table th{position:sticky;top:0;background:var(--sys-card-solid);text-align:left;padding:8px 10px;font-size:12px;color:var(--sys-text-3);border-bottom:.5px solid var(--sys-separator);cursor:pointer;white-space:nowrap;z-index:2}
+.col-table th:hover{color:var(--sys-blue)}
+.col-table td{padding:7px 10px;border-bottom:.5px solid var(--sys-separator);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px}
+.col-table tr:hover td{background:var(--sys-fill)}
+.col-table tr.selected td{background:var(--sys-blue-soft)}
+
+/* 离线提示 */
+.offline-bar{padding:7px 16px;background:var(--sys-orange);color:#fff;font-size:12.5px;text-align:center}
+
+/* ===== 新布局：应用栏 / 侧栏导航 / 视图 / 仪表盘 ===== */
+.app-bar{position:sticky;top:0;z-index:700;display:flex;align-items:center;gap:10px;padding:10px 16px;
+  background:var(--sys-card);backdrop-filter:var(--sys-blur);-webkit-backdrop-filter:var(--sys-blur);
+  border-bottom:.5px solid var(--sys-separator)}
+.app-bar .brand{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+.appbar-main{display:flex;align-items:center;gap:8px;flex:1;min-width:0;position:relative}
+.appbar-main .search-box{flex:1;max-width:420px;transition:max-width .18s ease,opacity .18s ease}
+.appbar-main .search-box.collapsed{max-width:0;opacity:0;pointer-events:none;overflow:hidden;border:none;padding:0}
+.app-bar .hdr-right{display:flex;align-items:center;gap:8px;flex:0 0 auto;position:relative}
+.icon-btn{width:38px;height:38px;border-radius:12px;border:1px solid var(--sys-separator);background:var(--sys-fill);
+  color:var(--sys-text);font-size:17px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.icon-btn:hover{background:var(--sys-fill-2)}
+.btn.icon-only{min-width:40px;padding:9px 10px;font-size:16px}
+.menu-wrap{position:relative}
+.pop-menu{position:absolute;top:calc(100% + 8px);left:0;z-index:800;display:none;flex-direction:column;min-width:186px;padding:6px;
+  background:var(--sys-card-solid);border:.5px solid var(--sys-separator);border-radius:14px;box-shadow:0 18px 44px rgba(31,35,40,.22)}
+:root.dark .pop-menu{box-shadow:0 22px 54px rgba(0,0,0,.6)}
+.pop-menu.show{display:flex;animation:sheetUp .16s cubic-bezier(.4,0,.2,1)}
+.pop-menu .chip{justify-content:flex-start;width:100%}
+.side-nav{display:flex;flex-direction:column;gap:2px;margin-bottom:14px}
+.side-item{display:flex;align-items:center;gap:9px;width:100%;padding:8px 10px;border:none;border-radius:10px;
+  background:transparent;color:var(--sys-text);font-size:13.5px;font-weight:500;cursor:pointer;text-align:left}
+.side-item:hover{background:var(--sys-fill)}
+.side-item.active{background:var(--sys-blue-soft);color:var(--sys-blue);font-weight:600}
+.side-item .si-ic{width:18px;text-align:center}
+.side-foot{margin-top:auto;padding-top:12px;border-top:.5px solid var(--sys-separator);display:flex;flex-wrap:wrap;gap:6px}
+.side-mini{display:flex;align-items:center;gap:5px;padding:6px 9px;border:1px solid var(--sys-separator);border-radius:10px;
+  background:var(--sys-fill);color:var(--sys-text-2);font-size:12px;cursor:pointer}
+.side-mini:hover{color:var(--sys-text);background:var(--sys-fill-2)}
+.side-mini input[type=color]{width:18px;height:18px;padding:0;border:none;background:none;cursor:pointer}
+.sidebar{display:flex;flex-direction:column}
+.view{display:none}
+.view.active{display:block}
+/* 密度：紧凑 */
+:root[data-density="compact"] .side-item{padding:5px 9px;font-size:13px}
+:root[data-density="compact"] .file-list li{padding-top:5px;padding-bottom:5px}
+:root[data-density="compact"] .btn{padding:6px 12px;font-size:13px}
+:root[data-density="compact"] .gitem{font-size:11.5px}
+:root[data-density="compact"] .app-bar{padding:7px 14px}
+:root[data-density="cozy"] .side-item{padding:10px 11px;font-size:14px}
+/* 仪表盘 */
+.dash-loading{padding:40px;text-align:center;color:var(--sys-text-3)}
+.dash{display:grid;gap:14px;grid-template-columns:repeat(12,1fr)}
+.dash-card{grid-column:span 12;background:var(--sys-card);border:.5px solid var(--sys-separator);border-radius:18px;padding:16px;
+  backdrop-filter:var(--sys-blur);-webkit-backdrop-filter:var(--sys-blur);box-shadow:var(--sys-shadow-sm)}
+.dash-card h4{margin:0 0 12px;font-size:13px;color:var(--sys-text-2);font-weight:600;display:flex;align-items:center;gap:8px}
+.dash-card h4 .dash-more{margin-left:auto;font-size:12px;color:var(--sys-blue);cursor:pointer;background:none;border:none}
+.quick-zone{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.quick-zone .drop-mini{flex:1;min-width:220px;border:1.5px dashed var(--sys-separator-opaque);border-radius:14px;padding:14px;
+  text-align:center;color:var(--sys-text-3);font-size:13px;cursor:pointer}
+.quick-zone .drop-mini.over{border-color:var(--sys-blue);background:var(--sys-blue-soft);color:var(--sys-blue)}
+.ring-wrap{display:flex;align-items:center;gap:16px}
+.ring{width:104px;height:104px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;
+  background:conic-gradient(var(--sys-blue) calc(var(--p,0)*1%), var(--sys-fill-2) 0)}
+.ring>div{width:80px;height:80px;border-radius:50%;background:var(--sys-card-solid);display:flex;flex-direction:column;
+  align-items:center;justify-content:center;font-size:15px;font-weight:700}
+.ring>div small{font-size:10.5px;font-weight:500;color:var(--sys-text-3)}
+.stat-row{display:flex;gap:10px;flex-wrap:wrap}
+.stat{flex:1;min-width:104px;background:var(--sys-fill);border-radius:14px;padding:12px}
+.stat b{display:block;font-size:20px;font-weight:700;letter-spacing:-.02em}
+.stat span{font-size:11.5px;color:var(--sys-text-3)}
+.spark{display:flex;align-items:flex-end;gap:3px;height:38px;margin-top:10px}
+.spark i{flex:1;background:var(--sys-blue);border-radius:3px 3px 0 0;min-height:3px;opacity:.85}
+.recent-list{display:flex;flex-direction:column;gap:2px}
+.recent-item{display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:10px;cursor:pointer;font-size:13.5px}
+.recent-item:hover{background:var(--sys-fill)}
+.recent-item img{width:34px;height:34px;border-radius:8px;object-fit:cover;background:var(--sys-fill-2);flex:0 0 auto}
+.recent-item .ri-ic{width:34px;height:34px;border-radius:8px;background:var(--sys-fill-2);display:flex;align-items:center;justify-content:center;font-size:16px;flex:0 0 auto}
+.recent-item .ri-tx{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.recent-item .ri-sub{font-size:11px;color:var(--sys-text-3);font-family:ui-monospace,Menlo,monospace}
+.tag-cloud{display:flex;flex-wrap:wrap;gap:6px}
+.tag-cloud button{border:1px solid var(--sys-separator);background:var(--sys-fill);color:var(--sys-text);border-radius:999px;
+  padding:4px 11px;font-size:12.5px;cursor:pointer;display:flex;align-items:center;gap:6px}
+.tag-cloud button:hover{background:var(--sys-fill-2)}
+.tag-cloud .tc-dot{width:8px;height:8px;border-radius:50%}
+.topdir{display:flex;align-items:center;gap:10px;padding:6px 4px;font-size:13px;cursor:pointer;border-radius:10px}
+.topdir:hover{background:var(--sys-fill)}
+.topdir .td-bar{height:8px;border-radius:5px;background:var(--sys-blue);opacity:.75;min-width:4px}
+.topdir .td-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media (min-width:900px){
+  .dash .span-4{grid-column:span 4}
+  .dash .span-6{grid-column:span 6}
+  .dash .span-8{grid-column:span 8}
+  .dash .span-12{grid-column:span 12}
+}
+/* 行内操作：常显，长尾进 ⋯ */
+.row-actions .row-more-wrap{position:relative;display:inline-flex}
+.row-menu{position:absolute;top:calc(100% + 6px);right:0;z-index:600;display:none;flex-direction:column;min-width:150px;padding:5px;
+  background:var(--sys-card-solid);border:.5px solid var(--sys-separator);border-radius:12px;box-shadow:0 16px 38px rgba(31,35,40,.22)}
+.row-menu.show{display:flex}
+.row-menu .btn{justify-content:flex-start;width:100%;white-space:nowrap}
+/* 移动端选择模式操作栏 */
+.selbar{display:none;position:fixed;left:0;right:0;bottom:calc(58px + env(safe-area-inset-bottom));z-index:880;gap:6px;padding:8px 10px;
+  background:var(--sys-card-solid);border-top:.5px solid var(--sys-separator)}
+.selbar.show{display:flex;overflow-x:auto}
+@media (max-width:760px){
+  .app-bar{flex-wrap:wrap;gap:8px;padding:8px 10px}
+  .appbar-main{order:3;flex-basis:100%}
+  .appbar-main .search-box{max-width:none}
+  .sidebar{position:fixed;top:0;bottom:0;left:0;width:270px;z-index:950;transform:translateX(-102%);transition:transform .22s ease;
+    border-radius:0;overflow-y:auto}
+  .sidebar.show{transform:none}
+  .dash-card{padding:13px}
+}
+
+.tabbar{display:none;position:fixed;left:0;right:0;bottom:0;z-index:900;background:var(--sys-card-solid);border-top:.5px solid var(--sys-separator);padding:6px 4px calc(6px + env(safe-area-inset-bottom));backdrop-filter:var(--sys-blur);-webkit-backdrop-filter:var(--sys-blur)}
+.tabbar button{flex:1;background:transparent;border:none;color:var(--sys-text-2);font-size:11px;display:flex;flex-direction:column;align-items:center;gap:2px;padding:4px 0;cursor:pointer}
+.tabbar button .tb-ic{font-size:19px;line-height:1}
+.tabbar button.on{color:var(--sys-blue)}
+@media (max-width:760px){
+  .tabbar{display:flex}
+  .main{padding-bottom:74px}
+  .vscroll{max-height:calc(100vh - 420px)}
+  .toolbar-row.main{flex-wrap:wrap}
+}
 .upitem{display:flex;align-items:center;gap:12px;padding:11px 16px;background:var(--sys-card);
   border-radius:12px;margin-bottom:6px;font-size:13px;box-shadow:var(--sys-shadow-sm);
   backdrop-filter:var(--sys-blur);-webkit-backdrop-filter:var(--sys-blur);border:.5px solid var(--sys-separator)}
@@ -4060,7 +6903,9 @@ body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;ba
   .list-head .lh-r{text-align:right}
   .file-list li{display:grid;grid-template-columns:22px 24px minmax(120px,1fr) 26px 92px 76px 212px;align-items:center;gap:12px}
   .file-list .fsize,.file-list .fdate{text-align:right}
-  .row-actions .btn.extra{display:none}
+.row-actions .btn.extra{display:none}
+.row-actions .btn.alw{display:inline-flex}
+.row-menu .btn{display:inline-flex;justify-content:flex-start}
 }
 
 /* 网格 + 图库 */
@@ -4075,11 +6920,25 @@ body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;ba
 .gitem input[type=checkbox]{opacity:0;transition:opacity .15s}
 .gitem:hover input[type=checkbox],.gitem.selected input[type=checkbox]{opacity:1}
 
-/* 侧栏：默认隐藏，可切换为左栏 */
+/* 侧栏：桌面常驻（可折叠并记忆），移动端抽屉 */
 .sidebar{display:none;position:sticky;top:24px;width:248px;max-height:calc(100vh - 48px);overflow-y:auto;padding:14px;
   background:rgba(255,255,255,0.72);border:1px solid rgba(0,0,0,0.08);border-radius:16px;box-shadow:var(--sys-shadow-md)}
 :root.dark .sidebar{background:rgba(22,27,34,0.66);border-color:rgba(255,255,255,0.10)}
 .sidebar.show{display:block}
+@media (min-width:761px){
+  .sidebar{display:flex;flex-direction:column}
+  .layout.sidebar-hidden .sidebar{display:none}
+  .only-mobile{display:none!important}
+}
+/* 移动端：选择模式 + 底部操作栏 */
+@media (max-width:760px){
+  .file-list li [data-chk],.gitem input[type=checkbox]{display:none}
+  body.selmode .file-list li [data-chk],body.selmode .gitem input[type=checkbox]{display:inline-block;opacity:1}
+  .batch-bar.show{display:flex;position:fixed;left:0;right:0;bottom:calc(58px + env(safe-area-inset-bottom));z-index:870;
+    flex-wrap:nowrap;overflow-x:auto;gap:6px;margin:0;border-radius:0;padding:8px 10px}
+  .batch-bar .btn{white-space:nowrap}
+  .row-actions .row-more-wrap .row-menu{right:auto;left:0}
+}
 .sidebar-toggle{display:inline-flex}
 .tree-item{padding:8px 10px;font-size:14px;border-radius:10px}
 .tree-item:hover{background:var(--sys-fill)}
@@ -4164,95 +7023,149 @@ body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;ba
 </style></head><body>
 <div class="wrap">
 <div id="loginPage">
-<div class="login-logo">${brand.logo}</div>
-<div class="login-title">${brand.title}</div>
+<div class="login-logo">${escHtml(brand.logo)}</div>
+<div class="login-title">${escHtml(brand.title)}</div>
 <div class="login-sub">安全 · 私密 · 快速</div>
 <div class="login-card">
 <div class="row"><input id="pw" type="password" placeholder="输入访问密码" style="flex:1" autocomplete="current-password"><button id="btnLogin" class="btn">登录</button></div>
+<div class="row hidden" id="totpRow" style="margin-top:8px"><input id="totpCode" inputmode="numeric" autocomplete="one-time-code" placeholder="动态码 / 备用码" style="flex:1"></div>
 <div class="login-err" id="loginErr">密码错误，请重试</div>
 </div>
 <div class="ver login-ver">${APP_VERSION}</div>
 </div>
 <div id="mainPage">
-<div class="page-header">
-<div class="brand"><span class="brand-logo">${brand.logo}</span><span class="brand-title">${brand.title}</span></div>
-<div class="hdr-right">
-<button id="btnTheme" class="btn gray" title="切换主题">🌗</button>
-<button id="btnSidebar" class="btn gray sidebar-toggle">☰</button>
-<button id="btnLang" class="btn gray">EN</button>
-<button id="btnView" class="btn gray">网格</button>
-<button id="btnLogout" class="btn gray">退出</button>
-</div>
-</div>
-<div class="layout">
-<div class="card sidebar" id="sidebar"><div class="s-title">目录</div><div id="treeBox"></div><div class="tag-section" id="tagSection"><div class="s-title">标签</div><div id="tagBox"></div></div></div>
-<div class="main">
-
-<div class="card toolbar-card">
-  <div class="toolbar-row main">
+<div id="offlineBar" class="offline-bar" style="display:none"></div>
+<header class="app-bar">
+  <button id="btnSidebar" class="icon-btn sidebar-toggle" title="侧栏">☰</button>
+  <div class="brand"><span class="brand-logo">${escHtml(brand.logo)}</span><span class="brand-title">${escHtml(brand.title)}</span></div>
+  <div class="appbar-main">
     <button id="btnUp" class="btn primary">上传文件</button>
-    <div class="input-group">
+    <div class="menu-wrap">
+      <button id="btnNew" class="btn gray" title="新建">＋</button>
+      <div class="pop-menu" id="newMenu">
+        <button class="chip" data-new="file">⬆ 上传文件</button>
+        <button class="chip" data-new="files">🗂 上传文件夹</button>
+        <button class="chip" data-new="dir">📁 新建文件夹</button>
+        <button class="chip" data-new="text">📝 新建文本</button>
+        <button class="chip" data-new="folder-pw">🔒 目录密码</button>
+      </div>
+    </div>
+    <div class="input-group" id="folderInputWrap" style="display:none">
       <input id="folderInput" placeholder="文件夹名">
       <button id="btnMk" class="input-addon" title="新建文件夹">＋</button>
     </div>
-    <div class="search-box">
+    <button id="btnSearchToggle" class="icon-btn" title="搜索 (⌘F)">🔍</button>
+    <button id="btnSelect" class="icon-btn only-mobile" title="选择">☑</button>
+    <div class="search-box collapsed" id="searchWrap">
       <input id="searchInput" placeholder="搜索文件...">
       <button id="btnSearch">搜索</button>
     </div>
+  </div>
+  <div class="hdr-right">
+    <button id="btnPalette" class="btn gray" title="命令面板 (⌘K / Ctrl+K)">⌘K</button>
+    <button id="btnView" class="btn gray icon-only" title="切换视图">▦</button>
     <button id="btnMore" class="btn" title="更多功能" aria-haspopup="true" aria-expanded="false">⋯</button>
     <div class="hdr-menu" id="hdrMenu">
-      <div class="mgroup"><div class="mlabel" data-l="browse">浏览</div>
+      <div class="mgroup"><div class="mlabel" data-l="views">页面</div>
         <button id="btnFav" class="chip">★ 收藏</button>
         <button id="btnRecent" class="chip">🕐 最近</button>
         <button id="btnTag" class="chip">🏷 标签</button>
+        <button id="btnTrash" class="chip">🗑 回收站</button>
+        <button id="btnAlbums" class="chip">🖼 公开相册</button>
+      </div>
+      <div class="mgroup"><div class="mlabel" data-l="organize">整理</div>
+        <button id="btnQuery" class="chip">🔎 高级筛选</button>
+        <button id="btnSimilar" class="chip">🖼 相似图片</button>
+        <button id="btnImgTools" class="chip">🖌 图片处理</button>
+        <button id="btnDup" class="chip">📋 重复文件</button>
+        <button id="btnFavGroups" class="chip">★ 收藏分组</button>
+        <button id="btnMeta" class="chip">🏷 元数据导出/导入</button>
       </div>
       <div class="mgroup"><div class="mlabel" data-l="actions">操作</div>
         <button id="btnZip" class="chip">📦 打包当前目录</button>
         <button id="btnShareDir" class="chip">📁 分享当前目录</button>
         <button id="btnFetchUrl" class="chip">⬇ 抓取链接</button>
+        <button id="btnImport" class="chip">📥 从 WebDAV 导入</button>
         <button id="btnAutoRule" class="chip">🗂 自动归档</button>
+        <button id="btnComp" class="chip" onclick="window.toggleCompress&&window.toggleCompress(this)">🗜 压缩</button>
+        <button id="btnLock" class="chip">🔒 目录密码</button>
+      </div>
+      <div class="mgroup"><div class="mlabel" data-l="links">链接</div>
+        <button id="btnShareMgmt" class="chip">🔗 分享管理</button>
+        <button id="btnULinkMgmt" class="chip">📤 上传链接管理</button>
         <button id="btnULink" class="chip">🔗 传链</button>
         <button id="btnEnc" class="chip">🔐 加密</button>
-        <button id="btnComp" class="chip" onclick="window.toggleCompress&&window.toggleCompress(this)">🗜 压缩</button>
-        <button id="btnLock" class="chip">🔒 密码</button>
-        <button id="btnTrash" class="chip">🗑 回收站</button>
       </div>
       <div class="mgroup"><div class="mlabel" data-l="data">数据</div>
         <button id="btnStats" class="chip">📊 统计</button>
         <button id="btnLog" class="chip">📋 日志</button>
         <button id="btnDlStats" class="chip">📥 下载明细</button>
-        <button id="btnDup" class="chip">📋 重复</button>
-      </div>
-      <div class="mgroup"><div class="mlabel" data-l="links">链接</div>
-        <button id="btnShareMgmt" class="chip">🔗 分享管理</button>
-        <button id="btnULinkMgmt" class="chip">📤 上传链接</button>
-      </div>
-      <div class="mgroup"><div class="mlabel" data-l="system">系统</div>
-        <button id="btnBackends" class="chip">☁️ 存储后端</button>
-        <button id="btnWebDAV" class="chip">🌐 WebDAV</button>
-        <button id="btnTokens" class="chip">🔑 令牌</button>
-        <button id="btnAdminPass" class="chip">🔐 改密码</button>
-        <button id="btnClearPend" class="chip">🧹 清除断点记录</button>
-        <button id="btnSessions" class="chip">🖥 登录设备</button>
         <button id="btnBackup" class="chip">💾 备份与恢复</button>
         <button id="btnHealth" class="chip">🩺 健康检查</button>
         <button id="btnOrphans" class="chip">🧹 孤儿扫描</button>
+      </div>
+      <div class="mgroup"><div class="mlabel" data-l="system">系统</div>
+        <button id="btnOps" class="chip">🛠 运维与配置</button>
+        <button id="btnTotp" class="chip">🛡 二次验证</button>
+        <button id="btnTokens" class="chip">🔑 访问令牌</button>
+        <button id="btnSessions" class="chip">🖥 登录设备</button>
+        <button id="btnAdminPass" class="chip">🔐 改密码</button>
+        <button id="btnBackends" class="chip">☁️ 存储后端</button>
+        <button id="btnWebDAV" class="chip">🌐 WebDAV</button>
         <button id="btnWebhook" class="chip">🔔 通知</button>
         <button id="btnApi" class="chip">⚡ 上传接口</button>
-        <button id="btnAlbums" class="chip">🖼 公开相册</button>
+        <button id="btnClearPend" class="chip">🧹 清除断点记录</button>
+      </div>
+      <div class="mgroup"><div class="mlabel" data-l="appearance">外观</div>
+        <button id="btnTheme" class="chip">🌗 切换主题</button>
+        <button id="btnLang" class="chip">🌐 English</button>
+        <button id="btnLogout" class="chip">🚪 退出登录</button>
       </div>
     </div>
   </div>
+</header>
+<div class="upqbar" id="upQueueBar" style="display:none"></div>
+<div class="clipbar" id="clipBar" style="display:none"></div>
+<div class="uplist" id="upList"></div>
+<div class="layout">
+<aside class="card sidebar" id="sidebar">
+  <nav class="side-nav" id="sideNav">
+    <button class="side-item" data-nav="home"><span class="si-ic">🏠</span><span class="si-tx" data-l="home">首页</span></button>
+    <button class="side-item" data-nav="files"><span class="si-ic">📁</span><span class="si-tx" data-l="allFiles">全部文件</span></button>
+    <button class="side-item" data-nav="fav"><span class="si-ic">★</span><span class="si-tx" data-l="favs">收藏</span></button>
+    <button class="side-item" data-nav="recent"><span class="si-ic">🕐</span><span class="si-tx" data-l="recents">最近</span></button>
+    <button class="side-item" data-nav="albums"><span class="si-ic">🖼</span><span class="si-tx" data-l="albums">相册</span></button>
+    <button class="side-item" data-nav="trash"><span class="si-ic">🗑</span><span class="si-tx" data-l="trash">回收站</span></button>
+    <button class="side-item" data-nav="upload"><span class="si-ic">📤</span><span class="si-tx" data-l="uploadLinks">上传链接</span></button>
+  </nav>
+  <div class="s-title" data-l="tree">目录</div><div id="treeBox"></div>
+  <div class="tag-section" id="tagSection"><div class="s-title" data-l="tags">标签</div><div id="tagBox"></div></div>
+  <div class="side-foot">
+    <button id="footTheme" class="side-mini">🌗 <span data-l="theme">主题</span></button>
+    <button id="footDensity" class="side-mini">📐 <span data-l="density">密度</span></button>
+    <label class="side-mini" title="主题色"><input type="color" id="footAccent" value="#0a84ff"><span data-l="accent">主题色</span></label>
+    <button id="footLang" class="side-mini">🌐 <span data-l="language">语言</span></button>
+    <button id="footLogout" class="side-mini">🚪 <span data-l="logout">退出</span></button>
+  </div>
+</aside>
+<div class="main">
+
+<section class="view" id="viewHome">
+  <div id="dashWrap"><div class="dash-loading">加载概览…</div></div>
+</section>
+
+<section class="view" id="viewFiles">
+<div class="card toolbar-card">
   <div id="dropZone">
     <span class="drop-icon">⬇</span>
     <span>拖拽文件 / 文件夹到此处，或点击上传</span>
   </div>
 </div>
 
-<div class="uplist" id="upList"></div>
-<div class="batch-bar" id="batchBar"><span id="batchCount"></span><button id="batchDel" class="btn danger small">批量删除</button><button id="batchDl" class="btn gray small">批量下载</button><button id="batchZip" class="btn gray small">打包下载</button><button id="batchShare" class="btn gray small">批量分享</button><button id="batchMv" class="btn gray small">移动</button><button id="batchRen" class="btn gray small">重命名</button><button id="batchClr" class="btn gray small">取消</button></div>
-<div class="card flat"><div class="bc"><span class="bc-path" id="bcPath"></span><div class="sort-wrap"><span class="sort-label" data-l="sort">排序</span><div class="sort-group"><button class="sort-btn" data-s="name">名称</button><button class="sort-btn" data-s="size">大小</button><button class="sort-btn" data-s="time">日期</button></div></div></div><div class="filter-bar" id="filterBar"><div class="chip-group"><span class="chip-label" data-l="type">类型</span><button class="fchip active" data-ft="">全部</button><button class="fchip" data-ft="image">图片</button><button class="fchip" data-ft="video">视频</button><button class="fchip" data-ft="audio">音频</button><button class="fchip" data-ft="doc">文档</button><button class="fchip" data-ft="zip">压缩包</button><button class="fchip" data-ft="other">其他</button></div><span class="chip-sep"></span><div class="chip-group"><span class="chip-label" data-l="time">时间</span><button class="fchip active" data-fa="">全部</button><button class="fchip" data-fa="today">今天</button><button class="fchip" data-fa="7">7 天</button><button class="fchip" data-fa="30">30 天</button></div></div><div id="fileList"></div></div>
-<div class="usage"><div class="ulabel"><span id="uUsed">...</span><span class="ver">${APP_VERSION}</span><span style="display:flex;gap:8px;align-items:center"><span id="uFiles"></span><button id="btnRecalc" class="btn gray tiny" title="重新统计">↻</button></span></div><div class="ubar"><div class="ufill" id="uFill" style="width:0%"></div></div></div>
+<div class="batch-bar" id="batchBar"><span id="batchCount"></span><button id="batchCopy" class="btn gray small">复制</button><button id="batchCut" class="btn gray small">剪切</button><button id="batchDel" class="btn danger small">批量删除</button><button id="batchDl" class="btn gray small">批量下载</button><button id="batchZip" class="btn gray small">打包下载</button><button id="batchShare" class="btn gray small">批量分享</button><button id="batchMv" class="btn gray small">移动</button><button id="batchRen" class="btn gray small">重命名</button><button id="batchClr" class="btn gray small">取消</button></div>
+<div class="card flat"><div class="bc"><span class="bc-path" id="bcPath"></span><div class="sort-wrap"><span class="sort-label" data-l="sort">排序</span><div class="sort-group"><button class="sort-btn" data-s="name">名称</button><button class="sort-btn" data-s="size">大小</button><button class="sort-btn" data-s="time">日期</button></div></div></div><div class="filter-bar" id="filterBar"><div class="chip-group"><span class="chip-label" data-l="type">类型</span><button class="fchip active" data-ft="">全部</button><button class="fchip" data-ft="image">图片</button><button class="fchip" data-ft="video">视频</button><button class="fchip" data-ft="audio">音频</button><button class="fchip" data-ft="doc">文档</button><button class="fchip" data-ft="zip">压缩包</button><button class="fchip" data-ft="other">其他</button></div><span class="chip-sep"></span><div class="chip-group"><span class="chip-label" data-l="time">时间</span><button class="fchip active" data-fa="">全部</button><button class="fchip" data-fa="today">今天</button><button class="fchip" data-fa="7">7 天</button><button class="fchip" data-fa="30">30 天</button></div></div><div id="fileList"></div></div><div class="usage"><div class="ulabel"><span id="uUsed">...</span><span class="ver">${APP_VERSION}</span><span style="display:flex;gap:8px;align-items:center"><span id="uFiles"></span><button id="btnRecalc" class="btn gray tiny" title="重新统计">↻</button></span></div><div class="ubar"><div class="ufill" id="uFill" style="width:0%"></div></div></div>
+</section>
+
 </div>
 </div>
 </div>
@@ -4267,6 +7180,18 @@ body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;ba
 <div class="modal-bg" id="webdavModal"><div class="modal" style="min-width:400px;max-width:520px"><button class="mclose" id="webdavClose">✕</button><h3>WebDAV</h3><div id="webdavContent"></div></div></div>
 <div class="modal-bg" id="brModal"><div class="modal" style="min-width:400px;max-width:560px"><button class="mclose" id="brClose">✕</button><h3>批量重命名</h3><div id="brContent"></div></div></div>
 <div class="modal-bg" id="tagModal"><div class="modal" style="min-width:360px;max-width:500px"><button class="mclose" id="tagClose">✕</button><h3 id="tagTitle">管理标签</h3><div id="tagContent"></div></div></div>
+<div class="palette" id="palette"><div class="palette-box">
+  <input id="paletteInput" placeholder="输入命令或文件名…（↑↓ 选择，Enter 执行，Esc 关闭）" autocomplete="off">
+  <div class="palette-list" id="paletteList"></div>
+  <div class="palette-foot" id="paletteFoot">⌘K / Ctrl+K 打开 · 支持命令与文件搜索</div>
+</div></div>
+<div class="tabbar" id="tabBar">
+  <button data-tb="home"><span class="tb-ic">🏠</span>首页</button>
+  <button data-tb="files"><span class="tb-ic">📁</span>文件</button>
+  <button data-tb="fav"><span class="tb-ic">★</span>收藏</button>
+  <button data-tb="recent"><span class="tb-ic">🕐</span>最近</button>
+  <button data-tb="more"><span class="tb-ic">☰</span>我的</button>
+</div>
 <div class="modal-bg" id="noteModal"><div class="modal" style="min-width:360px;max-width:500px"><button class="mclose" id="noteClose">✕</button><h3 id="noteTitle">文件备注</h3><div id="noteContent"></div></div></div>
 <div class="modal-bg" id="dupModal"><div class="modal" style="min-width:400px;max-width:640px"><button class="mclose" id="dupClose">✕</button><h3 id="dupTitle">重复文件</h3><div id="dupContent"></div></div></div>
 <div class="modal-bg" id="encModal"><div class="modal" style="min-width:360px;max-width:480px"><button class="mclose" id="encClose">✕</button><h3 id="encTitle">AES 加密</h3><div id="encContent"></div></div></div>
@@ -4292,10 +7217,17 @@ var currentItems=[];
 var previewIdx=-1;
 var uploadQueue=0;
 var CHUNK_SIZE=5*1024*1024;
-var T={zh:{upload:'上传',folder:'文件夹名',search:'搜索文件...',go:'搜索',fav:'收藏',recent:'最近',zip:'打包',ulink:'传链',lock:'密码',trash:'回收站',view:'网格',viewList:'列表',logout:'退出',home:'首页',empty:'此文件夹为空',noResult:'无结果',del:'删除',ren:'改名',move:'移动',share:'分享',download:'下载',edit:'编辑',rename:'重命名为:',delete:'确定删除？',batchDel:'批量删除',batchDl:'批量下载',clear:'取消',sort:'排序',drop:'拖拽文件 / 文件夹到此处，或点击上传',trashEmpty:'回收站为空',restore:'恢复',purge:'彻底删除',emptyTrash:'清空回收站',moveTo:'移动到...',save:'保存',saved:'已保存',days:'有效天数:',link:'分享链接（复制）：',used:'已用',files:'个文件',maxAcc:'最大访问次数(0=不限):',maxUp:'最大上传数(0=不限):',setPw:'设置密码(留空取消):',pwSet:'密码已设置',pwRm:'密码已移除',title:'云端网盘',sidebar:'目录',locked:'该文件夹已加密',enterPw:'请输入文件夹密码:',wrongPw:'密码错误',upDone:'完成',upFail:'失败',upLocked:'已锁',sharePw:'分享密码(留空则不设):',unzip:'解压',unzipping:'解压中...',unzipDone:'解压完成',history:'历史版本',restoreV:'恢复此版本',noVers:'无历史版本',confirmRestore:'确定用此版本覆盖当前文件？',daysLeft:'天后过期',batchRestore:'批量恢复',batchPurge:'批量彻底删除',tag:'标签',tags:'标签管理',addTag:'添加标签',tagColor:'颜色',noTags:'暂无标签',dup:'重复',duplicates:'重复文件',noDup:'无重复文件',enc:'加密',encrypt:'加密文件',decrypt:'解密文件',encPw:'加密密码:',encDone:'加密完成',encFail:'加密失败',decDone:'解密完成',note:'备注',noteSaved:'备注已保存',paste:'粘贴上传',shortcuts:'快捷键',renderMd:'渲染',raw:'原文',stats:'统计',log:'日志',tokens:'令牌',webdav:'WebDAV',brRen:'批量重命名',brPattern:'替换规则 (支持 {n} 序号, {d} 日期):',brPreview:'预览',slideshow:'幻灯片',screenshot:'截图',qrCode:'二维码'},en:{upload:'Upload',folder:'Folder',search:'Search...',go:'Go',fav:'Fav',recent:'Recent',zip:'ZIP',ulink:'ULink',lock:'Lock',trash:'Trash',view:'Grid',viewList:'List',logout:'Out',home:'Home',empty:'Empty folder',noResult:'No results',del:'Del',ren:'Ren',move:'Move',share:'Share',download:'Download',edit:'Edit',rename:'Rename:',delete:'Delete?',batchDel:'Del All',batchDl:'Download',clear:'Clear',sort:'Sort',drop:'Drop files or folder here, or click to upload',trashEmpty:'Empty',restore:'Restore',purge:'Del',emptyTrash:'Empty All',moveTo:'Move to...',save:'Save',saved:'Saved',days:'Days:',link:'Link:',used:'Used',files:'files',maxAcc:'Max accesses (0=unlimited):',maxUp:'Max uploads (0=unlimited):',setPw:'Set password (empty to remove):',pwSet:'Password set',pwRm:'Password removed',title:'Cloud Drive',sidebar:'Folders',locked:'Folder is locked',enterPw:'Enter folder password:',wrongPw:'Wrong password',upDone:'Done',upFail:'Fail',upLocked:'Locked',sharePw:'Share password (empty=none):',unzip:'Unzip',unzipping:'Unzipping...',unzipDone:'Unzipped',history:'History',restoreV:'Restore',noVers:'No versions',confirmRestore:'Overwrite current file with this version?',daysLeft:'days left',batchRestore:'Restore All',batchPurge:'Delete All',tag:'Tag',tags:'Tags',addTag:'Add tag',tagColor:'Color',noTags:'No tags',dup:'Dups',duplicates:'Duplicates',noDup:'No duplicates',enc:'Encrypt',encrypt:'Encrypt',decrypt:'Decrypt',encPw:'Password:',encDone:'Encrypted',encFail:'Encrypt failed',decDone:'Decrypted',note:'Note',noteSaved:'Note saved',paste:'Paste upload',shortcuts:'Shortcuts',renderMd:'Render',raw:'Source',stats:'Stats',log:'Log',tokens:'Tokens',webdav:'WebDAV',brRen:'Rename',brPattern:'Pattern ({n}=index, {d}=date):',brPreview:'Preview',slideshow:'Slideshow',screenshot:'Snap',qrCode:'QR'}};
+var T={zh:{upload:'上传',folder:'文件夹名',search:'搜索文件...',go:'搜索',fav:'收藏',recent:'最近',zip:'打包',ulink:'传链',lock:'密码',trash:'回收站',view:'网格',viewList:'列表',logout:'退出',home:'首页',empty:'此文件夹为空',noResult:'无结果',del:'删除',ren:'改名',move:'移动',share:'分享',download:'下载',edit:'编辑',rename:'重命名为:',delete:'确定删除？',batchDel:'批量删除',batchDl:'批量下载',clear:'取消',sort:'排序',drop:'拖拽文件 / 文件夹到此处，或点击上传',trashEmpty:'回收站为空',restore:'恢复',purge:'彻底删除',emptyTrash:'清空回收站',moveTo:'移动到...',save:'保存',saved:'已保存',days:'有效天数:',link:'分享链接（复制）：',used:'已用',files:'个文件',maxAcc:'最大访问次数(0=不限):',maxUp:'最大上传数(0=不限):',setPw:'设置密码(留空取消):',pwSet:'密码已设置',pwRm:'密码已移除',title:'云端网盘',sidebar:'目录',locked:'该文件夹已加密',enterPw:'请输入文件夹密码:',wrongPw:'密码错误',upDone:'完成',upFail:'失败',upLocked:'已锁',sharePw:'分享密码(留空则不设):',unzip:'解压',unzipping:'解压中...',unzipDone:'解压完成',history:'历史版本',restoreV:'恢复此版本',noVers:'无历史版本',confirmRestore:'确定用此版本覆盖当前文件？',daysLeft:'天后过期',batchRestore:'批量恢复',batchPurge:'批量彻底删除',tag:'标签',tags:'标签管理',addTag:'添加标签',tagColor:'颜色',noTags:'暂无标签',dup:'重复',duplicates:'重复文件',noDup:'无重复文件',enc:'加密',encrypt:'加密文件',decrypt:'解密文件',encPw:'加密密码:',encDone:'加密完成',encFail:'加密失败',decDone:'解密完成',note:'备注',noteSaved:'备注已保存',paste:'粘贴上传',shortcuts:'快捷键',renderMd:'渲染',raw:'原文',stats:'统计',log:'日志',tokens:'令牌',webdav:'WebDAV',brRen:'批量重命名',brPattern:'替换规则 (支持 {n} 序号, {d} 日期):',brPreview:'预览',slideshow:'幻灯片',screenshot:'截图',qrCode:'二维码',upQueue:'上传队列',pause:'暂停',resume:'继续',retry:'重试',cancel:'取消',conc:'并发',clearDone:'清除已完成',pauseAll:'全部暂停',resumeAll:'全部继续',copy:'复制',cut:'剪切',pasteHere:'粘贴到此处',clipEmpty:'剪贴板为空',pasteDone:'已粘贴',resumeTitle:'未完成的分片上传（重新选择同名文件即可续传）',pendHint:'重新选择同名文件',clearPend:'清除记录'},en:{upload:'Upload',folder:'Folder',search:'Search...',go:'Go',fav:'Fav',recent:'Recent',zip:'ZIP',ulink:'ULink',lock:'Lock',trash:'Trash',view:'Grid',viewList:'List',logout:'Out',home:'Home',empty:'Empty folder',noResult:'No results',del:'Del',ren:'Ren',move:'Move',share:'Share',download:'Download',edit:'Edit',rename:'Rename:',delete:'Delete?',batchDel:'Del All',batchDl:'Download',clear:'Clear',sort:'Sort',drop:'Drop files or folder here, or click to upload',trashEmpty:'Empty',restore:'Restore',purge:'Del',emptyTrash:'Empty All',moveTo:'Move to...',save:'Save',saved:'Saved',days:'Days:',link:'Link:',used:'Used',files:'files',maxAcc:'Max accesses (0=unlimited):',maxUp:'Max uploads (0=unlimited):',setPw:'Set password (empty to remove):',pwSet:'Password set',pwRm:'Password removed',title:'Cloud Drive',sidebar:'Folders',locked:'Folder is locked',enterPw:'Enter folder password:',wrongPw:'Wrong password',upDone:'Done',upFail:'Fail',upLocked:'Locked',sharePw:'Share password (empty=none):',unzip:'Unzip',unzipping:'Unzipping...',unzipDone:'Unzipped',history:'History',restoreV:'Restore',noVers:'No versions',confirmRestore:'Overwrite current file with this version?',daysLeft:'days left',batchRestore:'Restore All',batchPurge:'Delete All',tag:'Tag',tags:'Tags',addTag:'Add tag',tagColor:'Color',noTags:'No tags',dup:'Dups',duplicates:'Duplicates',noDup:'No duplicates',enc:'Encrypt',encrypt:'Encrypt',decrypt:'Decrypt',encPw:'Password:',encDone:'Encrypted',encFail:'Encrypt failed',decDone:'Decrypted',note:'Note',noteSaved:'Note saved',paste:'Paste upload',shortcuts:'Shortcuts',renderMd:'Render',raw:'Source',stats:'Stats',log:'Log',tokens:'Tokens',webdav:'WebDAV',brRen:'Rename',brPattern:'Pattern ({n}=index, {d}=date):',brPreview:'Preview',slideshow:'Slideshow',screenshot:'Snap',qrCode:'QR',upQueue:'Queue',pause:'Pause',resume:'Resume',retry:'Retry',cancel:'Cancel',conc:'Concurrency',clearDone:'Clear done',pauseAll:'Pause all',resumeAll:'Resume all',copy:'Copy',cut:'Cut',pasteHere:'Paste here',clipEmpty:'Clipboard empty',pasteDone:'Pasted',resumeTitle:'Unfinished chunked uploads (re-select the same file to resume)',pendHint:'re-select the same file',clearPend:'Clear records'}};
 function t(k){return(T[lang]&&T[lang][k])||k}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function safeColor(c){c=String(c==null?'':c).trim();return /^#[0-9a-fA-F]{3,8}$/.test(c)?c:'#0a84ff'}
 function show(id){document.getElementById('loginPage').style.display=id==='login'?'flex':'none';document.getElementById('mainPage').style.display=id==='main'?'block':'none'}
+// 登录页：若服务端启用了二次验证，直接展示动态码输入框
+(function(){
+  fetch('/api/version',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+    if(d&&d.totp){var row=document.getElementById('totpRow');if(row)row.classList.remove('hidden')}
+  }).catch(function(){});
+})();
 function fmt(b){if(!b||b===0)return'0 B';var u=['B','KB','MB','GB'];var i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(1)+' '+u[i]}
 function getIcon(it){if(it.type==='dir')return'📁';var e=(it.name||'').split('.').pop().toLowerCase();var m={jpg:'🖼️',jpeg:'🖼️',png:'🖼️',gif:'🖼️',webp:'🖼️',heic:'🖼️',mp4:'🎬',mov:'🎬',mp3:'🎵',wav:'🎵',zip:'📦',pdf:'📄',txt:'📝',md:'📝',doc:'📄',docx:'📄',xls:'📊',xlsx:'📊',ppt:'📽️',pptx:'📽️'};return m[e]||'📄'}
 function isImage(it){return(it.mime||'').indexOf('image/')===0}
@@ -4339,9 +7271,9 @@ function matchFilter(it){
     if(filterType==='image')ok=m.indexOf('image/')===0;
     else if(filterType==='video')ok=m.indexOf('video/')===0;
     else if(filterType==='audio')ok=m.indexOf('audio/')===0;
-    else if(filterType==='doc')ok=m.indexOf('text/')===0||m.indexOf('json')>=0||/\.(md|txt|log|csv|docx?|xlsx?|pptx?|pdf)$/.test(n);
-    else if(filterType==='zip')ok=m.indexOf('zip')>=0||/\.(zip|rar|7z|tar|gz)$/.test(n);
-    else if(filterType==='other')ok=!(m.indexOf('image/')===0||m.indexOf('video/')===0||m.indexOf('audio/')===0||m.indexOf('text/')===0||m.indexOf('json')>=0||/\.(md|txt|log|csv|docx?|xlsx?|pptx?|pdf|zip|rar|7z|tar|gz)$/.test(n));
+    else if(filterType==='doc')ok=m.indexOf('text/')===0||m.indexOf('json')>=0||/\\.(md|txt|log|csv|docx?|xlsx?|pptx?|pdf)$/.test(n);
+    else if(filterType==='zip')ok=m.indexOf('zip')>=0||/\\.(zip|rar|7z|tar|gz)$/.test(n);
+    else if(filterType==='other')ok=!(m.indexOf('image/')===0||m.indexOf('video/')===0||m.indexOf('audio/')===0||m.indexOf('text/')===0||m.indexOf('json')>=0||/\\.(md|txt|log|csv|docx?|xlsx?|pptx?|pdf|zip|rar|7z|tar|gz)$/.test(n));
     if(!ok)return false;
   }
   if(filterAge){
@@ -4361,7 +7293,7 @@ function render(){
   var parts=cur.split('/').filter(Boolean);var h='<a data-p="/">'+t('home')+'</a>';var acc='/';
   parts.forEach(function(p){acc+=p+'/';h+=' <span style="opacity:.4">/</span> <a data-p="'+esc(acc)+'">'+esc(p)+'</a>'});
   var bcEl=document.getElementById('bcPath');bcEl.innerHTML=h;
-  bcEl.querySelectorAll('a').forEach(function(a){a.onclick=function(){cur=a.getAttribute('data-p');searchMode=false;favMode=false;recentMode=false;load()}});
+  bcEl.querySelectorAll('a').forEach(function(a){a.onclick=function(){cur=a.getAttribute('data-p');setMode('');load()}});
   document.getElementById('btnView').textContent=viewMode==='list'?(lang==='zh'?'网格':'Grid'):(viewMode==='grid'?(lang==='zh'?'图库':'Gallery'):(lang==='zh'?'列表':'List'));
   document.querySelectorAll('.fchip').forEach(function(b){
     var v=b.hasAttribute('data-ft')?b.getAttribute('data-ft'):b.getAttribute('data-fa');
@@ -4388,8 +7320,21 @@ function render(){
   document.getElementById('btnWebDAV').textContent='🌐 WebDAV';
   var bmEl=document.getElementById('btnMore');if(bmEl)bmEl.title=lang==='zh'?'更多功能':'More';
   (function(){
-    var CL={zh:{browse:'浏览',actions:'操作',data:'数据',links:'链接',system:'系统',sort:'排序',type:'类型',time:'时间'},en:{browse:'Browse',actions:'Actions',data:'Data',links:'Links',system:'System',sort:'Sort',type:'Type',time:'Time'}};
-    document.querySelectorAll('.chip-label[data-l],.mlabel[data-l],.sort-label[data-l]').forEach(function(el){var k=el.getAttribute('data-l');el.textContent=(CL[lang]&&CL[lang][k])||k});
+    var bUp=document.getElementById('btnUp');if(bUp)bUp.textContent=lang==='zh'?'上传':'Upload';
+    var bNew=document.getElementById('btnNew');if(bNew)bNew.title=lang==='zh'?'新建':'New';
+    var bSt=document.getElementById('btnSearchToggle');if(bSt)bSt.title=lang==='zh'?'搜索':'Search';
+    var bSel=document.getElementById('btnSelect');if(bSel)bSel.title=lang==='zh'?'选择':'Select';
+    var sIn=document.getElementById('searchInput');if(sIn)sIn.placeholder=lang==='zh'?'搜索文件...':'Search files...';
+    var plIn=document.getElementById('paletteInput');if(plIn)plIn.placeholder=lang==='zh'?'输入命令或文件名…（↑↓ 选择，Enter 执行，Esc 关闭）':'Type a command or file name…';
+  })();
+  (function(){
+    var CL={zh:{browse:'浏览',actions:'操作',data:'数据',links:'链接',system:'系统',sort:'排序',type:'类型',time:'时间',views:'页面',organize:'整理',appearance:'外观',
+      home:'首页',allFiles:'全部文件',favs:'收藏',recents:'最近',albums:'相册',trash:'回收站',uploadLinks:'上传链接',tree:'目录',tags:'标签',
+      theme:'主题',density:'密度',accent:'主题色',language:'语言',logout:'退出'},
+    en:{browse:'Browse',actions:'Actions',data:'Data',links:'Links',system:'System',sort:'Sort',type:'Type',time:'Time',views:'Pages',organize:'Organize',appearance:'Appearance',
+      home:'Home',allFiles:'All files',favs:'Favorites',recents:'Recent',albums:'Albums',trash:'Trash',uploadLinks:'Upload links',tree:'Folders',tags:'Tags',
+      theme:'Theme',density:'Density',accent:'Accent',language:'Language',logout:'Log out'}};
+    document.querySelectorAll('.chip-label[data-l],.mlabel[data-l],.sort-label[data-l],.si-tx[data-l],.side-mini span[data-l],.s-title[data-l]').forEach(function(el){var k=el.getAttribute('data-l');if(CL[lang]&&CL[lang][k])el.textContent=CL[lang][k]});
   })();
   document.getElementById('btnDup').textContent='📋 '+(lang==='zh'?'重复':'Dups');
   document.getElementById('btnEnc').textContent='🔐 '+(lang==='zh'?'加密':'Encrypt');
@@ -4398,9 +7343,11 @@ function render(){
   document.querySelectorAll('.sort-btn').forEach(function(b){var k=b.getAttribute('data-s');b.textContent=lang==='zh'?(k==='name'?'名称':k==='size'?'大小':'日期'):(k==='name'?'Name':k==='size'?'Size':'Date');b.classList.toggle('active',k===sortKey)});
   renderTree();
   renderTagSidebar();
+  showFilesView();   // 任何一次列表渲染都意味着要看到文件页（仪表盘 → 文件页）
 
   var promise;
-  if(tagFilterMode){promise=api('/api/tags?filter='+encodeURIComponent(tagFilterName)).then(function(d){return{items:d.results||[]}})}
+  if(QUERY.on){promise=Promise.resolve({items:QUERY.items})}
+  else if(tagFilterMode){promise=api('/api/tags?filter='+encodeURIComponent(tagFilterName)).then(function(d){return{items:d.items||d.results||[]}})}
   else if(favMode){promise=api('/api/favs').then(function(d){return{items:d.items||[]}})}
   else if(recentMode){promise=api('/api/recent').then(function(d){return{items:d.items||[]}})}
   else if(searchMode){promise=Promise.resolve({items:searchResults})}
@@ -4418,32 +7365,39 @@ function render(){
     }
     var items=sortItems((d.items||[]).filter(matchFilter).slice());
     var truncated=false;
-    if(!searchMode&&!favMode&&!recentMode&&!tagFilterMode&&items.length>500){items=items.slice(0,500);truncated=true;}
+    if(!searchMode&&!favMode&&!recentMode&&!tagFilterMode&&!QUERY.on&&items.length>500){items=items.slice(0,500);truncated=true;}
     currentItems=items;
     var container=document.getElementById('fileList');
-    if(!items.length){container.innerHTML='<p class="empty">'+(searchMode||favMode||recentMode?t('noResult'):((filterType||filterAge)?(lang==='zh'?'没有符合条件的文件':'No matching files'):t('empty')))+'</p>';return}
+    if(!items.length){container.innerHTML='<p class="empty">'+(searchMode||favMode||recentMode||QUERY.on?t('noResult'):((filterType||filterAge)?(lang==='zh'?'没有符合条件的文件':'No matching files'):t('empty')))+'</p>';return}
+    var truncTip=truncated?('<p class="list-tip">'+(lang==='zh'?'目录较大，仅显示前 500 项，请使用搜索或筛选定位':'Directory truncated to 500 items, use search/filter to locate')+'</p>'):'';
     var html='';
     if(viewMode==='gallery'){
       var media=items.filter(function(it){return it.type==='file'&&((it.mime||'').indexOf('image/')===0||(it.mime||'').indexOf('video/')===0)});
       if(!media.length){container.innerHTML='<p class="empty">'+(lang==='zh'?'此目录没有图片或视频':'No images or videos here')+'</p>';return}
       html='<div class="file-grid gallery">';
       media.forEach(function(it){
-        var gsrc=(it.hasThumb?'/api/thumb?path=':'/api/preview?path=')+encodeURIComponent((it.path||cur)+it.name)+'&token='+tk;
-        html+='<div class="gitem" data-n="'+esc(it.name)+'" data-t="file" data-m="'+esc(it.mime||'')+'">';
-        html+='<img class="gthumb" loading="lazy" src="'+gsrc+'" alt="">';
+        var p=it.path||cur;
+        var gsrc=(it.hasThumb?'/api/thumb?path=':'/api/preview?path=')+encodeURIComponent(p+it.name)+'&token='+tk;
+        var isV=(it.mime||'').indexOf('video/')===0;
+        html+='<div class="gitem" data-p="'+esc(p)+'" data-n="'+esc(it.name)+'" data-t="file" data-m="'+esc(it.mime||'')+'">';
+        // 视频没有缩略图时按 <video> 渲染，避免全部显示成破图
+        html+= isV ? ('<video class="gthumb" muted preload="metadata" src="'+gsrc+'"></video>') : ('<img class="gthumb" loading="lazy" src="'+gsrc+'" alt="">');
         html+='<div class="gname">'+esc(it.name)+'</div>';
         html+='<div class="gmeta"><span>'+fmt(it.size)+'</span><span>'+esc(it.time?new Date(it.time).toLocaleDateString():'')+'</span></div></div>';
       });
-      html+='</div>';
+      html+='</div>'+truncTip;
     }else if(viewMode==='grid'){
       html='<div class="file-grid">';
       items.forEach(function(it){
-        html+='<div class="gitem" data-n="'+esc(it.name)+'" data-t="'+it.type+'" data-m="'+esc(it.mime||'')+'">';
-        html+='<input type="checkbox" data-chk="'+esc(it.name)+'" />';
+        var p=it.path||cur;
+        html+='<div class="gitem" data-p="'+esc(p)+'" data-n="'+esc(it.name)+'" data-t="'+it.type+'" data-m="'+esc(it.mime||'')+'">';
+        html+='<input type="checkbox" data-chk="'+esc(p+it.name)+'" />';
         if(it.type==='file'&&it.hasThumb){
-          html+='<img class="gthumb" src="/api/thumb?path='+encodeURIComponent((it.path||cur)+it.name)+'&token='+tk+'" loading="lazy" />';
+          html+='<img class="gthumb" src="/api/thumb?path='+encodeURIComponent(p+it.name)+'&token='+tk+'" loading="lazy" />';
+        }else if(it.type==='file'&&(it.mime||'').indexOf('video/')===0){
+          html+='<div class="gicon">'+getIcon(it)+'</div>';
         }else if(it.type==='file'&&isImage(it)){
-          html+='<img class="gthumb" src="/api/preview?path='+encodeURIComponent((it.path||cur)+it.name)+'&token='+tk+'" loading="lazy" />';
+          html+='<img class="gthumb" src="/api/preview?path='+encodeURIComponent(p+it.name)+'&token='+tk+'" loading="lazy" />';
         }else{
           html+='<div class="gicon">'+getIcon(it)+'</div>';
         }
@@ -4452,60 +7406,250 @@ function render(){
         var gdt=it.time?new Date(it.time).toLocaleDateString():'';
         html+='<div class="gmeta"><span>'+sz+'</span><span>'+esc(gdt)+'</span></div></div>';
       });
-      html+='</div>';
-    }else{
-      html='<div class="list-head"><span></span><span></span><span>'+(lang==='zh'?'名称':'Name')+'</span><span></span><span class="lh-r">'+(lang==='zh'?'大小':'Size')+'</span><span class="lh-r">'+(lang==='zh'?'日期':'Date')+'</span><span></span></div><ul class="file-list">';
-      items.forEach(function(it){
-        var sz=it.type==='dir'?fmt(it.dirSize||0):fmt(it.size);
-        var dt=it.time?new Date(it.time).toLocaleDateString():'';
-        html+='<li data-li="'+esc(it.name)+'" draggable="true" data-drag="'+esc(cur+it.name)+'"><input type="checkbox" data-chk="'+esc(it.name)+'" /><span class="file-icon">'+getIcon(it)+'</span>';
-        html+='<span class="fname" data-n="'+esc(it.name)+'" data-t="'+it.type+'" data-m="'+esc(it.mime||'')+'">'+esc(it.name);
-        if((searchMode||favMode||recentMode||tagFilterMode)&&it.path)html+='<span class="fpath">'+esc(it.path)+'</span>';
-        html+='</span>';
-        html+='<button class="fav-star" data-fav="'+esc(it.name)+'">☆</button>';
-        html+='<span class="fsize">'+sz+'</span><span class="fdate">'+dt+'</span>';
-        html+='<span class="row-actions">';
-        html+='<button data-ren="'+esc(it.name)+'" class="btn gray tiny">'+t('ren')+'</button>';
-        html+='<button data-mv="'+esc(it.name)+'" class="btn gray tiny">'+t('move')+'</button>';
-        if(it.type==='file')html+='<button data-shr="'+esc(it.name)+'" class="btn gray tiny">'+t('share')+'</button>';
-        else html+='<button data-shrd="'+esc(it.name)+'" class="btn gray tiny">'+t('share')+'</button>';
-        if(it.type==='file'&&isZip(it.name))html+='<button data-unz="'+esc(it.name)+'" class="btn gray tiny extra">'+t('unzip')+'</button>';
-        if(it.type==='file'&&isText(it))html+='<button data-ed="'+esc(it.name)+'" class="btn gray tiny extra">'+t('edit')+'</button>';
-        if(it.type==='file')html+='<button data-his="'+esc(it.name)+'" class="btn gray tiny extra">'+t('history')+'</button>';
-        if(it.type==='file')html+='<button data-tag="'+esc(it.name)+'" class="btn gray tiny extra">🏷</button>';
-        if(it.type==='file')html+='<button data-nt="'+esc(it.name)+'" class="btn gray tiny extra">📝</button>';
-        html+='<button class="btn tiny danger" data-del="'+esc(it.name)+'">'+t('del')+'</button>';
-        html+='</span></li>';
+      html+='</div>'+truncTip;
+    }else if(viewMode==='columns'){
+      html+='<div style="overflow:auto;max-height:calc(100vh - 340px)"><table class="col-table"><thead><tr>';
+      var COLS=[['name',lang==='zh'?'名称':'Name'],['type',lang==='zh'?'类型':'Type'],['size',lang==='zh'?'大小':'Size'],['time',lang==='zh'?'修改时间':'Modified'],['path',lang==='zh'?'路径':'Path']];
+      COLS.forEach(function(c){
+        html+='<th data-cs="'+c[0]+'">'+c[1]+(sortKey===c[0]?(sortAsc?' ▲':' ▼'):'')+'</th>';
       });
+      html+='<th></th></tr></thead><tbody>';
+      items.forEach(function(it){
+        var p=it.path||cur, full=p+it.name;
+        var sz=it.type==='dir'?fmt(it.dirSize||0):fmt(it.size);
+        html+='<tr data-p="'+esc(p)+'" data-n="'+esc(it.name)+'" data-t="'+it.type+'" data-m="'+esc(it.mime||'')+'">';
+        html+='<td><span style="cursor:pointer" class="cfname">'+getIcon(it)+' '+esc(it.name)+'</span></td>';
+        html+='<td>'+(it.type==='dir'?(lang==='zh'?'文件夹':'Folder'):esc((it.mime||'').split(';')[0]||'-'))+'</td>';
+        html+='<td>'+sz+'</td><td>'+(it.time?esc(new Date(it.time).toLocaleString()):'-')+'</td><td class="dup-path">'+esc(p)+'</td>';
+        html+='<td><input type="checkbox" data-chk="'+esc(full)+'"'+(selected[full]?' checked':'')+'></td></tr>';
+      });
+      html+='</tbody></table></div>'+truncTip;
+    }else{
+      var head='<div class="list-head"><span></span><span></span><span>'+(lang==='zh'?'名称':'Name')+'</span><span></span><span class="lh-r">'+(lang==='zh'?'大小':'Size')+'</span><span class="lh-r">'+(lang==='zh'?'日期':'Date')+'</span><span></span></div>';
+      if(items.length>150&&!truncated){
+        // 大目录：虚拟滚动（只渲染可视窗口）
+        if(VIRT.dir!==cur){VIRT.dir=cur;VIRT.scroll=0}
+        container.innerHTML=head+'<div id="vhost"></div>';
+        var host=document.getElementById('vhost');
+        renderVirtualList(host,items,function(it){return listRowHtml(it)},function(){bindEvents(container)});
+        return;
+      }
+      html=head+'<ul class="file-list">';
+      items.forEach(function(it){ html+=listRowHtml(it) });
       if(truncated)html+='<li class="list-tip">'+(lang==='zh'?'目录较大，仅显示前 500 项，请使用搜索或筛选定位':'Directory truncated to 500 items, use search/filter to locate')+'</li>';
       html+='</ul>';
     }
     container.innerHTML=html;bindEvents(container);
+    try{bindGestures(container)}catch(e){}
   });
+}
+// 列表行标记（普通列表与虚拟滚动共用）
+function listRowHtml(it){
+  var p=it.path||cur;
+  var full=p+it.name;
+  var sz=it.type==='dir'?fmt(it.dirSize||0):fmt(it.size);
+  var dt=it.time?new Date(it.time).toLocaleDateString():'';
+  var h='<li data-p="'+esc(p)+'" data-li="'+esc(it.name)+'" draggable="true" data-drag="'+esc(full)+'"><input type="checkbox" data-chk="'+esc(full)+'"'+(selected[full]?' checked':'')+' /><span class="file-icon">'+getIcon(it)+'</span>';
+  h+='<span class="fname" data-n="'+esc(it.name)+'" data-t="'+it.type+'" data-m="'+esc(it.mime||'')+'">'+esc(it.name);
+  if((searchMode||favMode||recentMode||tagFilterMode)&&it.path)h+='<span class="fpath">'+esc(it.path)+'</span>';
+  h+='</span>';
+  h+='<button class="fav-star" data-fav="'+esc(it.name)+'">☆</button>';
+  h+='<span class="fsize">'+sz+'</span><span class="fdate">'+dt+'</span>';
+  h+='<span class="row-actions">';
+  // 常显的三个主操作（不依赖悬停，触屏可用）
+  if(it.type==='file')h+='<button class="btn gray tiny alw" data-dlrow="'+esc(it.name)+'" title="'+(lang==='zh'?'下载':'Download')+'">⬇</button>';
+  if(it.type==='file')h+='<button class="btn gray tiny alw" data-shr="'+esc(it.name)+'" title="'+t('share')+'">🔗</button>';
+  else h+='<button class="btn gray tiny alw" data-shrd="'+esc(it.name)+'" title="'+t('share')+'">🔗</button>';
+  h+='<button class="btn tiny danger alw" data-del="'+esc(it.name)+'" title="'+t('del')+'">🗑</button>';
+  // 长尾进 ⋯ 菜单
+  h+='<span class="row-more-wrap"><button class="btn gray tiny row-more" data-rm="'+esc(it.name)+'" title="'+(lang==='zh'?'更多操作':'More')+'">⋯</button><span class="row-menu">';
+  h+='<button data-ren="'+esc(it.name)+'" class="btn gray tiny">✏️ '+t('ren')+'</button>';
+  h+='<button data-mv="'+esc(it.name)+'" class="btn gray tiny">📁 '+t('move')+'</button>';
+  if(it.type==='file')h+='<button data-cp="'+esc(it.name)+'" class="btn gray tiny">📄 '+(lang==='zh'?'复制到…':'Copy to…')+'</button>';
+  if(it.type==='file')h+='<button data-his="'+esc(it.name)+'" class="btn gray tiny">🕐 '+t('history')+'</button>';
+  if(it.type==='file'&&isText(it))h+='<button data-ed="'+esc(it.name)+'" class="btn gray tiny">📝 '+t('edit')+'</button>';
+  if(it.type==='file'&&isZip(it.name))h+='<button data-unz="'+esc(it.name)+'" class="btn gray tiny">📦 '+t('unzip')+'</button>';
+  if(it.type==='file')h+='<button data-tag="'+esc(it.name)+'" class="btn gray tiny">🏷 '+(lang==='zh'?'标签':'Tag')+'</button>';
+  if(it.type==='file')h+='<button data-nt="'+esc(it.name)+'" class="btn gray tiny">📝 '+(lang==='zh'?'备注':'Note')+'</button>';
+  h+='<button data-lockrow="'+esc(it.name)+'" class="btn gray tiny">🔒 '+(lang==='zh'?'目录密码':'Folder lock')+'</button>';
+  if(it.type==='file')h+='<button data-enc="'+esc(it.name)+'" class="btn gray tiny">🔐 '+(lang==='zh'?'加密':'Encrypt')+'</button>';
+  h+='</span></span>';
+  h+='</span></li>';
+  return h;
 }
 
 
 // ===== Tag sidebar =====
 var tagFilterMode=false,tagFilterName='';
+var currentTags=[];
+// ===== 高级筛选器（/api/query）=====
+var QUERY={on:false,params:{},items:[],total:0,offset:0,hasMore:false};
+var qDefaults=function(){return {q:'',type:'',ext:'',minMB:'',maxMB:'',after:'',before:'',tags:'',tagMode:'any',fav:false,deep:true,sort:'name',order:'asc'}};
+function queryModal(){
+  var m=document.getElementById('queryModal');
+  if(!m){
+    m=document.createElement('div');m.id='queryModal';m.className='modal-bg';
+    m.innerHTML='<div class="modal" style="min-width:440px;max-width:700px"><button class="mclose" id="queryClose">✕</button><h3>🔎 '+(lang==='zh'?'高级筛选':'Advanced filter')+'</h3><div id="queryContent"></div></div>';
+    document.body.appendChild(m);
+    document.getElementById('queryClose').onclick=function(){m.classList.remove('show')};
+    m.onclick=function(e){if(e.target===m)m.classList.remove('show')};
+  }
+  return m;
+}
+function showQuery(){
+  var m=queryModal(),box=document.getElementById('queryContent');
+  var p=Object.assign(qDefaults(),QUERY.params);
+  var tags=currentTags||[];
+  var h='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 40%">'+(lang==='zh'?'文件名包含':'Name contains')+'</span><input id="qQ" value="'+esc(p.q)+'" style="flex:1;padding:6px 10px"></div>';
+  var TYPES=[['','全部'],['image','图片'],['video','视频'],['audio','音频'],['doc','文档'],['zip','压缩包'],['other','其他']];
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 40%">'+(lang==='zh'?'类型':'Type')+'</span><select id="qType" style="flex:1;padding:6px 10px">'+TYPES.map(function(x){return '<option value="'+x[0]+'"'+(p.type===x[0]?' selected':'')+'>'+x[1]+'</option>'}).join('')+'</select></div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 40%">'+(lang==='zh'?'扩展名（逗号分隔）':'Extensions')+'</span><input id="qExt" value="'+esc(p.ext)+'" placeholder=".jpg,.png" style="flex:1;padding:6px 10px"></div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 40%">'+(lang==='zh'?'大小范围 (MB)':'Size (MB)')+'</span><input id="qMin" type="number" value="'+esc(p.minMB)+'" placeholder="min" style="width:90px;padding:6px 10px"><span>–</span><input id="qMax" type="number" value="'+esc(p.maxMB)+'" placeholder="max" style="width:90px;padding:6px 10px"></div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 40%">'+(lang==='zh'?'修改时间':'Modified')+'</span><input id="qAfter" type="date" value="'+esc(p.after)+'" style="flex:1;padding:5px 8px"><span>–</span><input id="qBefore" type="date" value="'+esc(p.before)+'" style="flex:1;padding:5px 8px"></div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 40%">'+(lang==='zh'?'标签（逗号分隔）':'Tags')+'</span><input id="qTags" value="'+esc(p.tags)+'" list="qTagList" style="flex:1;padding:6px 10px"><datalist id="qTagList">'+tags.map(function(x){return '<option value="'+esc(x.name)+'">'}).join('')+'</datalist>'
+    +'<select id="qTagMode" style="padding:6px 8px"><option value="any"'+(p.tagMode==='any'?' selected':'')+'>'+(lang==='zh'?'任一':'any')+'</option><option value="all"'+(p.tagMode==='all'?' selected':'')+'>'+(lang==='zh'?'全部':'all')+'</option></select></div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 40%">'+(lang==='zh'?'范围 / 排序':'Scope / sort')+'</span>'
+    +'<label style="display:flex;gap:4px;align-items:center;font-size:12.5px"><input type="checkbox" id="qDeep" '+(p.deep?'checked':'')+'>'+(lang==='zh'?'含子目录':'recursive')+'</label>'
+    +'<label style="display:flex;gap:4px;align-items:center;font-size:12.5px"><input type="checkbox" id="qFav" '+(p.fav?'checked':'')+'>★</label>'
+    +'<select id="qSort" style="padding:6px 8px">'+[['name','名称'],['size','大小'],['time','时间']].map(function(x){return '<option value="'+x[0]+'"'+(p.sort===x[0]?' selected':'')+'>'+x[1]+'</option>'}).join('')+'</select>'
+    +'<select id="qOrder" style="padding:6px 8px"><option value="asc"'+(p.order==='asc'?' selected':'')+'>↑</option><option value="desc"'+(p.order==='desc'?' selected':'')+'>↓</option></select></div>';
+  h+='<div id="qMsg" style="font-size:13px;min-height:18px"></div>';
+  h+='<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end"><button id="qClear" class="btn gray small">'+(lang==='zh'?'清空':'Clear')+'</button><button id="qSave" class="btn gray small">'+(lang==='zh'?'保存为预设':'Save preset')+'</button><button id="qRun" class="btn small">'+(lang==='zh'?'筛选':'Filter')+'</button></div>';
+  box.innerHTML=h;
+  m.classList.add('show');
+  document.getElementById('qClear').onclick=function(){QUERY.params=qDefaults();showQuery()};
+  document.getElementById('qSave').onclick=function(){
+    try{localStorage.setItem('dQuery',JSON.stringify(readQueryForm()))}catch(e){}
+    var msg=document.getElementById('qMsg');msg.style.color='var(--sys-green)';msg.textContent=(lang==='zh'?'已保存为默认预设':'Preset saved');
+  };
+  document.getElementById('qRun').onclick=function(){runQuery(readQueryForm())};
+}
+function readQueryForm(){
+  function v(id){var el=document.getElementById(id);return el?el.value:''}
+  function c(id){var el=document.getElementById(id);return !!(el&&el.checked)}
+  return {q:v('qQ'),type:v('qType'),ext:v('qExt'),minMB:v('qMin'),maxMB:v('qMax'),after:v('qAfter'),before:v('qBefore'),tags:v('qTags'),tagMode:v('qTagMode'),fav:c('qFav'),deep:c('qDeep'),sort:v('qSort'),order:v('qOrder')};
+}
+function queryQS(p,offset){
+  var qs=[];
+  if(p.q)qs.push('q='+encodeURIComponent(p.q));
+  if(p.type)qs.push('type='+encodeURIComponent(p.type));
+  if(p.ext)qs.push('ext='+encodeURIComponent(p.ext));
+  if(p.minMB)qs.push('minSize='+Math.round(parseFloat(p.minMB)*1048576));
+  if(p.maxMB)qs.push('maxSize='+Math.round(parseFloat(p.maxMB)*1048576));
+  if(p.after)qs.push('after='+encodeURIComponent(p.after));
+  if(p.before)qs.push('before='+encodeURIComponent(new Date(new Date(p.before).getTime()+86399999).toISOString()));
+  if(p.tags)qs.push('tags='+encodeURIComponent(p.tags)+'&tagMode='+encodeURIComponent(p.tagMode));
+  if(p.fav)qs.push('fav=1');
+  qs.push('deep='+(p.deep?'1':'0'));
+  qs.push('sort='+encodeURIComponent(p.sort)+'&order='+encodeURIComponent(p.order));
+  qs.push('path='+encodeURIComponent(queryScope));
+  qs.push('limit=200&offset='+(offset||0));
+  return '/api/query?'+qs.join('&');
+}
+var queryScope='/';
+function runQuery(p,append){
+  QUERY.params=p;QUERY.on=true;QUERY.offset=append?QUERY.items.length:0;
+  searchMode=false;favMode=false;recentMode=false;tagFilterMode=false;
+  api(queryQS(p,QUERY.offset)).then(function(d){
+    var items=d.items||[];
+    QUERY.items=append?QUERY.items.concat(items):items;
+    QUERY.total=d.total||0;QUERY.hasMore=!!d.hasMore;
+    currentItems=QUERY.items;
+    var m=queryModal();
+    var msg=document.getElementById('qMsg');
+    if(msg){msg.style.color='var(--sys-text-3)';msg.textContent=(lang==='zh'?'命中 ':'hits ')+QUERY.total+(d.capped?(' ('+(lang==='zh'?'结果已截断':'capped')+')'):'')}
+    m.classList.remove('show');
+    render();loadUsage();
+  }).catch(function(){});
+}
+
 function renderTagSidebar(){
   api('/api/tags').then(function(d){
     var tags=d.tags||[];
+    currentTags=tags;
     var box=document.getElementById('tagBox');
     if(!tags.length){box.innerHTML='<div style="color:var(--sys-text-3);font-size:12px;padding:8px 10px">'+t('noTags')+'</div>';return}
     var h='';
-    tags.forEach(function(tg){
+    tags.slice(0,60).forEach(function(tg){
       var isActive=tagFilterMode&&tagFilterName===tg.name;
-      h+='<div class="tag-filter-item'+(isActive?' active':'')+'" data-tf="'+esc(tg.name)+'"><span class="tag-dot" style="background:'+(tg.color||'#0a84ff')+'"></span>'+esc(tg.name)+'</div>';
+      h+='<div class="tag-filter-item'+(isActive?' active':'')+'" data-tf="'+esc(tg.name)+'" title="'+(lang==='zh'?'点击筛选 · 右键管理':'click to filter · right-click to manage')+'"><span class="tag-dot" style="background:'+safeColor(tg.color)+'"></span>'+esc(tg.name)+(tg.count?(' <span style="color:var(--sys-text-3);font-size:11px">'+tg.count+'</span>'):'')+'</div>';
     });
+    h+='<div style="display:flex;gap:6px;margin-top:8px"><button class="btn gray tiny" id="tagManage" style="flex:1">'+(lang==='zh'?'管理标签':'Manage')+'</button><button class="btn tiny" id="tagAuto" style="flex:1">'+(lang==='zh'?'自动标签':'Auto tag')+'</button></div>';
     box.innerHTML=h;
     box.querySelectorAll('[data-tf]').forEach(function(el){
       el.onclick=function(){
         var n=el.getAttribute('data-tf');
-        if(tagFilterMode&&tagFilterName===n){tagFilterMode=false;tagFilterName='';favMode=false;recentMode=false;searchMode=false;load()}
-        else{tagFilterMode=true;tagFilterName=n;favMode=false;recentMode=false;searchMode=false;load()}
+        if(tagFilterMode&&tagFilterName===n){tagFilterMode=false;tagFilterName='';favMode=false;recentMode=false;searchMode=false;QUERY.on=false;load()}
+        else{tagFilterMode=true;tagFilterName=n;favMode=false;recentMode=false;searchMode=false;QUERY.on=false;load()}
       };
+      el.oncontextmenu=function(e){e.preventDefault();showTagManage(el.getAttribute('data-tf'))};
     });
+    var mg=document.getElementById('tagManage');
+    if(mg)mg.onclick=function(){showTagManage('')};
+    var au=document.getElementById('tagAuto');
+    if(au)au.onclick=function(){showTagAuto()};
   }).catch(function(){});
+}
+// 标签管理：改色 / 重命名合并
+function showTagManage(focus){
+  var m=queryModal(),box=document.getElementById('queryContent');
+  m.classList.add('show');
+  var h='<div class="dup-path" style="margin-bottom:8px">'+(lang==='zh'?'重命名会把所有文件上的该标签一并改写（合并到同名标签）。':'Rename merges into an existing tag of the same name.')+'</div>';
+  h+='<div id="tagRows"></div>';
+  box.innerHTML=h;
+  function paint(){
+    api('/api/tags').then(function(d){
+      var tags=d.tags||[];
+      var rows=document.getElementById('tagRows');
+      var html='';
+      if(!tags.length)html='<div class="dup-path">'+(lang==='zh'?'暂无标签':'No tags')+'</div>';
+      tags.forEach(function(tg){
+        html+='<div class="token-row"><span class="tag-dot" style="background:'+safeColor(tg.color)+'"></span>'
+          +'<input value="'+esc(tg.name)+'" data-tgnm="'+esc(tg.name)+'" style="width:150px;padding:5px 8px">'
+          +'<input type="color" value="'+safeColor(tg.color)+'" data-tgcl="'+esc(tg.name)+'" style="width:38px;height:30px;padding:0;border:none;background:none">'
+          +'<span class="dup-path" style="flex:1">'+(tg.count||0)+'</span>'
+          +'<button class="btn gray tiny" data-tgsave="'+esc(tg.name)+'">'+(lang==='zh'?'保存':'Save')+'</button></div>';
+      });
+      rows.innerHTML=html;
+      rows.querySelectorAll('[data-tgcl]').forEach(function(el){el.onchange=function(){
+        api('/api/tags/color',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:el.getAttribute('data-tgcl'),color:el.value})}).then(function(){renderTagSidebar()});
+      }});
+      rows.querySelectorAll('[data-tgsave]').forEach(function(el){el.onclick=function(){
+        var from=el.getAttribute('data-tgsave');
+        var inp=rows.querySelector('[data-tgnm="'+from.replace(/"/g,'\\"')+'"]');
+        var to=inp?inp.value.trim():'';
+        var cl=rows.querySelector('[data-tgcl="'+from.replace(/"/g,'\\"')+'"]');
+        if(!to||to===from)return;
+        api('/api/tags/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:from,to:to,color:cl?cl.value:''})}).then(function(r){
+          if(r&&r.ok){renderTagSidebar();paint();load()}else alert((r&&r.error)||'failed');
+        });
+      }});
+    });
+  }
+  paint();
+}
+function showTagAuto(){
+  var m=queryModal(),box=document.getElementById('queryContent');
+  m.classList.add('show');
+  box.innerHTML='<div class="dup-path" style="margin-bottom:8px">'+(lang==='zh'?'为当前目录的文件自动打标签（按类型或按年月）':'Auto-tag files in the current folder')+'</div>'
+    +'<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px"><select id="taMode" style="padding:6px 8px"><option value="type">'+(lang==='zh'?'按类型':'By type')+'</option><option value="date">'+(lang==='zh'?'按年月':'By date')+'</option></select>'
+    +'<label style="display:flex;gap:4px;align-items:center;font-size:12.5px"><input type="checkbox" id="taDeep">'+(lang==='zh'?'含子目录':'recursive')+'</label>'
+    +'<button id="taPreview" class="btn gray small">'+(lang==='zh'?'预览':'Preview')+'</button><button id="taApply" class="btn small">'+(lang==='zh'?'应用':'Apply')+'</button></div>'
+    +'<div id="taOut" style="max-height:44vh;overflow:auto;font-size:13px"></div>';
+  function run(apply){
+    var out=document.getElementById('taOut');
+    out.innerHTML='…';
+    api('/api/tags/auto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur,mode:document.getElementById('taMode').value,deep:document.getElementById('taDeep').checked,apply:apply})}).then(function(d){
+      var g=d.groups||[];
+      var h='<div class="dup-path" style="margin-bottom:6px">'+(lang==='zh'?'共 ':'total ')+d.total+' · '+(apply?((lang==='zh'?'已改 ':'changed ')+d.changed):(lang==='zh'?'预览':'preview'))+'</div>';
+      g.forEach(function(x){h+='<div class="token-row"><span class="token-name">'+esc(x.tag)+'</span><span class="dup-path" style="flex:1">'+x.count+' · '+x.sample.map(esc).join(', ')+'</span></div>'});
+      out.innerHTML=h;
+      if(apply)renderTagSidebar();
+    });
+  }
+  document.getElementById('taPreview').onclick=function(){run(false)};
+  document.getElementById('taApply').onclick=function(){if(confirm(lang==='zh'?'确认写入标签？':'Apply tags?'))run(true)};
+  run(false);
 }
 
 
@@ -4560,32 +7704,128 @@ function renderTree(){
           renderTree();
           return;
         }
-        cur=tp;searchMode=false;favMode=false;recentMode=false;load();
+        cur=tp;setMode('');load();
       };
     });
   }).catch(function(){});
 }
 document.getElementById('btnSidebar').onclick=function(){document.getElementById('sidebar').classList.toggle('show')};
 
+// 行内操作一律使用该条目自己的目录（搜索/收藏/最近/标签结果可能来自其它目录），
+// 否则会把 cur+name 当成目标路径，导致 404 或误删当前目录的同名文件。
+function rowDir(el){var r=(el&&el.closest)?el.closest('[data-p]'):null;return (r&&r.getAttribute('data-p'))||cur}
+function enterDir(p,name){cur=normP(p)+name+'/';setMode('');load()}
+function setMode(m){
+  searchMode=(m==='search');favMode=(m==='fav');recentMode=(m==='recent');tagFilterMode=(m==='tag');
+  if(m!=='tag')tagFilterName='';
+}
 function bindEvents(c){
+  c.querySelectorAll('[data-cs]').forEach(function(th){th.onclick=function(){
+    var k=th.getAttribute('data-cs');
+    if(k==='type'||k==='path')k='name';
+    if(sortKey===k)sortAsc=!sortAsc;else{sortKey=k;sortAsc=true}
+    try{localStorage.setItem('ds',sortKey)}catch(e){}
+    render();
+  }});
+  c.querySelectorAll('.cfname').forEach(function(el){
+    var tr=el.closest('tr');if(!tr)return;
+    el.onclick=function(){
+      var n=tr.getAttribute('data-n'),tp=tr.getAttribute('data-t'),m=tr.getAttribute('data-m')||'',p=tr.getAttribute('data-p')||cur;
+      if(tp==='dir')enterDir(p,n);else doPreview(n,m,-1,p);
+    };
+  });
   c.querySelectorAll('[data-drag]').forEach(function(el){el.addEventListener('dragstart',function(e){e.dataTransfer.setData('text/plain',el.getAttribute('data-drag'))})});
   c.querySelectorAll('[data-chk]').forEach(function(cb){cb.onchange=function(){var n=cb.getAttribute('data-chk');if(cb.checked)selected[n]=true;else delete selected[n];updateBatch();var li=cb.closest('li')||cb.closest('.gitem');if(li)li.classList.toggle('selected',cb.checked)}});
-  c.querySelectorAll('.fname').forEach(function(el){el.onclick=function(){var n=el.getAttribute('data-n'),tp=el.getAttribute('data-t'),m=el.getAttribute('data-m')||'';if(tp==='dir'){cur=normP(cur)+n+'/';searchMode=false;favMode=false;recentMode=false;load()}else{doPreview(n,m)}}});
-  c.querySelectorAll('.gitem').forEach(function(el){el.onclick=function(e){if(e.target.type==='checkbox')return;var n=el.getAttribute('data-n'),tp=el.getAttribute('data-t'),m=el.getAttribute('data-m')||'';if(tp==='dir'){cur=normP(cur)+n+'/';searchMode=false;favMode=false;recentMode=false;load()}else doPreview(n,m)};el.oncontextmenu=function(e){e.preventDefault();showCtx(e.clientX,e.clientY,el.getAttribute('data-n'),el.getAttribute('data-t'),el.getAttribute('data-m')||'')}});
-  c.querySelectorAll('[data-del]').forEach(function(b){b.onclick=function(){if(!confirm(t('delete')))return;api('/api/delete?path='+encodeURIComponent(cur+b.getAttribute('data-del')),{method:'DELETE'}).then(load)}});
-  c.querySelectorAll('[data-ren]').forEach(function(b){b.onclick=function(){var o=b.getAttribute('data-ren');var n=prompt(t('rename'),o);if(!n||n===o)return;api('/api/rename',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur+o,newName:n})}).then(load)}});
-  c.querySelectorAll('[data-shr]').forEach(function(b){b.onclick=function(){doShare(b.getAttribute('data-shr'))}});
-  c.querySelectorAll('[data-shrd]').forEach(function(b){b.onclick=function(){doShareDir(cur+b.getAttribute('data-shrd')+'/')}});
-  c.querySelectorAll('[data-mv]').forEach(function(b){b.onclick=function(){showMove(b.getAttribute('data-mv'))}});
-  c.querySelectorAll('[data-ed]').forEach(function(b){b.onclick=function(){editText(b.getAttribute('data-ed'))}});
-  c.querySelectorAll('[data-unz]').forEach(function(b){b.onclick=function(){doUnzip(b.getAttribute('data-unz'))}});
-  c.querySelectorAll('[data-his]').forEach(function(b){b.onclick=function(){showVersions(b.getAttribute('data-his'))}});
-  c.querySelectorAll('[data-tag]').forEach(function(b){b.onclick=function(){doTagFile(b.getAttribute('data-tag'))}});
-  c.querySelectorAll('[data-nt]').forEach(function(b){b.onclick=function(){showNote(b.getAttribute('data-nt'))}});
-  c.querySelectorAll('[data-fav]').forEach(function(b){b.onclick=function(){var n=b.getAttribute('data-fav');api('/api/fav',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur+n})}).then(function(){b.classList.toggle('on')})}});
+  c.querySelectorAll('.fname').forEach(function(el){el.onclick=function(){
+    var n=el.getAttribute('data-n'),tp=el.getAttribute('data-t'),m=el.getAttribute('data-m')||'',p=rowDir(el);
+    if(selMode){var cb=el.closest('li');cb=cb?cb.querySelector('[data-chk]'):null;if(cb){cb.checked=!cb.checked;cb.onchange&&cb.onchange()}return}
+    if(tp==='dir'){enterDir(p,n)}else{doPreview(n,m,-1,p)}
+  }});
+  c.querySelectorAll('.file-list li').forEach(function(li){
+    li.oncontextmenu=function(e){e.preventDefault();showCtx(e.clientX,e.clientY,li.getAttribute('data-li'),li.querySelector('.fname')?li.querySelector('.fname').getAttribute('data-t'):'file',li.querySelector('.fname')?li.querySelector('.fname').getAttribute('data-m')||'':'',li.getAttribute('data-p')||cur)};
+  });
+  c.querySelectorAll('.gitem').forEach(function(el){el.onclick=function(e){if(e.target.type==='checkbox')return;var n=el.getAttribute('data-n'),tp=el.getAttribute('data-t'),m=el.getAttribute('data-m')||'',p=rowDir(el);if(tp==='dir'){enterDir(p,n)}else doPreview(n,m,-1,p)};el.oncontextmenu=function(e){e.preventDefault();showCtx(e.clientX,e.clientY,el.getAttribute('data-n'),el.getAttribute('data-t'),el.getAttribute('data-m')||'',rowDir(el))}});
+  c.querySelectorAll('[data-del]').forEach(function(b){b.onclick=function(){if(!confirm(t('delete')))return;api('/api/delete?path='+encodeURIComponent(rowDir(b)+b.getAttribute('data-del')),{method:'DELETE'}).then(load)}});
+  c.querySelectorAll('[data-ren]').forEach(function(b){b.onclick=function(){var o=b.getAttribute('data-ren');var n=prompt(t('rename'),o);if(!n||n===o)return;api('/api/rename',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:rowDir(b)+o,newName:n})}).then(load)}});
+  c.querySelectorAll('[data-shr]').forEach(function(b){b.onclick=function(){doShare(b.getAttribute('data-shr'),rowDir(b))}});
+  c.querySelectorAll('[data-shrd]').forEach(function(b){b.onclick=function(){doShareDir(rowDir(b)+b.getAttribute('data-shrd')+'/')}});
+  c.querySelectorAll('[data-mv]').forEach(function(b){b.onclick=function(){showMove(b.getAttribute('data-mv'),rowDir(b))}});
+  c.querySelectorAll('[data-ed]').forEach(function(b){b.onclick=function(){editText(b.getAttribute('data-ed'),rowDir(b))}});
+  c.querySelectorAll('[data-unz]').forEach(function(b){b.onclick=function(){doUnzip(b.getAttribute('data-unz'),rowDir(b))}});
+  c.querySelectorAll('[data-his]').forEach(function(b){b.onclick=function(){showVersions(b.getAttribute('data-his'),rowDir(b))}});
+  c.querySelectorAll('[data-tag]').forEach(function(b){b.onclick=function(){doTagFile(b.getAttribute('data-tag'),rowDir(b))}});
+  c.querySelectorAll('[data-nt]').forEach(function(b){b.onclick=function(){showNote(b.getAttribute('data-nt'),rowDir(b))}});
+  c.querySelectorAll('[data-fav]').forEach(function(b){b.onclick=function(){var n=b.getAttribute('data-fav');api('/api/fav',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:rowDir(b)+n})}).then(function(){b.classList.toggle('on')})}});
+  // 常显主操作：下载
+  c.querySelectorAll('[data-dlrow]').forEach(function(b){b.onclick=function(e){
+    if(e&&e.stopPropagation)e.stopPropagation();
+    var p=rowDir(b)+b.getAttribute('data-dlrow');
+    window.open('/api/download?path='+encodeURIComponent(p)+'&token='+tk,'_blank');
+  }});
+  // 行内 ⋯ 菜单
+  c.querySelectorAll('[data-rm]').forEach(function(b){b.onclick=function(e){
+    e.stopPropagation();
+    var wrap=b.closest('.row-more-wrap');
+    var menu=wrap?wrap.querySelector('.row-menu'):null;
+    if(!menu)return;
+    var open=menu.classList.contains('show');
+    c.querySelectorAll('.row-menu.show').forEach(function(m){m.classList.remove('show')});
+    menu.classList.toggle('show',!open);
+  }});
+  // 行内长尾：复制到 / 目录密码 / 加密
+  c.querySelectorAll('[data-cp]').forEach(function(b){b.onclick=function(){showMove(b.getAttribute('data-cp'),rowDir(b))}});
+  c.querySelectorAll('[data-lockrow]').forEach(function(b){b.onclick=function(){
+    var dir=rowDir(b);
+    var pw=prompt(lang==='zh'?'为该目录设置密码（留空清除）：':'Folder password (empty to clear):','');
+    if(pw===null)return;
+    api('/api/folder-pass',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:dir,password:pw})}).then(function(){load()});
+  }});
+  c.querySelectorAll('[data-enc]').forEach(function(b){b.onclick=function(){
+    var n=b.getAttribute('data-enc');
+    try{showEncryptPrompt(n,rowDir(b))}catch(e){}
+  }});
 }
 
 function updateBatch(){var keys=Object.keys(selected);var bar=document.getElementById('batchBar');if(keys.length){bar.classList.add('show');document.getElementById('batchCount').textContent=keys.length+' selected'}else bar.classList.remove('show')}
+
+// ===== 站内复制 / 剪切 / 粘贴 =====
+function clipGet(){try{var c=JSON.parse(localStorage.getItem('du_clip')||'null');return (c&&c.paths&&c.paths.length)?c:null}catch(e){return null}}
+function clipSet(mode,paths){try{localStorage.setItem('du_clip',JSON.stringify({mode:mode,paths:paths||[]}))}catch(e){}renderClipBar()}
+function clipClear(){try{localStorage.removeItem('du_clip')}catch(e){}renderClipBar()}
+function clipFromSelection(mode){
+  var keys=Object.keys(selected);
+  if(!keys.length){alert(lang==='zh'?'请先选择文件':'Select files first');return}
+  clipSet(mode,keys);
+}
+function renderClipBar(){
+  var bar=document.getElementById('clipBar');if(!bar)return;
+  var c=clipGet();
+  if(!c){bar.innerHTML='';bar.style.display='none';return}
+  bar.innerHTML='<span>'+(c.mode==='cut'?'✂ '+t('cut'):'📋 '+t('copy'))+' · '+c.paths.length+' '+(lang==='zh'?'项':'items')+'</span>'
+    +'<span style="flex:1"></span>'
+    +'<button id="clipPaste" class="btn small">'+t('pasteHere')+'</button>'
+    +'<button id="clipCancel" class="btn gray small">'+t('cancel')+'</button>';
+  bar.style.display='flex';
+  document.getElementById('clipPaste').onclick=function(){pasteHere(cur)};
+  document.getElementById('clipCancel').onclick=clipClear;
+}
+async function pasteHere(target){
+  var c=clipGet();
+  if(!c){alert(t('clipEmpty'));return}
+  target=target||cur;
+  if(c.mode==='cut'){
+    var r=await api('/api/batch-move',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:c.paths,target:target})});
+    if(r&&r.ok){clipClear();alert(t('pasteDone')+': '+(r.moved||0)+'/'+c.paths.length);load()}
+    else alert((r&&r.error)||t('upFail'));
+  }else{
+    var r2=await api('/api/copy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:c.paths,target:target})});
+    if(r2&&r2.ok){
+      var msg=t('pasteDone')+': '+(r2.copied||0)+'/'+c.paths.length;
+      if(r2.failed)msg+=(lang==='zh'?'（失败 ':' (failed ')+r2.failed+((lang==='zh'?'）':')'));
+      alert(msg);load();
+    }else alert((r2&&r2.error)||t('upFail'));
+  }
+}
 
 // ===== Batch Rename =====
 document.getElementById('batchRen').onclick=function(){
@@ -4595,17 +7835,19 @@ document.getElementById('batchRen').onclick=function(){
   var h='<div style="margin-bottom:12px"><input id="brPattern" value="{n}_{d}" style="width:100%;padding:10px;border-radius:8px;border:none;background:var(--sys-fill);color:var(--sys-text);font-size:14px" placeholder="'+t('brPattern')+'"></div>';
   h+='<div class="br-preview" id="brPreview">';
   keys.forEach(function(k,i){
-    var ext=k.lastIndexOf('.')>=0?k.substring(k.lastIndexOf('.')):'';
-    var base=k.lastIndexOf('.')>=0?k.substring(0,k.lastIndexOf('.')):k;
+    var bn=k.split('/').filter(Boolean).pop()||k;
+    var dot=bn.lastIndexOf('.');
+    var ext=dot>=0?bn.substring(dot):'';
+    var base=dot>=0?bn.substring(0,dot):bn;
     var newName=(i+1)+'_'+new Date().toISOString().substring(0,10)+ext;
-    h+='<div class="br-row"><span class="br-old">'+esc(k)+'</span><span>→</span><span class="br-new">'+esc(newName)+'</span></div>';
+    h+='<div class="br-row"><span class="br-old">'+esc(bn)+'</span><span>→</span><span class="br-new">'+esc(newName)+'</span></div>';
   });
   h+='</div><div style="margin-top:12px;text-align:right"><button id="brApply" class="btn small">Apply</button></div>';
   box.innerHTML=h;
   document.getElementById('brModal').classList.add('show');
   document.getElementById('brApply').onclick=function(){
     var pattern=document.getElementById('brPattern').value;
-    var paths=keys.map(function(k){return cur+k});
+    var paths=keys.slice();
     api('/api/batch-rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:paths,pattern:pattern})}).then(function(r){
       document.getElementById('brModal').classList.remove('show');
       selected={};load();
@@ -4616,11 +7858,13 @@ document.getElementById('brClose').onclick=function(){document.getElementById('b
 document.getElementById('brModal').onclick=function(e){if(e.target===this)this.classList.remove('show')};
 
 document.getElementById('batchClr').onclick=function(){selected={};render()};
-document.getElementById('batchDel').onclick=function(){var keys=Object.keys(selected);if(!keys.length||!confirm('Delete '+keys.length+'?'))return;api('/api/batch-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:keys.map(function(k){return cur+k})})}).then(function(){selected={};load()})};
-document.getElementById('batchDl').onclick=function(){Object.keys(selected).forEach(function(n){window.open('/api/download?path='+encodeURIComponent(cur+n)+'&token='+tk,'_blank')})};
+document.getElementById('batchCopy').onclick=function(){clipFromSelection('copy')};
+document.getElementById('batchCut').onclick=function(){clipFromSelection('cut');render()};
+document.getElementById('batchDel').onclick=function(){var keys=Object.keys(selected);if(!keys.length||!confirm('Delete '+keys.length+'?'))return;api('/api/batch-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:keys})}).then(function(){selected={};load()})};
+document.getElementById('batchDl').onclick=function(){Object.keys(selected).forEach(function(n){window.open('/api/download?path='+encodeURIComponent(n)+'&token='+tk,'_blank')})};
 document.getElementById('batchZip').onclick=function(){
   var keys=Object.keys(selected);if(!keys.length)return;
-  fetch('/api/zip-multi?token='+tk,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:keys.map(function(k){return cur+k})})})
+  fetch('/api/zip-multi?token='+tk,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:keys})})
     .then(function(r){if(!r.ok){return r.json().then(function(d){alert((d&&d.error)||'failed')})}return r.blob()})
     .then(function(b){if(!b)return;var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='files.zip';document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},1500)})
     .catch(function(){alert('failed')});
@@ -4632,7 +7876,11 @@ function doShareDir(dirPath){
   var mx=prompt(t('maxAcc'),'0');if(mx===null)return;
   var pw=prompt(t('sharePw'),'');if(pw===null)return;
   api('/api/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:dirPath,dir:true,days:parseInt(days),max:parseInt(mx)||0,password:pw||''})}).then(function(r){
-    if(r&&r.url){var u=location.origin+r.url;try{navigator.clipboard.writeText(u)}catch(e){};prompt(t('link'),u)}
+    if(r&&r.url){
+      var u=location.origin+r.url;try{navigator.clipboard.writeText(u)}catch(e){}
+      prompt(t('link'),u);
+      if(r.token)showShareSettings(r.token,true);   // 创建后直接进设置面板（权限/外观/短链）
+    }
     else if(r&&r.locked){alert(t('locked'))}
     else if(r&&r.error){alert(r.error)}
   });
@@ -4660,9 +7908,9 @@ document.getElementById('btnFetchUrl').onclick=function(){
 document.querySelectorAll('.sort-btn').forEach(function(b){b.onclick=function(){var k=b.getAttribute('data-s');if(sortKey===k)sortAsc=!sortAsc;else{sortKey=k;sortAsc=true}localStorage.setItem('ds',sortKey);render()}});
 document.getElementById('btnSearch').onclick=doSearch;
 document.getElementById('searchInput').onkeydown=function(e){if(e.key==='Enter')doSearch()};
-function doSearch(){var q=document.getElementById('searchInput').value.trim();if(!q){searchMode=false;load();return}api('/api/search?q='+encodeURIComponent(q)+'&path=/').then(function(d){searchMode=true;favMode=false;recentMode=false;searchResults=d.results||[];render()})}
-document.getElementById('btnFav').onclick=function(){favMode=!favMode;searchMode=false;recentMode=false;render()};
-document.getElementById('btnRecent').onclick=function(){recentMode=!recentMode;searchMode=false;favMode=false;render()};
+function doSearch(){var q=document.getElementById('searchInput').value.trim();if(!q){setMode('');load();return}api('/api/search?q='+encodeURIComponent(q)+'&path=/').then(function(d){setMode('search');searchResults=d.results||[];render()})}
+document.getElementById('btnFav').onclick=function(){var on=!favMode;setMode(on?'fav':'');render()};
+document.getElementById('btnRecent').onclick=function(){var on=!recentMode;setMode(on?'recent':'');render()};
 document.getElementById('btnZip').onclick=function(){window.open('/api/zip?path='+encodeURIComponent(cur)+'&token='+tk,'_blank')};
 
 
@@ -4683,28 +7931,35 @@ function showQR(url){
   document.getElementById('pvCounter').textContent='';
 }
 
-function doShare(name){
+function doShare(name,base){
+  base=base||cur;
   var days=prompt(t('days'),'7');if(!days)return;
   var mx=prompt(t('maxAcc'),'0');if(mx===null)return;
   var pw=prompt(t('sharePw'),'');
   if(pw===null)return;
-  api('/api/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur+name,days:parseInt(days),max:parseInt(mx)||0,password:pw||''})}).then(function(r){
-    if(r.url){var u=location.origin+r.url;prompt(t('link'),u);try{navigator.clipboard.writeText(u)}catch(e){};try{showQR(u)}catch(qe){}}
+  api('/api/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:base+name,days:parseInt(days),max:parseInt(mx)||0,password:pw||''})}).then(function(r){
+    if(r.url){
+      var u=location.origin+r.url;
+      prompt(t('link'),u);try{navigator.clipboard.writeText(u)}catch(e){};try{showQR(u)}catch(qe){}
+      if(r.token)showShareSettings(r.token,true);
+    }
     else if(r.locked){alert(t('locked'))}
     else if(r.error){alert(r.error)}
   });
 }
 
-function doUnzip(name){
+function doUnzip(name,base){
+  base=base||cur;
   if(!confirm(t('unzip')+' '+name+'?'))return;
-  api('/api/unzip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur+name})}).then(function(r){
+  api('/api/unzip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:base+name})}).then(function(r){
     if(r.ok){alert(t('unzipDone')+': '+r.created+' files');load()}
     else{alert(r.error||t('upFail'))}
   });
 }
 
-function showVersions(name){
-  api('/api/versions?path='+encodeURIComponent(cur+name)).then(function(d){
+function showVersions(name,base){
+  base=base||cur;
+  api('/api/versions?path='+encodeURIComponent(base+name)).then(function(d){
     var vers=d.versions||[];
     var box=document.getElementById('verContent');
     if(!vers.length){box.innerHTML='<p style="color:var(--sys-text-3);text-align:center;padding:24px">'+t('noVers')+'</p>';document.getElementById('verModal').classList.add('show');return}
@@ -4719,7 +7974,7 @@ function showVersions(name){
     box.querySelectorAll('[data-ver]').forEach(function(b){
       b.onclick=function(){
         if(!confirm(t('confirmRestore')))return;
-        api('/api/versions/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur+name,ts:parseInt(b.getAttribute('data-ver'))})}).then(function(r){
+        api('/api/versions/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:base+name,ts:parseInt(b.getAttribute('data-ver'))})}).then(function(r){
           document.getElementById('verModal').classList.remove('show');
           if(r.ok){alert(t('saved'));load()}else{alert(r.error||t('upFail'))}
         });
@@ -4743,7 +7998,7 @@ document.getElementById('btnLock').onclick=function(){
   api('/api/folder-pass',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur,password:pw})}).then(function(){alert(pw?t('pwSet'):t('pwRm'))});
 };
 document.getElementById('btnLang').onclick=function(){lang=lang==='zh'?'en':'zh';localStorage.setItem('dl',lang);render()};
-document.getElementById('btnView').onclick=function(){viewMode=viewMode==='list'?'grid':(viewMode==='grid'?'gallery':'list');localStorage.setItem('dv',viewMode);render()};
+document.getElementById('btnView').onclick=function(){cycleView()};
 document.querySelectorAll('.fchip').forEach(function(b){
   b.onclick=function(){
     if(b.hasAttribute('data-ft'))filterType=b.getAttribute('data-ft');
@@ -4778,7 +8033,8 @@ function previewPDF(src,name){
     }
     Promise.all(promises).then(function(){
       box.innerHTML='';box.appendChild(container);
-      box.innerHTML+='<div class="mtitle"><span>'+esc(name)+'</span><span style="display:flex;gap:6px"><button class="mdl" id="pvDl">'+t('download')+'</button></span></div>';
+      // 必须用 insertAdjacentHTML 追加：innerHTML += 会重新序列化 DOM，canvas 位图会全部丢失
+      box.insertAdjacentHTML('beforeend','<div class="mtitle"><span>'+esc(name)+'</span><span style="display:flex;gap:6px"><button class="mdl" id="pvDl">'+t('download')+'</button></span></div>');
       document.getElementById('pvDl').onclick=function(){window.open(src.replace('/api/preview','/api/download'),'_blank')};
     });
   }).catch(function(e){
@@ -4787,43 +8043,224 @@ function previewPDF(src,name){
 }
 
 
-// ===== Music Playlist =====
+// ===== Office 文档预览（按需从 CDN 加载解析库）=====
+function isOffice(name){var e=(String(name||'').split('.').pop()||'').toLowerCase();return ['docx','xlsx','xls','csv','pptx','ods'].indexOf(e)>=0}
+function loadScriptOnce(url){
+  if(!loadScriptOnce.c)loadScriptOnce.c={};
+  if(loadScriptOnce.c[url])return loadScriptOnce.c[url];
+  loadScriptOnce.c[url]=new Promise(function(res,rej){
+    var s=document.createElement('script');s.src=url;s.async=true;
+    s.onload=function(){res(true)};s.onerror=function(){rej(new Error('load failed'))};
+    document.head.appendChild(s);
+  });
+  return loadScriptOnce.c[url];
+}
+function previewOffice(src,name){
+  var box=document.getElementById('pvContent');
+  var ext=(String(name||'').split('.').pop()||'').toLowerCase();
+  box.innerHTML='<div class="pdf-status" id="offStatus">'+(lang==='zh'?'加载文档组件…':'Loading document…')+'</div>';
+  function fail(msg){
+    box.innerHTML='<div class="pdf-status">'+esc(msg||'预览失败')+'</div><div class="mtitle"><span>'+esc(name)+'</span><span><button class="mdl" id="pvDl">'+t('download')+'</button></span></div>';
+    document.getElementById('pvDl').onclick=function(){window.open(src.replace('/api/preview','/api/download'),'_blank')};
+  }
+  function show(html,extra){
+    box.innerHTML='<div style="max-height:62vh;overflow:auto;background:var(--sys-fill);border-radius:10px;padding:12px;text-align:left" class="off-body">'+html+'</div>'
+      +'<div class="mtitle"><span>'+esc(name)+'</span><span style="display:flex;gap:6px">'+(extra||'')+'<button class="mdl" id="pvDl">'+t('download')+'</button></span></div>';
+    document.getElementById('pvDl').onclick=function(){window.open(src.replace('/api/preview','/api/download'),'_blank')};
+  }
+  if(ext==='xlsx'||ext==='xls'||ext==='csv'||ext==='ods'){
+    loadScriptOnce('https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js').then(function(){
+      return fetch(src).then(function(r){return r.arrayBuffer()});
+    }).then(function(buf){
+      var XLSX=window.XLSX;
+      if(!XLSX)throw new Error('xlsx missing');
+      var wb=XLSX.read(new Uint8Array(buf),{type:'array'});
+      var sheets=wb.SheetNames||[];
+      if(!sheets.length)throw new Error('empty');
+      var cur=0;
+      function paint(){
+        var html=XLSX.utils.sheet_to_html(wb.Sheets[sheets[cur]],{id:'sheet'+cur});
+        var tabs='<div style="margin-bottom:8px;display:flex;gap:4px;flex-wrap:wrap">'+sheets.map(function(s,j){
+          return '<button class="mdl" data-sheet="'+j+'" style="'+(j===cur?'background:var(--sys-blue);color:#fff;border-color:var(--sys-blue)':'')+'">'+esc(s)+'</button>';
+        }).join('')+'</div>';
+        var safe=(typeof DOMPurify!=='undefined')?DOMPurify.sanitize(tabs+html):tabs+html;
+        show(safe,'<span class="dup-path" style="align-self:center">'+sheets.length+' sheet(s)</span>');
+        var body=box.querySelector('.off-body');
+        if(body)body.querySelectorAll('[data-sheet]').forEach(function(b){b.onclick=function(){cur=parseInt(b.getAttribute('data-sheet'),10)||0;paint()}});
+        var t1=box.querySelector('table');
+        if(t1){t1.style.borderCollapse='collapse';t1.querySelectorAll('td,th').forEach(function(c){c.style.border='1px solid var(--sys-separator)';c.style.padding='3px 6px';c.style.fontSize='12.5px'})}
+      }
+      paint();
+    }).catch(function(e){fail((lang==='zh'?'表格预览失败（需联网加载解析库）：':'Table preview failed: ')+(e&&e.message||''))});
+  }else if(ext==='docx'){
+    loadScriptOnce('https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js').then(function(){
+      return fetch(src).then(function(r){return r.arrayBuffer()});
+    }).then(function(buf){
+      if(!window.mammoth)throw new Error('mammoth missing');
+      return window.mammoth.convertToHtml({arrayBuffer:buf});
+    }).then(function(res){
+      var safe=(typeof DOMPurify!=='undefined')?DOMPurify.sanitize(res.value||''):esc(res.value||'');
+      show(safe,'<span class="dup-path" style="align-self:center">docx</span>');
+      var body=box.querySelector('.off-body');
+      if(body){body.style.lineHeight='1.7';body.style.fontSize='14px'}
+    }).catch(function(e){fail((lang==='zh'?'文档预览失败（需联网加载解析库）：':'Document preview failed: ')+(e&&e.message||''))});
+  }else{
+    fail(lang==='zh'?'该格式暂不支持在线预览，请下载查看':'Preview not supported, please download');
+  }
+}
+
+// ===== 音乐播放器（播放列表 / 随机循环 / 音量记忆 / 歌词 / 封面）=====
+var PL={idx:-1,mode:'seq',vol:1,lrc:null,tracks:[]};
+function plSave(){try{localStorage.setItem('dPL',JSON.stringify({mode:PL.mode,vol:PL.vol,path:cur}))}catch(e){}}
+function plLoad(){
+  try{var o=JSON.parse(localStorage.getItem('dPL')||'{}');if(o.mode)PL.mode=o.mode;if(typeof o.vol==='number')PL.vol=o.vol}catch(e){}
+}
+plLoad();
+function plModeIcon(){return PL.mode==='shuffle'?'🔀':(PL.mode==='one'?'🔂':'🔁')}
+function plNextIdx(dir){
+  var n=PL.tracks.length;if(!n)return -1;
+  if(PL.mode==='shuffle')return Math.floor(Math.random()*n);
+  var i=PL.idx+dir;
+  if(i<0)i=n-1;if(i>=n)i=0;
+  return i;
+}
+function plApplyVolume(){
+  var a=document.getElementById('plAudio');
+  if(a){try{a.volume=PL.vol}catch(e){}}
+}
+function plCover(fileUrl){
+  // 读取 ID3v2 APIC 封面（仅取前 256KB）
+  return fetch(fileUrl,{headers:{Range:'bytes=0-262143'}}).then(function(r){return r.arrayBuffer()}).then(function(buf){
+    var u=new Uint8Array(buf);
+    if(u.length<10||u[0]!==0x49||u[1]!==0x44||u[2]!==0x33)return null;
+    var size=((u[6]&0x7f)<<21)|((u[7]&0x7f)<<14)|((u[8]&0x7f)<<7)|(u[9]&0x7f);
+    var pos=10, end=Math.min(u.length,10+size);
+    while(pos+10<end){
+      var id=String.fromCharCode(u[pos],u[pos+1],u[pos+2],u[pos+3]);
+      var sz=((u[pos+4]&0x7f)<<21)|((u[pos+5]&0x7f)<<14)|((u[pos+6]&0x7f)<<7)|(u[pos+7]&0x7f);
+      if(sz<=0||pos+10+sz>end)break;
+      if(id==='APIC'){
+        var q=pos+10, mimeEnd=q;
+        while(mimeEnd<end&&u[mimeEnd]!==0)mimeEnd++;
+        var mime=String.fromCharCode.apply(null,u.subarray(q,mimeEnd))||'image/jpeg';
+        var p=mimeEnd+1; if(p<end&&u[p]===3)p+=1;
+        var dstart=p; while(dstart<end&&u[dstart]!==0)dstart++;
+        dstart++;
+        if(dstart<pos+10+sz)return URL.createObjectURL(new Blob([u.subarray(dstart,pos+10+sz)],{type:mime}));
+        return null;
+      }
+      pos+=10+sz;
+    }
+    return null;
+  }).catch(function(){return null});
+}
+function plLyrics(name){
+  var base=String(name||'').replace(/\\.[^.]+$/,'').toLowerCase();
+  var hit=null;
+  for(var i=0;i<currentItems.length;i++){
+    var it=currentItems[i];
+    if(it&&it.type==='file'&&/\\.lrc$/i.test(it.name)&&String(it.name).replace(/\\.[^.]+$/,'').toLowerCase()===base){hit=it;break}
+  }
+  if(!hit)return Promise.resolve(null);
+  var p=encodeURIComponent((hit.path||cur)+hit.name);
+  return fetch('/api/preview?path='+p+'&token='+tk).then(function(r){return r.text()}).then(function(txt){
+    var lines=[],re=/\\[(\\d+):(\\d+(?:\\.\\d+)?)\\](.*)/g,m;
+    while((m=re.exec(txt))){lines.push({t:parseInt(m[1],10)*60+parseFloat(m[2]),s:m[3].trim()})}
+    lines.sort(function(a,b){return a.t-b.t});
+    return lines.length?lines:null;
+  }).catch(function(){return null});
+}
 function getAudioItems(){
   return currentItems.filter(function(it){return it.type==='file'&&(it.mime||'').indexOf('audio/')===0});
 }
-var playlistIdx=-1;
 function playPlaylist(idx){
   var audios=getAudioItems();
   if(!audios.length)return;
-  playlistIdx=idx;
+  PL.tracks=audios;
+  playlistIdx=idx;PL.idx=idx;
   var it=audios[idx];
-  var src='/api/preview?path='+encodeURIComponent(cur+it.name)+'&token='+tk;
+  var adir=it.path||cur;
+  var src='/api/preview?path='+encodeURIComponent(adir+it.name)+'&token='+tk;
   var box=document.getElementById('pvContent');
-  var h='<audio controls autoplay src="'+src+'" id="plAudio" style="width:100%"></audio>';
-  h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px"><button class="mdl" id="plPrev">⏮ Prev</button><span style="font-size:13px;color:var(--sys-text-2)">'+(idx+1)+' / '+audios.length+'</span><button class="mdl" id="plNext">Next ⏭</button></div>';
-  h+='<div class="playlist">';
+  var h='<div id="plCover" style="text-align:center"></div>';
+  h+='<audio controls autoplay src="'+src+'" id="plAudio" style="width:100%"></audio>';
+  h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:6px">'
+    +'<button class="mdl" id="plPrev">⏮</button>'
+    +'<button class="mdl" id="plMode" title="'+(lang==='zh'?'播放模式':'Mode')+'">'+plModeIcon()+'</button>'
+    +'<span style="font-size:13px;color:var(--sys-text-2)">'+(idx+1)+' / '+audios.length+'</span>'
+    +'<button class="mdl" id="plNext">⏭</button></div>';
+  h+='<div id="plLrc" style="max-height:180px;overflow:auto;margin-top:8px;font-size:13px;line-height:1.8;text-align:center;color:var(--sys-text-2)"></div>';
+  h+='<div class="playlist" style="margin-top:8px">';
   audios.forEach(function(a,i){h+='<div class="pl-item'+(i===idx?' active':'')+'" data-pli="'+i+'">'+getIcon(a)+'<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(a.name)+'</span></div>'});
   h+='</div>';
   box.innerHTML=h;
+  document.getElementById('pvModal').classList.add('show');
   var audio=document.getElementById('plAudio');
-  if(audio)audio.onended=function(){if(playlistIdx<audios.length-1)playPlaylist(playlistIdx+1)};
-  var prev=document.getElementById('plPrev');if(prev)prev.onclick=function(){if(playlistIdx>0)playPlaylist(playlistIdx-1)};
-  var next=document.getElementById('plNext');if(next)next.onclick=function(){if(playlistIdx<audios.length-1)playPlaylist(playlistIdx+1)};
-  box.querySelectorAll('[data-pli]').forEach(function(el){el.onclick=function(){playPlaylist(parseInt(el.getAttribute('data-pli')))}});
+  plApplyVolume();
+  if(audio){
+    audio.onended=function(){
+      if(PL.mode==='one'){audio.currentTime=0;audio.play();return}
+      var n=plNextIdx(1);
+      var last=PL.idx===PL.tracks.length-1;
+      if(PL.mode==='seq'&&last)return;
+      if(n>=0)playPlaylist(n);
+    };
+    audio.ontimeupdate=function(){
+      var c=PL.lrc;if(!c||!c.length)return;
+      var t=audio.currentTime,act=-1;
+      for(var i=0;i<c.length;i++){if(c[i].t<=t+0.25)act=i;else break}
+      var box2=document.getElementById('plLrc');
+      if(box2&&act>=0&&box2.getAttribute('data-act')!==String(act)){
+        box2.setAttribute('data-act',String(act));
+        box2.innerHTML=c.map(function(l,i){
+          return '<div style="'+(i===act?'color:var(--sys-blue);font-weight:600':'')+'" data-lt="'+l.t+'">'+esc(l.s||'·')+'</div>';
+        }).join('');
+        var cur2=box2.querySelector('[data-lt="'+c[act].t+'"]');
+        if(cur2&&cur2.scrollIntoView)try{cur2.scrollIntoView({block:'center'})}catch(e){}
+      }
+    };
+    audio.onvolumechange=function(){PL.vol=audio.volume;plSave()};
+  }
+  var prev=document.getElementById('plPrev');if(prev)prev.onclick=function(){var n=plNextIdx(-1);if(n>=0)playPlaylist(n)};
+  var next=document.getElementById('plNext');if(next)next.onclick=function(){var n=plNextIdx(1);if(n>=0)playPlaylist(n)};
+  var mb=document.getElementById('plMode');
+  if(mb)mb.onclick=function(){
+    PL.mode=PL.mode==='seq'?'all':(PL.mode==='all'?'one':(PL.mode==='one'?'shuffle':'seq'));
+    mb.textContent=plModeIcon();plSave();
+  };
+  box.querySelectorAll('[data-pli]').forEach(function(el){el.onclick=function(){playPlaylist(parseInt(el.getAttribute('data-pli'),10))}});
   var active=box.querySelector('.pl-item.active');
-  if(active)active.scrollIntoView({block:'nearest',behavior:'smooth'});
+  if(active&&active.scrollIntoView)try{active.scrollIntoView({block:'nearest'})}catch(e){}
+  // 封面与歌词（异步，失败静默）
+  plCover(src).then(function(url){
+    var c=document.getElementById('plCover');
+    if(url&&c)c.innerHTML='<img src="'+url+'" style="max-width:180px;max-height:180px;border-radius:10px;box-shadow:var(--sys-shadow-sm)">';
+  });
+  plLyrics(it.name).then(function(lines){
+    PL.lrc=lines;
+    var box2=document.getElementById('plLrc');
+    if(box2&&lines)box2.innerHTML=lines.map(function(l){return '<div data-lt="'+l.t+'">'+esc(l.s||'·')+'</div>'}).join('');
+  });
 }
 
 
 // ===== Image Slideshow + EXIF =====
 var slideshowTimer=null;
+function stopSlideshow(){
+  if(slideshowTimer){clearInterval(slideshowTimer);slideshowTimer=null;}
+  var p=document.getElementById('pvPrev'),n=document.getElementById('pvNext'),c=document.getElementById('pvCounter');
+  if(p)p.classList.remove('hidden');
+  if(n)n.classList.remove('hidden');
+  if(c)c.textContent='';
+}
 function startSlideshow(){
   var imgs=currentItems.filter(function(it){return it.type==='file'&&(it.mime||'').indexOf('image/')===0});
   if(!imgs.length)return;
   var idx=0;
   function showNext(){
     var it=imgs[idx];
-    var src='/api/preview?path='+encodeURIComponent(cur+it.name)+'&token='+tk;
+    var sdir=it.path||cur;
+    var src='/api/preview?path='+encodeURIComponent(sdir+it.name)+'&token='+tk;
     var box=document.getElementById('pvContent');
     box.innerHTML='<img src="'+src+'" style="max-width:100%;max-height:65vh;border-radius:8px" /><div class="exif-bar" id="exifBar"></div><div style="text-align:center;margin-top:8px;font-size:13px;color:var(--sys-text-2)">'+(idx+1)+' / '+imgs.length+' · '+esc(it.name)+'</div>';
     loadExif(src);
@@ -4870,23 +8307,37 @@ function takeScreenshot(){
   link.click();
 }
 
-function doPreview(name,mime,idx){
-  if(idx===undefined){idx=currentItems.findIndex(function(it){return it.type==='file'&&it.name===name});}
+function doPreview(name,mime,idx,base){
+  base=base||cur;
+  if(idx===undefined||idx<0){idx=currentItems.findIndex(function(it){return it.type==='file'&&it.name===name&&((it.path||cur)===base)});}
   if(idx<0||idx>=currentItems.length){return}
   previewIdx=idx;
   var it=currentItems[idx];
-  if(it.type!=='file'){return}
+  if(!it||it.type!=='file'){return}
   name=it.name;mime=it.mime||'';
-  var path=encodeURIComponent(cur+name);var src='/api/preview?path='+path+'&token='+tk;var box=document.getElementById('pvContent');var html='';
-  if((mime||'').indexOf('image/')===0){html='<img src="'+src+'" /><button class="mdl screenshot-btn" onclick="startSlideshow();closePv()" style="position:absolute;top:14px;left:18px;z-index:20">▶ '+t('slideshow')+'</button>'}
+  var idir=it.path||base||cur;
+  stopSlideshow();   // 打开新预览时先停掉上一次的幻灯片，避免定时器持续覆盖内容
+  var path=encodeURIComponent(idir+name);var src='/api/preview?path='+path+'&token='+tk;var box=document.getElementById('pvContent');var html='';
+  if((mime||'').indexOf('image/')===0){html='<img src="'+src+'" /><button class="mdl screenshot-btn" onclick="startSlideshow()" style="position:absolute;top:14px;left:18px;z-index:20">▶ '+t('slideshow')+'</button>'}
   else if((mime||'').indexOf('video/')===0)html='<video controls autoplay src="'+src+'" id="pvVideo"></video><button class="mdl screenshot-btn" onclick="takeScreenshot()">📷 '+t('screenshot')+'</button>';
-  else if((mime||'').indexOf('audio/')===0){playPlaylist(getAudioItems().findIndex(function(a){return a.name===name}));return}
+  else if((mime||'').indexOf('audio/')===0){
+    // 音频走播放列表，但必须自己把弹窗显示出来（此前提前 return，点音频毫无反应）
+    playPlaylist(getAudioItems().findIndex(function(a){return a.name===name&&((a.path||cur)===idir)}));
+    document.getElementById('pvModal').classList.add('show');
+    document.getElementById('pvPrev').classList.add('hidden');
+    document.getElementById('pvNext').classList.add('hidden');
+    document.getElementById('pvCounter').textContent='';
+    api('/api/recent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:idir+name})}).catch(function(){});
+    return;
+  }
   else if(isPDF(name)){html='<div class="pdf-status">Loading...</div>'}
+  else if(isOffice(name)){html='<div class="pdf-status">Loading...</div>'}
   else if(isText({mime:mime})){var isMd=name.toLowerCase().endsWith('.md');html='<div id="pvTextWrap"><div style="margin-bottom:8px;display:flex;gap:8px;justify-content:flex-end">'+(isMd?'<button id="pvMdToggle" class="mdl">'+t('renderMd')+'</button>':'')+'</div><pre id="pvT" class="hl-pre">Loading...</pre></div>'}
   else html='<p style="color:var(--sys-text-3);padding:40px;text-align:center">'+t('noResult')+'</p>';
-  html+='<div class="mtitle"><span>'+esc(name)+'</span><span style="display:flex;gap:6px"><button class="mdl" id="pvHis">'+t('history')+'</button><button class="mdl" id="pvEdit" style="display:'+(isText({mime:mime})?'inline-block':'none')+'">'+t('edit')+'</button><button class="mdl" id="pvDl">'+t('download')+'</button></span></div>';
+  html+='<div class="mtitle"><span>'+esc(name)+'</span><span style="display:flex;gap:6px"><button class="mdl" id="pvCmt">💬</button><button class="mdl" id="pvHis">'+t('history')+'</button><button class="mdl" id="pvEdit" style="display:'+(isText({mime:mime})?'inline-block':'none')+'">'+t('edit')+'</button><button class="mdl" id="pvDl">'+t('download')+'</button></span></div>';
   box.innerHTML=html;
   if(isPDF(name)){previewPDF(src,name)}
+  else if(isOffice(name)){previewOffice(src,name)}
   if(isText({mime:mime})){fetch(src).then(function(r){return r.text()}).then(function(txt){
     var p=document.getElementById('pvT');
     if(p){
@@ -4918,10 +8369,12 @@ function doPreview(name,mime,idx){
   })}
   document.getElementById('pvModal').classList.add('show');
   document.getElementById('pvDl').onclick=function(){window.open('/api/download?path='+path+'&token='+tk,'_blank')};
-  document.getElementById('pvEdit').onclick=function(){closePv();editText(name)};
-  document.getElementById('pvHis').onclick=function(){closePv();showVersions(name)};
+  document.getElementById('pvEdit').onclick=function(){closePv();editText(name,idir)};
+  document.getElementById('pvHis').onclick=function(){closePv();showVersions(name,idir)};
+  var cmtBtn=document.getElementById('pvCmt');
+  if(cmtBtn)cmtBtn.onclick=function(){showComments(idir+name,name)};
   updatePreviewNav();
-  api('/api/recent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur+name})}).catch(function(){});
+  api('/api/recent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:idir+name})}).catch(function(){});
 }
 function findPreviewableStep(dir){
   if(previewIdx<0)return -1;
@@ -4947,7 +8400,7 @@ function updatePreviewNav(){
 document.getElementById('pvPrev').onclick=function(e){e.stopPropagation();previewNav(-1)};
 document.getElementById('pvNext').onclick=function(e){e.stopPropagation();previewNav(1)};
 document.getElementById('pvClose').onclick=closePv;document.getElementById('pvModal').onclick=function(e){if(e.target===this)closePv()};
-function closePv(){document.getElementById('pvModal').classList.remove('show');previewIdx=-1;document.querySelectorAll('.modal video,.modal audio').forEach(function(el){el.pause();el.removeAttribute('src');el.load()})}
+function closePv(){stopSlideshow();document.getElementById('pvModal').classList.remove('show');previewIdx=-1;document.querySelectorAll('.modal video,.modal audio').forEach(function(el){el.pause();el.removeAttribute('src');el.load()})}
 document.addEventListener('keydown',function(e){
   if(!document.getElementById('pvModal').classList.contains('show'))return;
   if(e.key==='ArrowLeft'){previewNav(-1)}
@@ -4955,10 +8408,11 @@ document.addEventListener('keydown',function(e){
   else if(e.key==='Escape'){closePv()}
 });
 
-function editText(name){
-  var path=encodeURIComponent(cur+name);var src='/api/preview?path='+path+'&token='+tk;
+function editText(name,base){
+  base=base||cur;
+  var path=encodeURIComponent(base+name);var src='/api/preview?path='+path+'&token='+tk;
   var box=document.getElementById('pvContent');
-  box.innerHTML='<textarea id="edArea" spellcheck="false">Loading...</textarea><div class="mtitle"><span>'+esc(name)+'</span><button class="mdl" id="edSave">'+t('save')+'</button></div>';
+  box.innerHTML='<textarea id="edArea" spellcheck="false">Loading...</textarea><div id="edMsg"></div><div class="mtitle"><span>'+esc(name)+'</span><button class="mdl" id="edSave">'+t('save')+'</button></div>';
   document.getElementById('pvModal').classList.add('show');
   document.getElementById('pvPrev').classList.add('hidden');
   document.getElementById('pvNext').classList.add('hidden');
@@ -4966,24 +8420,42 @@ function editText(name){
   fetch(src).then(function(r){return r.text()}).then(function(txt){document.getElementById('edArea').value=txt});
   document.getElementById('edSave').onclick=function(){
     var content=document.getElementById('edArea').value;
-    fetch('/api/save?path='+path+'&token='+tk,{method:'POST',body:content}).then(function(){closePv();load()});
+    var msg=document.getElementById('edMsg');
+    if(msg){msg.textContent='';msg.style.color=''}
+    fetch('/api/save?path='+path+'&token='+tk,{method:'POST',body:content}).then(function(r){
+      if(r.ok){closePv();load();return}
+      // 保存失败（413/403/400 等）必须告知用户，不能照常关窗让内容丢失
+      return r.json().then(function(d){
+        var em=(d&&d.error)||('HTTP '+r.status);
+        if(msg){msg.textContent=(lang==='zh'?'保存失败：':'Save failed: ')+em;msg.style.color='var(--sys-red)'}
+        else alert((lang==='zh'?'保存失败：':'Save failed: ')+em);
+      }).catch(function(){
+        if(msg){msg.textContent=(lang==='zh'?'保存失败':'Save failed');msg.style.color='var(--sys-red)'}
+        else alert(lang==='zh'?'保存失败':'Save failed');
+      });
+    }).catch(function(){
+      if(msg){msg.textContent=(lang==='zh'?'网络错误，未保存':'Network error, not saved');msg.style.color='var(--sys-red)'}
+      else alert(lang==='zh'?'保存失败':'Save failed');
+    });
   };
 }
 
-function showMove(name){
+function showMove(name,base){
+  base=base||cur;
   api('/api/search?q=&path=/').then(function(all){
     var dirs=[{path:'/',label:'/ (Root)'}];var seen={'/':true};
-    all.results.forEach(function(r){if(r.type==='dir'){var p=r.path+r.name+'/';if(!seen[p]){seen[p]=true;dirs.push({path:p,label:p})}}});
+    (all&&all.results?all.results:[]).forEach(function(r){if(r.type==='dir'){var p=r.path+r.name+'/';if(!seen[p]){seen[p]=true;dirs.push({path:p,label:p})}}});
     var box=document.getElementById('mvContent');var h='';
     dirs.forEach(function(d){h+='<div class="mi" data-mp="'+esc(d.path)+'" style="padding:10px 14px;cursor:pointer;border-radius:8px;font-size:14px;color:var(--sys-blue);font-weight:500">'+esc(d.label)+'</div>'});
     box.innerHTML=h;document.getElementById('mvModal').classList.add('show');document.getElementById('mvTitle').textContent=t('moveTo');
-    box.querySelectorAll('[data-mp]').forEach(function(el){el.onclick=function(){api('/api/move',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur+name,target:el.getAttribute('data-mp')})}).then(function(){document.getElementById('mvModal').classList.remove('show');load()})};el.onmouseenter=function(){el.style.background='var(--sys-fill)'};el.onmouseleave=function(){el.style.background=''}});
+    box.querySelectorAll('[data-mp]').forEach(function(el){el.onclick=function(){api('/api/move',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:base+name,target:el.getAttribute('data-mp')})}).then(function(){document.getElementById('mvModal').classList.remove('show');load()})};el.onmouseenter=function(){el.style.background='var(--sys-fill)'};el.onmouseleave=function(){el.style.background=''}});
   });
 }
 document.getElementById('mvClose').onclick=function(){document.getElementById('mvModal').classList.remove('show')};
 document.getElementById('mvModal').onclick=function(e){if(e.target===this)this.classList.remove('show')};
 
-function showCtx(x,y,name,type,mime){
+function showCtx(x,y,name,type,mime,base){
+  base=base||cur;
   var menu=document.getElementById('ctxMenu');var h='';
   if(type==='file'){
     h+='<div class="mi" data-a="dl">'+t('download')+'</div><div class="mi" data-a="shr">'+t('share')+'</div><div class="mi" data-a="tag">🏷 '+t('tag')+'</div><div class="mi" data-a="note">📝 '+t('note')+'</div><div class="mi" data-a="enc">🔐 '+t('enc')+'</div>';
@@ -4992,21 +8464,28 @@ function showCtx(x,y,name,type,mime){
     if(isText({mime:mime}))h+='<div class="mi" data-a="ed">'+t('edit')+'</div>';
   }
   h+='<div class="mi" data-a="ren">'+t('ren')+'</div><div class="mi" data-a="mv">'+t('move')+'</div><div class="mi danger" data-a="del">'+t('del')+'</div>';
+  h+='<div class="mi" data-a="cpy">📋 '+t('copy')+'</div><div class="mi" data-a="cut">✂ '+t('cut')+'</div>';
+  if(type==='file')h+='<div class="mi" data-a="link">🔗 '+(lang==='zh'?'限时直链':'Signed link')+'</div>';
+  if(type==='dir')h+='<div class="mi" data-a="pst">📥 '+t('pasteHere')+'</div>';
   if(type==='dir')h+='<div class="mi" data-a="shrd">📁 '+t('share')+'</div>';
   menu.innerHTML=h;menu.style.left=Math.min(x,window.innerWidth-190)+'px';menu.style.top=Math.min(y,window.innerHeight-260)+'px';menu.classList.add('show');
   menu.onclick=function(e){var a=e.target.getAttribute('data-a');if(!a)return;menu.classList.remove('show');
-    if(a==='dl')window.open('/api/download?path='+encodeURIComponent(cur+name)+'&token='+tk,'_blank');
-    else if(a==='shr')doShare(name);
-    else if(a==='shrd')doShareDir(cur+name+'/');
-    else if(a==='his')showVersions(name);
-    else if(a==='tag')doTagFile(name);
-    else if(a==='note')showNote(name);
-    else if(a==='enc')showEncrypt(name);
-    else if(a==='unz')doUnzip(name);
-    else if(a==='ed')editText(name);
-    else if(a==='ren'){var n=prompt(t('rename'),name);if(n&&n!==name)api('/api/rename',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur+name,newName:n})}).then(load)}
-    else if(a==='mv')showMove(name);
-    else if(a==='del'){if(confirm(t('delete')))api('/api/delete?path='+encodeURIComponent(cur+name),{method:'DELETE'}).then(load)}
+    if(a==='dl')window.open('/api/download?path='+encodeURIComponent(base+name)+'&token='+tk,'_blank');
+    else if(a==='shr')doShare(name,base);
+    else if(a==='shrd')doShareDir(base+name+'/');
+    else if(a==='his')showVersions(name,base);
+    else if(a==='tag')doTagFile(name,base);
+    else if(a==='note')showNote(name,base);
+    else if(a==='enc')showEncrypt(name,base);
+    else if(a==='unz')doUnzip(name,base);
+    else if(a==='ed')editText(name,base);
+    else if(a==='ren'){var n=prompt(t('rename'),name);if(n&&n!==name)api('/api/rename',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:base+name,newName:n})}).then(load)}
+    else if(a==='mv')showMove(name,base);
+    else if(a==='del'){if(confirm(t('delete')))api('/api/delete?path='+encodeURIComponent(base+name),{method:'DELETE'}).then(load)}
+    else if(a==='cpy')clipSet('copy',[base+name]);
+    else if(a==='cut')clipSet('cut',[base+name]);
+    else if(a==='pst')pasteHere(base+name+'/');
+    else if(a==='link')signedLink(base+name,base);
   };
 }
 document.addEventListener('click',function(){var m=document.getElementById('ctxMenu');if(m)m.classList.remove('show')});
@@ -5016,8 +8495,9 @@ document.addEventListener('click',function(){var m=document.getElementById('ctxM
 document.getElementById('btnTag').onclick=function(){showTagModal()};
 document.getElementById('tagClose').onclick=function(){document.getElementById('tagModal').classList.remove('show')};
 document.getElementById('tagModal').onclick=function(e){if(e.target===this)this.classList.remove('show')};
-function showTagModal(fileName){
-  var path=fileName?cur+fileName:'';
+function showTagModal(fileName,base){
+  base=base||cur;
+  var path=fileName?base+fileName:'';
   var box=document.getElementById('tagContent');
   var title=document.getElementById('tagTitle');
   api('/api/tags').then(function(d){
@@ -5034,7 +8514,7 @@ function showTagModal(fileName){
       h+='<div style="display:flex;flex-wrap:wrap;gap:6px">';
       allTags.forEach(function(tg){
         var has=fileName&&fileTags.some(function(ft){return ft.name===tg.name});
-        h+='<span class="tag-chip" data-tc="'+esc(tg.name)+'"'+(has?' style="outline:2px solid var(--sys-accent)"':'')+'><span class="tag-dot" style="background:'+(tg.color||'#0a84ff')+'"></span>'+esc(tg.name);
+        h+='<span class="tag-chip" data-tc="'+esc(tg.name)+'"'+(has?' style="outline:2px solid var(--sys-accent)"':'')+'><span class="tag-dot" style="background:'+safeColor(tg.color)+'"></span>'+esc(tg.name);
         if(fileName)h+='<span class="tag-x" data-tx="'+esc(tg.name)+'">✕</span>';
         h+='</span>';
       });
@@ -5050,7 +8530,7 @@ function showTagModal(fileName){
         if(fileName){
           var merged=fileTags.concat([{name:name,color:color}]);
           merged=merged.filter(function(t,i,a){return !a.slice(0,i).some(function(x){return x.name===t.name})});
-          api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path,tags:merged})}).then(function(){showTagModal(fileName);renderTagSidebar()});
+          api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path,tags:merged})}).then(function(){showTagModal(fileName,base);renderTagSidebar()});
         }else{
           api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'/.tag-register/',tags:[{name:name,color:color}]})}).then(function(){showTagModal();renderTagSidebar()});
         }
@@ -5067,7 +8547,7 @@ function showTagModal(fileName){
             var tg=allTags.find(function(x){return x.name===tn})||{name:tn,color:'#0a84ff'};
             merged=fileTags.concat([tg]);
           }
-          api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path,tags:merged})}).then(function(){showTagModal(fileName);renderTagSidebar()});
+          api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path,tags:merged})}).then(function(){showTagModal(fileName,base);renderTagSidebar()});
         };
       });
       box.querySelectorAll('[data-tx]').forEach(function(el){
@@ -5075,7 +8555,7 @@ function showTagModal(fileName){
           e.stopPropagation();
           var tn=el.getAttribute('data-tx');
           var merged=fileTags.filter(function(ft){return ft.name!==tn});
-          api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path,tags:merged})}).then(function(){showTagModal(fileName);renderTagSidebar()});
+          api('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path,tags:merged})}).then(function(){showTagModal(fileName,base);renderTagSidebar()});
         };
       });
     }
@@ -5089,7 +8569,7 @@ function showTagModal(fileName){
     }
   });
 }
-function doTagFile(name){showTagModal(name)}
+function doTagFile(name,base){showTagModal(name,base)}
 
 
 // ===== Duplicate finder =====
@@ -5119,8 +8599,9 @@ function showDuplicates(){
 // ===== File notes =====
 document.getElementById('noteClose').onclick=function(){document.getElementById('noteModal').classList.remove('show')};
 document.getElementById('noteModal').onclick=function(e){if(e.target===this)this.classList.remove('show')};
-function showNote(name){
-  var path=cur+name;
+function showNote(name,base){
+  base=base||cur;
+  var path=base+name;
   var box=document.getElementById('noteContent');
   document.getElementById('noteTitle').textContent=t('note')+' · '+name;
   box.innerHTML='<textarea id="noteArea" class="note-textarea" placeholder="Add notes...">Loading...</textarea><div style="margin-top:12px;text-align:right"><button id="noteSave" class="btn small">'+t('save')+'</button></div>';
@@ -5166,8 +8647,8 @@ function showTrash(){
     box.innerHTML=h;document.getElementById('trModal').classList.add('show');
 
     function getChecked(){var arr=[];box.querySelectorAll('[data-trc]:checked').forEach(function(cb){arr.push(cb.getAttribute('data-trc'))});return arr}
-    box.querySelectorAll('[data-rst]').forEach(function(b){b.onclick=function(){api('/api/restore?name='+encodeURIComponent(b.getAttribute('data-rst')),{method:'POST'}).then(function(){showTrash();load()})}});
-    box.querySelectorAll('[data-pg]').forEach(function(b){b.onclick=function(){api('/api/purge?name='+encodeURIComponent(b.getAttribute('data-pg')),{method:'DELETE'}).then(showTrash)}});
+    box.querySelectorAll('[data-rst]').forEach(function(b){b.onclick=function(){api('/api/restore?name='+encodeURIComponent(b.getAttribute('data-rst')),{method:'POST'}).then(function(r){if(r&&r.error)alert((lang==='zh'?'恢复失败：':'Restore failed: ')+r.error);showTrash();load()})}});
+    box.querySelectorAll('[data-pg]').forEach(function(b){b.onclick=function(){if(!confirm(t('purge')+'?'))return;api('/api/purge?name='+encodeURIComponent(b.getAttribute('data-pg')),{method:'DELETE'}).then(function(r){if(r&&r.error)alert(r.error);showTrash()})}});
     var trAll=document.getElementById('trAll');
     if(trAll)trAll.onchange=function(){box.querySelectorAll('[data-trc]').forEach(function(cb){cb.checked=trAll.checked})};
     var br=document.getElementById('trBatchRst');if(br)br.onclick=function(){var arr=getChecked();if(!arr.length)return;api('/api/batch-restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:arr})}).then(function(){showTrash();load()})};
@@ -5179,12 +8660,24 @@ function showTrash(){
 document.getElementById('btnLogin').onclick=function(){
   var fd=new FormData();
   fd.append('password',document.getElementById('pw').value);
-  fetch('/api/login',{method:'POST',body:fd}).then(function(r){return r.json()}).then(function(d){
-    if(d.token){tk=d.token;sessionStorage.setItem('dt',tk);show('main');load()}
-    else document.getElementById('loginErr').style.display='block';
-  });
+  var codeEl=document.getElementById('totpCode');
+  if(codeEl&&codeEl.value.trim())fd.append('code',codeEl.value.trim());
+  fetch('/api/login',{method:'POST',body:fd}).then(function(r){return r.json().then(function(d){return{ok:r.ok,d:d}})}).then(function(res){
+    var d=res.d;
+    if(d.token){tk=d.token;sessionStorage.setItem('dt',tk);show('main');goHome();loadUsage();return}
+    // 需要二次验证时把动态码输入框显示出来
+    if(d&&(d.totp||String(d.error||'').toLowerCase().indexOf('code')>=0)){
+      var row=document.getElementById('totpRow');if(row)row.classList.remove('hidden');
+      var el=document.getElementById('loginErr');
+      if(el){el.textContent=(d.error||'')+(lang==='zh'?'（请输入动态码）':' (enter code)');el.style.display='block'}
+      if(codeEl)codeEl.focus();
+      return;
+    }
+    document.getElementById('loginErr').style.display='block';
+  }).catch(function(){document.getElementById('loginErr').style.display='block'});
 };
 document.getElementById('pw').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnLogin').click()};
+document.getElementById('totpCode').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnLogin').click()};
 document.getElementById('btnLogout').onclick=function(){tk='';sessionStorage.removeItem('dt');show('login')};
 
 document.getElementById('btnUp').onclick=function(){document.getElementById('fileInput').click()};
@@ -5257,7 +8750,9 @@ function compressImage(file){
       canvas.getContext('2d').drawImage(img,0,0,w,h);
       canvas.toBlob(function(blob){
         if(blob&&blob.size<file.size){
-          resolve(new File([blob],file.name,{type:'image/jpeg'}));
+          var nf;
+          try{nf=new File([blob],file.name,{type:'image/jpeg'});if(file._relPath)nf._relPath=file._relPath}catch(e){nf=file}
+          resolve(nf);
         }else{resolve(file)}
       },'image/jpeg',0.85);
     };
@@ -5266,12 +8761,764 @@ function compressImage(file){
   });
 }
 
-function uploadFiles(files){if(!files||!files.length)return;for(var i=0;i<files.length;i++){(function(file){var div=makeUpItem(file.name);uploadQueue++;compressImage(file).then(function(file){return Promise.all([Promise.resolve(file),makeThumb(file)])}).then(function(arr){var file=arr[0],thumb=arr[1];if(file.size>CHUNK_SIZE){uploadChunked(file,div,thumb)}else{uploadSimple(file,div,thumb)}})})(files[i])}}
-function makeUpItem(name){var list=document.getElementById('upList');var div=document.createElement('div');div.className='upitem';div.innerHTML='<span class="upname">'+esc(name)+'</span><div class="upbar"><div class="upfill" style="width:0%"></div></div><span class="upst">0%</span>';list.appendChild(div);return div}
-function setProgress(div,pct){div.querySelector('.upfill').style.width=pct+'%';div.querySelector('.upst').textContent=pct+'%'}
-function setDone(div){div.querySelector('.upfill').style.width='100%';div.querySelector('.upst').textContent=t('upDone');div.querySelector('.upst').style.color='var(--sys-green)';uploadQueue--;setTimeout(function(){if(div.parentNode)div.parentNode.removeChild(div)},1500);if(uploadQueue===0)load()}
-function setFail(div,msg){div.querySelector('.upst').textContent=msg||t('upFail');div.querySelector('.upst').style.color='var(--sys-red)';uploadQueue--}
-// ===== Upload dedup =====
+// ===== 命令面板（⌘K / Ctrl+K）=====
+var PALETTE={open:false,items:[],idx:0,seq:0};
+function paletteModal(){return document.getElementById('palette')}
+function paletteCommands(){
+  function go(fn){return function(){try{fn()}catch(e){console.warn(e)}}}
+  var zh=lang==='zh';
+  var list=[
+    {ic:'⬆',t:zh?'上传文件':'Upload files',s:'upload',run:go(function(){document.getElementById('fileInput').click()})},
+    {ic:'📁',t:zh?'新建文件夹':'New folder',s:'mkdir',run:go(function(){document.getElementById('folderInput').focus()})},
+    {ic:'🔎',t:zh?'搜索当前盘':'Search all',s:'search',run:go(function(){document.getElementById('searchInput').focus()})},
+    {ic:'🔄',t:zh?'刷新列表':'Refresh',s:'reload',run:go(function(){load()})},
+    {ic:'★',t:zh?'收藏视图':'Favorites',s:'fav',run:go(function(){setMode('fav');render()})},
+    {ic:'🕐',t:zh?'最近访问':'Recent',s:'recent',run:go(function(){setMode('recent');render()})},
+    {ic:'🔀',t:zh?'切换视图（网格/列表/列/图库）':'Cycle view',s:'view',run:go(function(){cycleView()})},
+    {ic:'🔤',t:zh?'排序：名称':'Sort by name',s:'sort name',run:go(function(){sortKey='name';render()})},
+    {ic:'📅',t:zh?'排序：时间':'Sort by date',s:'sort time',run:go(function(){sortKey='time';render()})},
+    {ic:'⚖',t:zh?'排序：大小':'Sort by size',s:'sort size',run:go(function(){sortKey='size';render()})},
+    {ic:'📦',t:zh?'打包当前目录':'ZIP current folder',s:'zip',run:go(function(){document.getElementById('btnZip').click()})},
+    {ic:'📁',t:zh?'分享当前目录':'Share current folder',s:'share',run:go(function(){doShareDir(cur)})},
+    {ic:'📥',t:zh?'从 WebDAV 导入':'Import WebDAV',s:'import',run:go(function(){importWebdav()})},
+    {ic:'⭐',t:zh?'上传队列与并发':'Upload queue',s:'queue',run:go(function(){document.getElementById('upQueueBar').scrollIntoView({behavior:'smooth'})})},
+    {ic:'📋',t:zh?'粘贴到当前目录':'Paste here',s:'paste',run:go(function(){pasteHere(cur)})},
+    {ic:'🗑',t:zh?'回收站':'Trash',s:'trash',run:go(function(){showTrash()})},
+    {ic:'🏷',t:zh?'标签管理':'Tags',s:'tags',run:go(function(){showTagModal()})},
+    {ic:'🔎',t:zh?'重复文件':'Duplicates',s:'dup',run:go(function(){document.getElementById('btnDup').click()})},
+    {ic:'📊',t:zh?'统计面板':'Stats',s:'stats',run:go(function(){showStats()})},
+    {ic:'📜',t:zh?'活动日志':'Activity log',s:'log',run:go(function(){showLog()})},
+    {ic:'🔗',t:zh?'分享管理':'Share manager',s:'shares',run:go(function(){showShareMgmt()})},
+    {ic:'📤',t:zh?'上传链接管理':'Upload links',s:'ulinks',run:go(function(){showULinkMgmt()})},
+    {ic:'🔑',t:zh?'访问令牌':'Tokens',s:'tokens',run:go(function(){showTokens()})},
+    {ic:'🖥',t:zh?'登录设备':'Sessions',s:'sessions',run:go(function(){showSessions()})},
+    {ic:'🛡',t:zh?'二次验证 (TOTP)':'Two-factor',s:'totp',run:go(function(){showTotp()})},
+    {ic:'🛠',t:zh?'运维与配置':'Ops & config',s:'config',run:go(function(){showOps('config')})},
+    {ic:'💾',t:zh?'备份与恢复':'Backup',s:'backup',run:go(function(){showBackup()})},
+    {ic:'🩺',t:zh?'健康检查':'Health',s:'health',run:go(function(){showHealth()})},
+    {ic:'🧹',t:zh?'孤儿文件扫描':'Orphan scan',s:'orphans',run:go(function(){showOrphans()})},
+    {ic:'🖼',t:zh?'公开相册':'Albums',s:'albums',run:go(function(){showAlbums()})},
+    {ic:'🌗',t:zh?'切换主题':'Toggle theme',s:'theme',run:go(function(){document.getElementById('btnTheme').click()})},
+    {ic:'🌐',t:zh?'切换语言':'Toggle language',s:'lang',run:go(function(){document.getElementById('btnLang').click()})},
+    {ic:'⬆',t:zh?'返回上级目录':'Go to parent',s:'parent',run:go(function(){goParent()})},
+    {ic:'🚪',t:zh?'退出登录':'Log out',s:'logout',run:go(function(){document.getElementById('btnLogout').click()})}
+  ];
+  return list;
+}
+function paletteRender(){
+  var box=document.getElementById('paletteList');
+  if(!box)return;
+  var h='';
+  if(!PALETTE.items.length){h='<div class="palette-item" style="color:var(--sys-text-3)">'+(lang==='zh'?'没有匹配结果':'No matches')+'</div>'}
+  PALETTE.items.forEach(function(it,i){
+    h+='<div class="palette-item'+(i===PALETTE.idx?' active':'')+'" data-pi="'+i+'"><span class="pi-ic">'+(it.ic||'•')+'</span><span>'+esc(it.t)+'</span>'+(it.s?('<span class="pi-sub">'+esc(it.s)+'</span>'):'')+'</div>';
+  });
+  box.innerHTML=h;
+  box.querySelectorAll('[data-pi]').forEach(function(el){
+    el.onclick=function(){paletteRun(parseInt(el.getAttribute('data-pi'),10))};
+    el.onmouseenter=function(){PALETTE.idx=parseInt(el.getAttribute('data-pi'),10);paletteRender()};
+  });
+  var act=box.querySelector('.palette-item.active');
+  if(act&&act.scrollIntoView)try{act.scrollIntoView({block:'nearest'})}catch(e){}
+}
+function paletteFilter(q){
+  var all=paletteCommands();
+  q=String(q||'').trim().toLowerCase();
+  if(!q){PALETTE.items=all.slice(0,12);PALETTE.idx=0;paletteRender();return}
+  var hit=all.filter(function(c){return (c.t+' '+(c.s||'')).toLowerCase().indexOf(q)>=0});
+  PALETTE.items=hit.slice(0,10);
+  // 同时搜文件（防抖后走服务端搜索）
+  var my=++PALETTE.seq;
+  clearTimeout(PALETTE.timer);
+  PALETTE.timer=setTimeout(function(){
+    api('/api/search?q='+encodeURIComponent(q)+'&path=/&limit=8').then(function(d){
+      if(my!==PALETTE.seq)return;
+      var res=(d.results||[]).slice(0,8).map(function(r){
+        return {ic:r.type==='dir'?'📁':getIcon(r),t:r.name,s:(r.path||''),file:r,
+          run:function(){
+            if(r.type==='dir'){cur=normP(r.path||'/')+r.name+'/';setMode('');load()}
+            else doPreview(r.name,r.mime||'',-1,r.path||'/');
+          }};
+      });
+      PALETTE.items=hit.slice(0,8).concat(res);
+      PALETTE.idx=0;paletteRender();
+    }).catch(function(){});
+  },220);
+  paletteRender();
+}
+function paletteRun(i){
+  var it=PALETTE.items[i];
+  if(!it)return;
+  paletteClose();
+  setTimeout(function(){try{it.run()}catch(e){console.warn(e)}},30);
+}
+function paletteOpen(){
+  var m=paletteModal();if(!m)return;
+  PALETTE.open=true;m.classList.add('show');
+  var inp=document.getElementById('paletteInput');
+  if(inp){inp.value='';inp.focus()}
+  paletteFilter('');
+}
+function paletteClose(){
+  var m=paletteModal();if(!m)return;
+  PALETTE.open=false;m.classList.remove('show');
+}
+document.getElementById('btnPalette').onclick=function(){paletteOpen()};
+document.getElementById('palette').onclick=function(e){if(e.target===this)paletteClose()};
+document.getElementById('paletteInput').oninput=function(){paletteFilter(this.value)};
+document.getElementById('paletteInput').onkeydown=function(e){
+  if(e.key==='ArrowDown'){e.preventDefault();PALETTE.idx=Math.min(PALETTE.idx+1,PALETTE.items.length-1);paletteRender()}
+  else if(e.key==='ArrowUp'){e.preventDefault();PALETTE.idx=Math.max(0,PALETTE.idx-1);paletteRender()}
+  else if(e.key==='Enter'){e.preventDefault();paletteRun(PALETTE.idx)}
+  else if(e.key==='Escape'){e.preventDefault();paletteClose()}
+};
+
+// ===== 视图切换 / 虚拟滚动 / 列视图 =====
+var VIEWS=['grid','list','columns','gallery'];
+function cycleView(){
+  var i=VIEWS.indexOf(viewMode);
+  viewMode=VIEWS[(i+1)%VIEWS.length];
+  try{localStorage.setItem('dv',viewMode)}catch(e){}
+  syncViewBtn();render();
+}
+function syncViewBtn(){
+  var b=document.getElementById('btnView');
+  if(!b)return;
+  var zh=lang==='zh';
+  b.textContent=viewMode==='grid'?(zh?'网格':'Grid'):viewMode==='list'?(zh?'列表':'List'):viewMode==='columns'?(zh?'列':'Columns'):(zh?'图库':'Gallery');
+}
+var VIRT={rowH:46,pad:10,scroll:0,id:'vscroll'};
+function renderVirtualList(container,items,paint,bind){
+  var total=items.length;
+  var vis=Math.ceil(900/VIRT.rowH)+12;
+  var start=Math.max(0,Math.floor(VIRT.scroll/VIRT.rowH)-4);
+  var end=Math.min(total,start+vis);
+  var h='<div class="vscroll" id="'+VIRT.id+'" style="height:100%">';
+  h+='<div style="height:'+(start*VIRT.rowH)+'px"></div><ul class="file-list">';
+  for(var i=start;i<end;i++)h+=paint(items[i],i);
+  h+='</ul><div style="height:'+Math.max(0,(total-end)*VIRT.rowH)+'px"></div></div>';
+  container.innerHTML=h;
+  var sc=document.getElementById(VIRT.id);
+  if(sc){
+    sc.onscroll=function(){
+      VIRT.scroll=sc.scrollTop;
+      if(VIRT.ticking)return;
+      VIRT.ticking=true;
+      requestAnimationFrame(function(){
+        VIRT.ticking=false;
+        var s=Math.max(0,Math.floor(sc.scrollTop/VIRT.rowH)-4);
+        if(Math.abs(s-Math.floor(VIRT.scroll/VIRT.rowH))<6)return;
+        VIRT.scroll=sc.scrollTop;
+        var keep=sc.scrollTop;
+        renderVirtualList(container,items,paint,bind);
+        var ns=document.getElementById(VIRT.id);
+        if(ns)ns.scrollTop=keep;
+      });
+    };
+  }
+  bind();
+}
+
+// ===== 移动端手势（滑动返回 / 左滑多选 / 长按菜单 / 下拉刷新）=====
+function bindGestures(container){
+  var startX=0,startY=0,startT=0,row=null,moved=false;
+  container.addEventListener('touchstart',function(e){
+    if(!e.touches||e.touches.length!==1)return;
+    var t=e.touches[0];
+    startX=t.clientX;startY=t.clientY;startT=Date.now();moved=false;
+    row=e.target.closest?e.target.closest('li,.gitem'):null;
+    if(row&&row.__lp)clearTimeout(row.__lp);
+    if(row){
+      row.__lp=setTimeout(function(){
+        if(moved||!row)return;
+        var p=rowDir(row),n=row.getAttribute('data-n')||row.getAttribute('data-li')||'';
+        showCtx(startX,startY,n,(row.getAttribute('data-p')!==null&&row.getAttribute('data-t'))||'file',row.getAttribute('data-m')||'',p);
+        try{navigator.vibrate&&navigator.vibrate(10)}catch(e2){}
+      },520);
+    }
+  },{passive:true});
+  container.addEventListener('touchmove',function(e){
+    if(!e.touches||e.touches.length!==1)return;
+    var t=e.touches[0];
+    if(Math.abs(t.clientX-startX)>12||Math.abs(t.clientY-startY)>12){moved=true;if(row&&row.__lp)clearTimeout(row.__lp)}
+  },{passive:true});
+  container.addEventListener('touchend',function(e){
+    if(row&&row.__lp)clearTimeout(row.__lp);
+    if(!e.changedTouches||!e.changedTouches.length)return;
+    var t=e.changedTouches[0];
+    var dx=t.clientX-startX,dy=t.clientY-startY,dt=Date.now()-startT;
+    if(dt>700)return;
+    if(Math.abs(dy)>Math.abs(dx))return;
+    if(dx>70&&Math.abs(dy)<45){goParent();return}                  // 右滑 → 返回上级
+    if(dx<-60&&Math.abs(dy)<45&&row){                              // 左滑 → 多选
+      var cb=row.querySelector('[data-chk]');
+      if(cb){cb.checked=!cb.checked;cb.dispatchEvent(new Event('change'))}
+    }
+  },{passive:true});
+  // 下拉刷新
+  var pull=0,pulling=false;
+  container.addEventListener('touchstart',function(e){
+    if(window.scrollY<=2&&e.touches&&e.touches.length===1){pulling=true;pull=e.touches[0].clientY}
+  },{passive:true});
+  container.addEventListener('touchmove',function(e){
+    if(!pulling||!e.touches||!e.touches.length)return;
+    var dy=e.touches[0].clientY-pull;
+    if(dy>80){pulling=false;setMsgTouch(lang==='zh'?'正在刷新…':'Refreshing…');load()}
+  },{passive:true});
+  container.addEventListener('touchend',function(){pulling=false},{passive:true});
+}
+function setMsgTouch(txt){
+  var el=document.getElementById('offlineBar');
+  if(!el)return;
+  el.style.display='block';el.textContent=txt;
+  setTimeout(function(){checkOnline()},1200);
+}
+function goParent(){
+  if(cur==='/')return;
+  var parts=cur.split('/').filter(Boolean);parts.pop();
+  cur=parts.length?'/'+parts.join('/')+'/':'/';
+  setMode('');load();
+}
+
+// ===== 离线只读 =====
+function checkOnline(){
+  var bar=document.getElementById('offlineBar');
+  if(!bar)return;
+  if(navigator.onLine===false){
+    bar.style.display='block';
+    bar.textContent=(lang==='zh'?'📴 离线模式：仅可浏览（列表来自缓存，写入操作不可用）':'Offline: read-only (cached listing)');
+  }else bar.style.display='none';
+}
+window.addEventListener('online',checkOnline);
+window.addEventListener('offline',checkOnline);
+
+// ===== 系统分享 → 上传（Web Share Target）=====
+function bindShareTarget(){
+  function pullShared(count){
+    var n=parseInt(count,10)||0;
+    if(!n)return;
+    var files=[];var done=0;
+    for(var i=0;i<n;i++){
+      (function(i){
+        fetch('/shared/'+i,{cache:'no-store'}).then(function(r){
+          if(!r.ok)throw new Error('miss');
+          var nm='shared-'+i;
+          try{var raw=r.headers.get('X-File-Name');if(raw)nm=decodeURIComponent(raw)}catch(e){}
+          return r.blob().then(function(b){return new File([b],nm,{type:b.type||'application/octet-stream'})});
+        }).then(function(f){files.push(f)}).catch(function(){}).then(function(){
+          if(++done===n&&files.length)uploadFiles(files,cur);
+        });
+      })(i);
+    }
+  }
+  if(navigator.serviceWorker&&navigator.serviceWorker.addEventListener){
+    navigator.serviceWorker.addEventListener('message',function(e){
+      if(e.data&&e.data.type==='shared-files')pullShared(e.data.count);
+    });
+  }
+  try{
+    var m=/[?&]shared=(\\d+)/.exec(location.search);
+    if(m&&parseInt(m[1],10)>0){pullShared(m[1]);try{history.replaceState(null,'',location.pathname)}catch(e){}}
+  }catch(e){}
+}
+bindShareTarget();
+checkOnline();
+
+// ===== 相似图片（感知哈希 dHash + 汉明距离分组）=====
+function dHashFromBlob(blob){
+  return createImageBitmap(blob).then(function(bmp){
+    var w=9,h=8;
+    var c=document.createElement('canvas');c.width=w;c.height=h;
+    var ctx=c.getContext('2d');
+    ctx.drawImage(bmp,0,0,w,h);
+    var d=ctx.getImageData(0,0,w,h).data,bits='';
+    for(var y=0;y<h;y++){
+      for(var x=0;x<w-1;x++){
+        var i=(y*w+x)*4,j=(y*w+x+1)*4;
+        var a=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+        var b=0.299*d[j]+0.587*d[j+1]+0.114*d[j+2];
+        bits+=(a>b)?'1':'0';
+      }
+    }
+    var hex='';
+    for(var k=0;k<64;k+=4)hex+=parseInt(bits.substr(k,4),2).toString(16);
+    try{if(bmp.close)bmp.close()}catch(e){}
+    return hex;
+  });
+}
+function phDistance(a,b){
+  if(!a||!b||a.length!==b.length)return 99;
+  var n=0;
+  for(var i=0;i<a.length;i++){
+    var x=parseInt(a[i],16)^parseInt(b[i],16);
+    while(x){n+=x&1;x>>=1}
+  }
+  return n;
+}
+function imgUrl(p){return '/api/thumb?path='+encodeURIComponent(p)+'&token='+tk}
+function simModal(){
+  var m=document.getElementById('simModal');
+  if(!m){
+    m=document.createElement('div');m.id='simModal';m.className='modal-bg';
+    m.innerHTML='<div class="modal" style="min-width:460px;max-width:820px"><button class="mclose" id="simClose">✕</button><h3>🖼 '+(lang==='zh'?'相似图片':'Similar images')+'</h3><div id="simContent"></div></div>';
+    document.body.appendChild(m);
+    document.getElementById('simClose').onclick=function(){m.classList.remove('show')};
+    m.onclick=function(e){if(e.target===m)m.classList.remove('show')};
+  }
+  return m;
+}
+function showSimilar(){
+  var m=simModal(),box=document.getElementById('simContent');
+  box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">'+(lang==='zh'?'正在分析当前目录的图片…':'Analyzing images…')+'</p>';
+  m.classList.add('show');
+  var threshold=parseInt(localStorage.getItem('dSimTh')||'8',10)||8;
+  api('/api/media?path='+encodeURIComponent(cur)+'&kind=image&limit=800').then(function(d){
+    var items=(d.items||[]).filter(function(it){return it.mime&&it.mime.indexOf('image/')===0});
+    if(!items.length){box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">'+(lang==='zh'?'当前目录没有图片（可先进入含图片的目录）':'No images in this folder')+'</p>';return}
+    function render(autoIndex){
+      var indexed=items.filter(function(it){return it.ph});
+      var groups=[];
+      indexed.forEach(function(it){
+        var placed=false;
+        for(var g=0;g<groups.length;g++){
+          if(phDistance(groups[g][0].ph,it.ph)<=threshold){groups[g].push(it);placed=true;break}
+        }
+        if(!placed)groups.push([it]);
+      });
+      var multi=groups.filter(function(g){return g.length>1});
+      var h='<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">'
+        +'<span class="dup-path">'+(lang==='zh'?'相似阈值（越小越严格）':'Threshold')+'</span>'
+        +'<input id="simTh" type="number" min="0" max="20" value="'+threshold+'" style="width:70px;padding:5px 8px">'
+        +'<button id="simApply" class="btn gray tiny">'+(lang==='zh'?'重新分组':'Re-group')+'</button>'
+        +'<span style="flex:1"></span><span class="dup-path" id="simStat">'+indexed.length+'/'+items.length+' '+(lang==='zh'?'张已建索引':'indexed')+'</span>'
+        +'<button id="simIndex" class="btn tiny">'+(lang==='zh'?'为剩余图片建索引':'Index rest')+'</button></div>';
+      if(!multi.length)h+='<p style="text-align:center;color:var(--sys-text-3);padding:14px">'+(lang==='zh'?'没有发现相似图片':'No similar images found')+'</p>';
+      multi.forEach(function(g){
+        h+='<div style="margin-bottom:14px;padding:10px;background:var(--sys-fill);border-radius:12px">';
+        h+='<div class="dup-path" style="margin-bottom:6px">'+g.length+' '+(lang==='zh'?'张相似':'similar')+'</div>';
+        h+='<div style="display:flex;gap:8px;flex-wrap:wrap">';
+        g.forEach(function(it){
+          h+='<div style="width:118px"><img src="'+imgUrl(it.k)+'" loading="lazy" style="width:118px;height:92px;object-fit:cover;border-radius:8px;background:var(--sys-fill-2)">'
+            +'<div style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(it.name)+'">'+esc(it.name)+'</div>'
+            +'<div class="dup-path" style="font-size:10.5px">'+fmt(it.size)+'</div>'
+            +'<button class="btn tiny danger" data-simdel="'+esc(it.k)+'" style="margin-top:2px">'+(lang==='zh'?'删除':'Del')+'</button></div>';
+        });
+        h+='</div></div>';
+      });
+      box.innerHTML=h;
+      var ap=document.getElementById('simApply');
+      if(ap)ap.onclick=function(){threshold=Math.max(0,Math.min(20,parseInt(document.getElementById('simTh').value,10)||0));try{localStorage.setItem('dSimTh',String(threshold))}catch(e){}render(false)};
+      var ix=document.getElementById('simIndex');
+      if(ix)ix.onclick=function(){indexMissing(items,render)};
+      box.querySelectorAll('[data-simdel]').forEach(function(b){b.onclick=function(){
+        var k=b.getAttribute('data-simdel');
+        if(!confirm((lang==='zh'?'删除 ':'Delete ')+k+'?'))return;
+        api('/api/delete?path='+encodeURIComponent('/'+k),{method:'DELETE'}).then(function(){load();showSimilar()});
+      }});
+      if(autoIndex&&indexed.length<items.length)indexMissing(items,render);
+    }
+    render(true);
+  }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">Error</p>'});
+}
+// 为缺少 ph 的图片补算感知哈希（每次最多 30 张，避免一次跑太久）
+function indexMissing(items,render){
+  var todo=items.filter(function(it){return !it.ph}).slice(0,30);
+  if(!todo.length)return;
+  var stat=document.getElementById('simStat');
+  var done=0;
+  function step(){
+    if(done>=todo.length){render(false);return}
+    var it=todo[done++];
+    fetch('/api/preview?path='+encodeURIComponent('/'+it.k)+'&token='+tk)
+      .then(function(r){return r.blob()})
+      .then(function(b){return dHashFromBlob(b)})
+      .then(function(hh){return api('/api/phash',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'/'+it.k,hash:hh})})})
+      .then(function(){it.ph='1';if(stat)stat.textContent=(lang==='zh'?'建索引 ':'indexing ')+done+'/'+todo.length})
+      .catch(function(){it.ph='skip'})
+      .then(function(){setTimeout(step,20)});
+  }
+  step();
+}
+
+// ===== 图片批处理（缩放 / 压缩 / 水印 / 旋转）=====
+function imgToolsModal(){
+  var m=document.getElementById('imgToolsModal');
+  if(!m){
+    m=document.createElement('div');m.id='imgToolsModal';m.className='modal-bg';
+    m.innerHTML='<div class="modal" style="min-width:420px;max-width:640px"><button class="mclose" id="imgToolsClose">✕</button><h3>🖌 '+(lang==='zh'?'图片批处理':'Image tools')+'</h3><div id="imgToolsContent"></div></div>';
+    document.body.appendChild(m);
+    document.getElementById('imgToolsClose').onclick=function(){m.classList.remove('show')};
+    m.onclick=function(e){if(e.target===m)m.classList.remove('show')};
+  }
+  return m;
+}
+function showImgTools(){
+  var m=imgToolsModal(),box=document.getElementById('imgToolsContent');
+  var sel=Object.keys(selected);
+  var imgs=sel.filter(function(p){return /\\.(jpe?g|png|webp|gif|bmp|avif)$/i.test(p)});
+  var h='<div class="dup-path" style="margin-bottom:8px">'+(lang==='zh'?'已选 ':'Selected ')+sel.length+' · '+(lang==='zh'?'其中图片 ':'images ')+imgs.length+'</div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'最大边长 (px，0=不改)':'Max edge (px)')+'</span><input id="itEdge" type="number" value="2048" style="flex:1;padding:6px 10px"></div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'JPEG 质量 (1-100)':'Quality')+'</span><input id="itQ" type="number" value="82" style="flex:1;padding:6px 10px"></div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'旋转角度':'Rotate')+'</span><select id="itRot" style="flex:1;padding:6px 10px"><option value="0">0°</option><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select></div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'水印文字（可空）':'Watermark text')+'</span><input id="itWm" placeholder="© your name" style="flex:1;padding:6px 10px"></div>';
+  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'水印位置':'Watermark pos')+'</span><select id="itWmPos" style="flex:1;padding:6px 10px"><option value="br">'+(lang==='zh'?'右下':'bottom-right')+'</option><option value="bl">'+(lang==='zh'?'左下':'bottom-left')+'</option><option value="tr">'+(lang==='zh'?'右上':'top-right')+'</option><option value="center">'+(lang==='zh'?'居中':'center')+'</option></select></div>';
+  h+='<label style="display:flex;gap:8px;align-items:center;margin:8px 0;font-size:13.5px"><input type="checkbox" id="itCopy" checked>'+(lang==='zh'?'另存为副本（-edit 后缀），不覆盖原图':'Save as copy (-edit)')+'</label>';
+  h+='<div id="itMsg" style="font-size:13px;min-height:18px"></div>';
+  h+='<div style="text-align:right"><button id="itRun" class="btn small" '+(imgs.length?'':'disabled')+'>'+(lang==='zh'?'开始处理':'Run')+'</button></div>';
+  box.innerHTML=h;
+  m.classList.add('show');
+  document.getElementById('itRun').onclick=function(){runImgTools(imgs)};
+}
+async function runImgTools(paths){
+  if(!paths||!paths.length)return;
+  var edge=parseInt(document.getElementById('itEdge').value,10)||0;
+  var q=Math.max(1,Math.min(100,parseInt(document.getElementById('itQ').value,10)||82))/100;
+  var rot=parseInt(document.getElementById('itRot').value,10)||0;
+  var wm=(document.getElementById('itWm').value||'').trim();
+  var wpos=document.getElementById('itWmPos').value;
+  var asCopy=document.getElementById('itCopy').checked;
+  var msg=document.getElementById('itMsg');
+  var ok=0,fail=0;
+  for(var i=0;i<paths.length;i++){
+    var p=paths[i];
+    var div=makeUpItem(p.split('/').filter(Boolean).pop());
+    div.querySelector('.upst').textContent='…';
+    try{
+      var r=await fetch('/api/preview?path='+encodeURIComponent(p)+'&token='+tk);
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      var blob=await r.blob();
+      var bmp=await createImageBitmap(blob);
+      var w=bmp.width,hgt=bmp.height;
+      if(edge>0&&Math.max(w,hgt)>edge){var s=edge/Math.max(w,hgt);w=Math.round(w*s);hgt=Math.round(hgt*s)}
+      var canvas=document.createElement('canvas');
+      if(rot===90||rot===270){canvas.width=hgt;canvas.height=w}else{canvas.width=w;canvas.height=hgt}
+      var ctx=canvas.getContext('2d');
+      ctx.save();
+      if(rot===90){ctx.translate(canvas.width,0);ctx.rotate(Math.PI/2)}
+      else if(rot===180){ctx.translate(canvas.width,canvas.height);ctx.rotate(Math.PI)}
+      else if(rot===270){ctx.translate(0,canvas.height);ctx.rotate(-Math.PI/2)}
+      ctx.drawImage(bmp,0,0,w,hgt);
+      ctx.restore();
+      if(wm){
+        var fs=Math.max(12,Math.round(Math.min(canvas.width,canvas.height)/22));
+        ctx.font='600 '+fs+'px -apple-system,system-ui,sans-serif';
+        ctx.fillStyle='rgba(255,255,255,0.82)';
+        ctx.shadowColor='rgba(0,0,0,0.5)';ctx.shadowBlur=6;
+        var tw=ctx.measureText(wm).width,pad=Math.round(fs*0.6);
+        var x=canvas.width-tw-pad,y=canvas.height-pad;
+        if(wpos==='bl')x=pad;
+        else if(wpos==='tr')y=fs+pad;
+        else if(wpos==='center'){x=(canvas.width-tw)/2;y=canvas.height/2}
+        ctx.fillText(wm,x,y);
+      }
+      var out=await new Promise(function(res){canvas.toBlob(res,'image/jpeg',q)});
+      if(!out)throw new Error('encode failed');
+      var dir=parentOf(p),name=p.split('/').filter(Boolean).pop();
+      var finalName=asCopy?name.replace(/(\\.[^.]+)$/,'-edit$1'):name;
+      var fd=new FormData();
+      fd.append('file',new File([out],finalName,{type:'image/jpeg'}));
+      await new Promise(function(res,rej){
+        var xhr=new XMLHttpRequest();
+        xhr.open('POST','/api/upload?path='+encodeURIComponent(dir)+'&token='+tk);
+        xhr.upload.onprogress=function(e){if(e.lengthComputable)div.querySelector('.upfill').style.width=Math.round(e.loaded/e.total*100)+'%'};
+        xhr.onload=function(){if(xhr.status>=200&&xhr.status<300)res();else rej(new Error('HTTP '+xhr.status))};
+        xhr.onerror=function(){rej(new Error('network'))};
+        xhr.send(fd);
+      });
+      div.querySelector('.upfill').style.width='100%';
+      div.querySelector('.upst').textContent=t('upDone');
+      div.querySelector('.upst').style.color='var(--sys-green)';
+      ok++;
+    }catch(e){
+      div.querySelector('.upst').textContent=(e&&e.message)||t('upFail');
+      div.querySelector('.upst').style.color='var(--sys-red)';
+      fail++;
+    }
+    if(msg)msg.textContent=(ok+fail)+'/'+paths.length;
+    setTimeout(function(){if(div.parentNode)div.parentNode.removeChild(div)},2500);
+  }
+  if(msg){msg.style.color=fail?'var(--sys-red)':'var(--sys-green)';msg.textContent=(lang==='zh'?'完成 ':'done ')+ok+(fail?(' / '+(lang==='zh'?'失败 ':'failed ')+fail):'')}
+  load();
+}
+
+// ===== 收藏分组 =====
+function favGroupsModal(){
+  var m=document.getElementById('favgModal');
+  if(!m){
+    m=document.createElement('div');m.id='favgModal';m.className='modal-bg';
+    m.innerHTML='<div class="modal" style="min-width:440px;max-width:680px"><button class="mclose" id="favgClose">✕</button><h3 id="favgTitle">★ '+(lang==='zh'?'收藏分组':'Favorite groups')+'</h3><div id="favgContent"></div></div>';
+    document.body.appendChild(m);
+    document.getElementById('favgClose').onclick=function(){m.classList.remove('show')};
+    m.onclick=function(e){if(e.target===m)m.classList.remove('show')};
+  }
+  return m;
+}
+function showFavGroups(){
+  var m=favGroupsModal(),box=document.getElementById('favgContent');
+  document.getElementById('favgTitle').textContent='★ '+(lang==='zh'?'收藏分组':'Favorite groups');
+  m.classList.add('show');
+  function paint(){
+    api('/api/favgroups').then(function(d){
+      var groups=d.groups||[];
+      var h='<div class="dup-path" style="margin-bottom:8px">'+(lang==='zh'?'共 ':'total ')+(d.total||0)+' ★ · '+(lang==='zh'?'未分组 ':'ungrouped ')+((d.ungrouped||[]).length)+'</div>';
+      h+='<div style="display:flex;gap:6px;margin-bottom:10px"><input id="fgName" placeholder="'+(lang==='zh'?'新分组名称':'New group name')+'" style="flex:1;padding:7px 10px"><button id="fgAdd" class="btn small">'+(lang==='zh'?'新建':'Create')+'</button></div>';
+      groups.forEach(function(g){
+        h+='<div style="margin-bottom:12px;background:var(--sys-fill);border-radius:12px;padding:10px">';
+        h+='<div style="display:flex;gap:6px;align-items:center"><input value="'+esc(g.name)+'" data-fgrnm="'+esc(g.name)+'" style="width:150px;padding:5px 8px"><span class="dup-path" style="flex:1">'+(g.paths||[]).length+'</span>'
+          +'<button class="btn gray tiny" data-fgrn="'+esc(g.name)+'">'+(lang==='zh'?'重命名':'Rename')+'</button>'
+          +'<button class="btn tiny danger" data-fgrd="'+esc(g.name)+'">✕</button></div>';
+        (g.paths||[]).slice(0,40).forEach(function(p){
+          h+='<div class="token-row" style="padding:4px 0"><span class="dup-path" style="flex:1;overflow:hidden;text-overflow:ellipsis">'+esc(p)+'</span>'
+            +'<button class="btn tiny" data-fgo="'+esc(p)+'">'+(lang==='zh'?'打开':'Open')+'</button>'
+            +'<button class="btn tiny danger" data-fgr="'+esc(p)+'">✕</button></div>';
+        });
+        h+='</div>';
+      });
+      if((d.ungrouped||[]).length){
+        h+='<div style="margin-bottom:8px;font-size:13px;font-weight:600">'+(lang==='zh'?'未分组收藏':'Ungrouped')+'</div>';
+        (d.ungrouped||[]).slice(0,40).forEach(function(p){
+          h+='<div class="token-row" style="padding:4px 0"><span class="dup-path" style="flex:1;overflow:hidden;text-overflow:ellipsis">'+esc(p)+'</span>'
+            +'<input data-fgassign="'+esc(p)+'" placeholder="'+(lang==='zh'?'分到…':'group…')+'" style="width:110px;padding:4px 8px"></div>';
+        });
+      }
+      box.innerHTML=h;
+      document.getElementById('fgAdd').onclick=function(){
+        var n=document.getElementById('fgName').value.trim();if(!n)return;
+        api('/api/favgroups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}).then(paint);
+      };
+      box.querySelectorAll('[data-fgrd]').forEach(function(b){b.onclick=function(){api('/api/favgroups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({delete:b.getAttribute('data-fgrd')})}).then(paint)}});
+      box.querySelectorAll('[data-fgrn]').forEach(function(b){b.onclick=function(){
+        var from=b.getAttribute('data-fgrn');
+        var inp=box.querySelector('[data-fgrnm="'+from+'"]');
+        var to=inp?inp.value.trim():'';
+        if(!to||to===from)return;
+        api('/api/favgroups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({renameFrom:from,renameTo:to})}).then(paint);
+      }});
+      box.querySelectorAll('[data-fgr]').forEach(function(b){b.onclick=function(){
+        api('/api/favgroups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({setPath:b.getAttribute('data-fgr'),group:''})}).then(paint);
+      }});
+      box.querySelectorAll('[data-fgo]').forEach(function(b){b.onclick=function(){
+        var p=b.getAttribute('data-fgo');
+        var dir=p.substring(0,p.lastIndexOf('/')+1)||'/';
+        cur=dir;QUERY.on=false;setMode('');load();m.classList.remove('show');
+      }});
+      box.querySelectorAll('[data-fgassign]').forEach(function(inp){
+        function commit(){
+          var g=inp.value.trim();if(!g)return;
+          api('/api/favgroups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({setPath:inp.getAttribute('data-fgassign'),group:g})}).then(paint);
+        }
+        inp.onchange=commit;
+        inp.onkeydown=function(e){if(e.key==='Enter')commit()};
+      });
+    }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">Error</p>'});
+  }
+  paint();
+}
+
+// ===== 元数据导出 / 导入 =====
+function showMetaIO(){
+  var m=favGroupsModal(),box=document.getElementById('favgContent');
+  document.getElementById('favgTitle').textContent='🏷 '+(lang==='zh'?'元数据导出 / 导入':'Metadata export / import');
+  m.classList.add('show');
+  var h='<div style="font-size:12.5px;color:var(--sys-text-3);line-height:1.7;margin-bottom:10px">'
+    +'<b>'+(lang==='zh'?'导出':'Export')+'</b>：'+(lang==='zh'?'把当前目录（含子目录）的标签、备注、收藏、大小/时间等元数据导出为 JSON 或 CSV（不含文件内容）。':'Exports tags/notes/favorites/size/time as JSON or CSV (no file contents).')+'<br>'
+    +'<b>'+(lang==='zh'?'导入':'Import')+'</b>：'+(lang==='zh'?'把 JSON 元数据套用到现有文件（仅匹配已存在的文件，可合并或覆盖标签）。':'Applies JSON metadata to existing files only.')+'</div>';
+  h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
+    +'<button id="miJson" class="btn small">⬇ JSON</button>'
+    +'<button id="miCsv" class="btn gray small">⬇ CSV</button>'
+    +'<button id="miImp" class="btn gray small">⬆ '+(lang==='zh'?'导入 JSON':'Import JSON')+'</button>'
+    +'<select id="miMode" style="padding:6px 8px"><option value="merge">'+(lang==='zh'?'合并标签':'merge tags')+'</option><option value="replace">'+(lang==='zh'?'覆盖标签':'replace tags')+'</option></select>'
+    +'<input id="miFile" type="file" accept=".json,application/json" style="display:none">'
+    +'</div><div id="miOut" style="font-size:13px;max-height:44vh;overflow:auto"></div>';
+  box.innerHTML=h;
+  document.getElementById('miJson').onclick=function(){window.open('/api/export-meta?path='+encodeURIComponent(cur)+'&format=download&token='+tk,'_blank')};
+  document.getElementById('miCsv').onclick=function(){window.open('/api/export-meta?path='+encodeURIComponent(cur)+'&format=csv&token='+tk,'_blank')};
+  var fi=document.getElementById('miFile');
+  document.getElementById('miImp').onclick=function(){fi.click()};
+  fi.onchange=function(){
+    var f=fi.files&&fi.files[0];if(!f)return;
+    var out=document.getElementById('miOut');
+    out.textContent='…';
+    var rd=new FileReader();
+    rd.onload=function(){
+      var payload=null;
+      try{payload=JSON.parse(rd.result)}catch(e){out.textContent=(lang==='zh'?'JSON 解析失败':'Bad JSON');return}
+      api('/api/import-meta',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payload:payload,mode:document.getElementById('miMode').value})}).then(function(r){
+        if(r&&r.ok){
+          out.innerHTML='<div style="color:var(--sys-green)">'+(lang==='zh'?'导入完成':'Imported')+'</div>'
+            +'<div class="dup-path">'+(lang==='zh'?'匹配 ':'matched ')+r.matched+' · '+(lang==='zh'?'缺失 ':'missing ')+r.missing+' · '+(lang==='zh'?'标签写入 ':'tags ')+r.tagsWritten+' · '+(lang==='zh'?'备注写入 ':'notes ')+r.notesWritten+' · ★ '+r.favAdded+'</div>';
+          load();renderTagSidebar();
+        }else out.textContent=(r&&r.error)||'failed';
+      });
+    };
+    rd.readAsText(f);
+  };
+}
+
+var UQ=[], upSeq=0;
+function upConcurrency(){var n=parseInt(localStorage.getItem('dUpConc')||'',10);return (n>=1&&n<=6)?n:2}
+function setUpConcurrency(n){try{localStorage.setItem('dUpConc',String(n))}catch(e){}renderQueueBar();pump()}
+function taskOf(div){for(var i=0;i<UQ.length;i++)if(UQ[i].div===div)return UQ[i];return null}
+function uploadFiles(files,dir){
+  if(!files||!files.length)return;
+  dir=dir||cur;
+  if(currentView==='home'){cur=dir;goFiles('files');setMode('');load()}   // 从仪表盘发起上传：跳到文件页看进度与落点
+  for(var i=0;i<files.length;i++){
+    var f=files[i];
+    var task={id:'u'+(++upSeq),file:f,name:f.name,size:f.size,dir:dir,relPath:f._relPath||'',status:'waiting',progress:0,div:null,thumb:null,uploadId:null,msg:'',prepared:false};
+    makeUpItem(task);
+    UQ.push(task);
+  }
+  renderQueueBar();pump();
+}
+function pump(){
+  var active=0,i;
+  for(i=0;i<UQ.length;i++)if(UQ[i].status==='uploading')active++;
+  var conc=upConcurrency();
+  for(i=0;i<UQ.length&&active<conc;i++){
+    if(UQ[i].status==='waiting'){runTask(UQ[i]);active++}
+  }
+  renderQueueBar();
+}
+async function runTask(task){
+  if(task.status!=='waiting')return;
+  task.status='uploading';task.msg='';paintTask(task);renderQueueBar();
+  try{
+    var file=task.file;
+    if(!task.prepared){
+      if(file.type&&file.type.indexOf('image/')===0){try{file=await compressImage(file)}catch(e){}}
+      if(task.status!=='uploading'){finishTask(task,'paused');return}
+      var th=null;try{th=await makeThumb(file)}catch(e){}
+      task.workFile=file;task.thumb=th;task.prepared=true;
+      if(task.status!=='uploading'){finishTask(task,'paused');return}
+    }
+    file=task.workFile||file;
+    if(file.size>CHUNK_SIZE)await uploadChunked(task,file);
+    else await uploadSimple(task,file);
+  }catch(e){
+    if(task.status==='uploading'){task.status='failed';task.msg=(e&&e.taskMsg)||(e&&e.message)||t('upFail')}
+  }
+  if(task.status==='uploading')task.status='done';
+  finishTask(task,task.status);
+}
+function finishTask(task,status){
+  if(status)task.status=status;
+  paintTask(task);renderQueueBar();
+  if(task.status==='done'){
+    setTimeout(function(){removeTask(task)},1800);
+    var more=UQ.some(function(x){return (x.status==='uploading'||x.status==='waiting')&&x!==task});
+    if(!more)setTimeout(load,400);
+  }
+}
+function removeTask(task){
+  for(var i=0;i<UQ.length;i++)if(UQ[i]===task)UQ.splice(i,1);
+  if(task.div&&task.div.parentNode)task.div.parentNode.removeChild(task.div);
+  renderQueueBar();
+}
+function pauseTask(task){
+  if(task.status==='waiting'||task.status==='uploading'){
+    task.status='paused';
+    if(task.xhr){try{task.xhr.abort()}catch(e){}}
+    paintTask(task);renderQueueBar();
+  }
+}
+function resumeTask(task){
+  if(task.status==='paused'||task.status==='failed'){task.status='waiting';task.msg='';paintTask(task);pump()}
+}
+function cancelTask(task){
+  task.canceled=true;task.status='canceled';
+  if(task.xhr){try{task.xhr.abort()}catch(e){}}
+  removeTask(task);
+}
+function renderTaskActs(task){
+  var box=task.div?task.div.querySelector('.upacts'):null;if(!box)return;
+  var st=task.status,h='';
+  if(st==='uploading'||st==='waiting')h+='<button data-act="pause" title="'+t('pause')+'">⏸</button>';
+  if(st==='paused'||st==='failed')h+='<button data-act="resume" title="'+t('resume')+'">▶</button>';
+  if(st==='failed')h+='<button data-act="retry" title="'+t('retry')+'">↻</button>';
+  if(st!=='done')h+='<button data-act="cancel" title="'+t('cancel')+'">✕</button>';
+  box.innerHTML=h;
+  box.querySelectorAll('[data-act]').forEach(function(b){
+    b.onclick=function(e){
+      e.stopPropagation();
+      var a=b.getAttribute('data-act');
+      if(a==='pause')pauseTask(task);
+      else if(a==='resume')resumeTask(task);
+      else if(a==='retry')resumeTask(task);
+      else if(a==='cancel')cancelTask(task);
+    };
+  });
+}
+function paintTask(task){
+  if(!task.div)return;
+  var fill=task.div.querySelector('.upfill'),st=task.div.querySelector('.upst');
+  if(fill)fill.style.width=(task.progress||0)+'%';
+  if(st){
+    if(task.status==='waiting')st.textContent=t('upQueue')+'…';
+    else if(task.status==='paused')st.textContent=t('pause');
+    else if(task.status==='failed')st.textContent=task.msg||t('upFail');
+    else if(task.status==='done')st.textContent=t('upDone');
+    else st.textContent=(task.progress||0)+'%';
+    st.style.color=task.status==='failed'?'var(--sys-red)':(task.status==='done'?'var(--sys-green)':'');
+  }
+  renderTaskActs(task);
+}
+function renderQueueBar(){
+  var bar=document.getElementById('upQueueBar');if(!bar)return;
+  var waiting=0,active=0,paused=0,failed=0;
+  UQ.forEach(function(x){
+    if(x.status==='waiting')waiting++;else if(x.status==='uploading')active++;
+    else if(x.status==='paused')paused++;else if(x.status==='failed')failed++;
+  });
+  uploadQueue=waiting+active+paused;
+  if(!UQ.length){bar.innerHTML='';bar.style.display='none';return}
+  var h='<span class="upq-t">'+t('upQueue')+' · '+active+'/'+(waiting+paused)+(failed?(' · <span style="color:var(--sys-red)">'+t('upFail')+' '+failed+'</span>'):'')+'</span>';
+  h+='<span style="flex:1"></span>';
+  h+='<label class="upq-l">'+t('conc')+' <select id="upConcSel">'+[1,2,3,4,5,6].map(function(n){return '<option value="'+n+'"'+(n===upConcurrency()?' selected':'')+'>'+n+'</option>'}).join('')+'</select></label>';
+  h+='<button id="upPauseAll" class="btn gray tiny">'+t('pauseAll')+'</button>';
+  h+='<button id="upResumeAll" class="btn gray tiny">'+t('resumeAll')+'</button>';
+  h+='<button id="upClearDone" class="btn gray tiny">'+t('clearDone')+'</button>';
+  bar.innerHTML=h;bar.style.display='flex';
+  var sel=document.getElementById('upConcSel');if(sel)sel.onchange=function(){setUpConcurrency(parseInt(sel.value,10)||2)};
+  var pa=document.getElementById('upPauseAll');if(pa)pa.onclick=function(){UQ.forEach(function(x){if(x.status==='waiting'||x.status==='uploading')pauseTask(x)})};
+  var ra=document.getElementById('upResumeAll');if(ra)ra.onclick=function(){UQ.forEach(function(x){if(x.status==='paused'||x.status==='failed')resumeTask(x)})};
+  var cd=document.getElementById('upClearDone');if(cd)cd.onclick=function(){UQ.filter(function(x){return x.status==='done'||x.status==='failed'}).forEach(removeTask)};
+}
+function makeUpItem(x){
+  var task=(x&&typeof x==='object')?x:null;
+  var name=task?task.name:String(x==null?'':x);
+  var list=document.getElementById('upList');
+  var div=document.createElement('div');div.className='upitem';
+  div.innerHTML='<span class="upname">'+esc(name)+'</span><div class="upbar"><div class="upfill" style="width:0%"></div></div><span class="upst">0%</span><span class="upacts"></span>';
+  list.appendChild(div);
+  if(task){task.div=div;paintTask(task)}
+  return div;
+}
+function setProgress(div,pct){
+  var task=taskOf(div);
+  if(task){task.progress=pct;paintTask(task);return}
+  if(!div)return;
+  var f=div.querySelector('.upfill'),s=div.querySelector('.upst');
+  if(f)f.style.width=pct+'%';
+  if(s)s.textContent=pct+'%';
+}
+function setDone(div){
+  var task=taskOf(div);
+  if(task){task.progress=100;finishTask(task,'done');return}
+  if(!div)return;
+  var f=div.querySelector('.upfill'),s=div.querySelector('.upst');
+  if(f)f.style.width='100%';
+  if(s){s.textContent=t('upDone');s.style.color='var(--sys-green)'}
+  setTimeout(function(){if(div.parentNode)div.parentNode.removeChild(div)},1500);
+  load();
+}
+function setFail(div,msg){
+  var task=taskOf(div);
+  if(task){task.msg=msg||t('upFail');finishTask(task,'failed');return}
+  if(!div)return;
+  var s=div.querySelector('.upst');
+  if(s){s.textContent=msg||t('upFail');s.style.color='var(--sys-red)'}
+}
 // ===== 秒传 / 断点续传 =====
 async function sha256File(file){
   if(!file||file.size>64*1024*1024)return '';
@@ -5286,74 +9533,440 @@ function pendSave(l){try{localStorage.setItem('du_pending',JSON.stringify(l.slic
 function pendFind(file,dir){var l=pendList(),t=Date.now();for(var i=0;i<l.length;i++){var p=l[i];if(p.name===file.name&&p.size===file.size&&p.dir===dir&&(t-p.ts<86400000))return p}return null}
 function pendAdd(rec){var l=pendList().filter(function(p){return p.uploadId!==rec.uploadId});l.push(rec);pendSave(l)}
 function pendRemove(id){pendSave(pendList().filter(function(p){return p.uploadId!==id}))}
-async function uploadSimple(file,div,thumb){
-  try{
-    var dirItems=await api('/api/list?path='+encodeURIComponent(cur));
-    if(dirItems.items&&dirItems.items.some(function(r){return r.name===file.name&&r.size===file.size})){setDone(div);return}
-  }catch(e){}
+function pendPrune(){var t=Date.now();var l=pendList().filter(function(p){return p&&p.uploadId&&(t-(p.ts||0)<86400000)});pendSave(l);return l}
+function showPending(){
+  var l=pendPrune();
+  var box=document.getElementById('pendBox');
+  if(!l.length){alert(lang==='zh'?'没有未完成的上传记录':'No pending uploads');return}
+  var h='<div style="font-size:12px;color:var(--sys-text-3);margin-bottom:8px">'+t('resumeTitle')+'</div>';
+  l.forEach(function(p){
+    h+='<div class="token-row"><span class="token-name">'+esc(p.name)+'</span><span class="dup-path">'+fmt(p.size)+' · '+esc(new Date(p.ts).toLocaleString())+'</span></div>';
+  });
+  h+='<div style="margin-top:12px;text-align:right"><button id="pendClear" class="btn danger small">'+t('clearPend')+'</button></div>';
+  if(!box){box=document.createElement('div');box.id='pendBox';box.className='modal-bg';box.innerHTML='<div class="modal" style="min-width:340px;max-width:520px"><button class="mclose" id="pendClose">✕</button><h3>'+t('resumeTitle')+'</h3><div id="pendContent"></div></div>';document.body.appendChild(box);}
+  document.getElementById('pendContent').innerHTML=h;
+  box.classList.add('show');
+  document.getElementById('pendClose').onclick=function(){box.classList.remove('show')};
+  document.getElementById('pendClear').onclick=function(){try{localStorage.removeItem('du_pending')}catch(e){}box.classList.remove('show');renderQueueBar()};
+}
+async function uploadSimple(task,file){
   var hash=await sha256File(file);
   if(hash){
     try{
-      var ic=await api('/api/instant-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hash:hash,name:file.name,size:file.size,dir:cur})});
-      if(ic&&ic.hit){setDone(div);return}
+      var ic=await api('/api/instant-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hash:hash,name:file.name,size:file.size,dir:task.dir})});
+      if(ic&&ic.hit){task.progress=100;return}
     }catch(e){}
   }
+  if(task.status!=='uploading')return;
   var fd=new FormData();fd.append('file',file);
-  if(thumb)fd.append('thumb',thumb,'thumb.jpg');
-  if(file._relPath)fd.append('relPath',file._relPath);
+  if(task.thumb)fd.append('thumb',task.thumb,'thumb.jpg');
+  if(task.relPath)fd.append('relPath',task.relPath);
   if(hash)fd.append('hash',hash);
-  var xhr=new XMLHttpRequest();xhr.open('POST','/api/upload?path='+encodeURIComponent(cur)+'&token='+tk);
-  xhr.upload.onprogress=function(e){if(e.lengthComputable){setProgress(div,Math.round(e.loaded/e.total*100))}};
-  xhr.onload=function(){if(xhr.status>=200&&xhr.status<300){setDone(div)}else if(xhr.status===423){setFail(div,t('upLocked'))}else{setFail(div,t('upFail'))}};
-  xhr.onerror=function(){setFail(div,t('upFail'))};
-  xhr.send(fd);
+  await new Promise(function(resolve,reject){
+    var xhr=new XMLHttpRequest();task.xhr=xhr;
+    xhr.open('POST','/api/upload?path='+encodeURIComponent(task.dir)+'&token='+tk);
+    xhr.upload.onprogress=function(e){if(e.lengthComputable){task.progress=Math.round(e.loaded/e.total*100);paintTask(task)}};
+    xhr.onload=function(){
+      task.xhr=null;
+      if(task.status!=='uploading'){resolve();return}
+      if(xhr.status>=200&&xhr.status<300){task.progress=100;resolve();return}
+      var msg=t('upFail');
+      if(xhr.status===423)msg=t('upLocked');
+      else if(xhr.status===413)msg=(lang==='zh'?'超出配额或文件过大':'Quota or size limit');
+      else if(xhr.status===507)msg=(lang==='zh'?'目录已满':'Directory full');
+      var err=new Error(msg);err.taskMsg=msg;reject(err);
+    };
+    xhr.onerror=function(){task.xhr=null;if(task.status==='uploading'){var e=new Error(t('upFail'));e.taskMsg=t('upFail');reject(e)}else resolve()};
+    xhr.onabort=function(){task.xhr=null;resolve()};
+    xhr.send(fd);
+  });
 }
-async function uploadChunked(file,div,thumb){
+async function uploadChunked(task,file){
   var totalChunks=Math.ceil(file.size/CHUNK_SIZE);
-  try{
-    var hash=await sha256File(file);
-    var uploadId=null,got=[];
-    var pend=pendFind(file,cur);
-    if(pend){
-      try{
-        var st=await api('/api/chunk-status?id='+encodeURIComponent(pend.uploadId));
-        if(st&&st.chunks){uploadId=pend.uploadId;got=st.got||[];}
-      }catch(e){}
+  var hash=await sha256File(file);
+  var uploadId=null,got=[];
+  var pend=pendFind(file,task.dir);
+  if(pend){
+    try{
+      var st=await api('/api/chunk-status?id='+encodeURIComponent(pend.uploadId));
+      if(st&&st.chunks){uploadId=pend.uploadId;got=st.got||[]}
+      else pendRemove(pend.uploadId);
+    }catch(e){}
+  }
+  if(task.status!=='uploading')return;
+  if(!uploadId){
+    var init=await api('/api/chunk-init',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fileName:file.name,totalSize:file.size,hash:hash,path:task.dir,mime:file.type})});
+    if(init.instant){task.progress=100;return}
+    if(!init.uploadId)throw new Error(t('upFail'));
+    uploadId=init.uploadId;
+    pendAdd({uploadId:uploadId,name:file.name,size:file.size,dir:task.dir,ts:Date.now()});
+  }
+  task.uploadId=uploadId;
+  var gotSet={};got.forEach(function(i){gotSet[i]=1});
+  var CONC=Math.min(4,totalChunks);
+  var next=0,doneCount=got.length,aborted=false;
+  task.progress=Math.round(doneCount/totalChunks*100);paintTask(task);
+  async function worker(){
+    while(true){
+      if(aborted||task.status!=='uploading'){aborted=true;return}
+      var i=next++;
+      if(i>=totalChunks)return;
+      if(gotSet[i])continue;
+      var chunk=file.slice(i*CHUNK_SIZE,(i+1)*CHUNK_SIZE);
+      var r=await fetch('/api/chunk-upload/'+uploadId+'/'+i+'?token='+tk,{method:'POST',body:chunk});
+      if(!r.ok){aborted=true;var e=new Error('chunk '+i+' HTTP '+r.status);e.taskMsg=t('upFail');throw e}
+      doneCount++;task.progress=Math.round(doneCount/totalChunks*100);paintTask(task);
     }
-    if(!uploadId){
-      var init=await api('/api/chunk-init',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fileName:file.name,totalSize:file.size,hash:hash,path:cur,mime:file.type})});
-      if(init.instant){setDone(div);return}
-      if(!init.uploadId){setFail(div,t('upFail'));return}
-      uploadId=init.uploadId;
-      pendAdd({uploadId:uploadId,name:file.name,size:file.size,dir:cur,ts:Date.now()});
-    }
-    var gotSet={};got.forEach(function(i){gotSet[i]=1});
-    var CONC=Math.min(4,totalChunks);
-    var next=0,doneCount=got.length,aborted=false;
-    setProgress(div,Math.round(doneCount/totalChunks*100));
-    async function worker(){
-      while(!aborted){
-        var i=next++;
-        if(i>=totalChunks)return;
-        if(gotSet[i])continue;
-        var chunk=file.slice(i*CHUNK_SIZE,(i+1)*CHUNK_SIZE);
-        var r=await fetch('/api/chunk-upload/'+uploadId+'/'+i+'?token='+tk,{method:'POST',body:chunk});
-        if(!r.ok){aborted=true;throw new Error('chunk '+i)}
-        doneCount++;setProgress(div,Math.round(doneCount/totalChunks*100));
-      }
-    }
-    var workers=[];for(var w=0;w<CONC;w++)workers.push(worker());
-    try{await Promise.all(workers)}catch(e){setFail(div,t('upFail'));return}
-    pendRemove(uploadId);
-    var done=await api('/api/chunk-complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uploadId:uploadId})});
-    if(done&&done.ok){setDone(div)}else{setFail(div,t('upFail'))}
-  }catch(e){setFail(div,t('upFail'))}
+  }
+  var workers=[];for(var w=0;w<CONC;w++)workers.push(worker());
+  try{await Promise.all(workers)}catch(e){if(task.status==='uploading')throw e;return}
+  if(task.status!=='uploading')return;   // 暂停：保留断点记录，继续时从已收分片续传
+  var done=await api('/api/chunk-complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uploadId:uploadId})});
+  if(done&&done.ok){pendRemove(uploadId);task.progress=100}
+  else{var e2=new Error((done&&done.error)||t('upFail'));e2.taskMsg=(done&&done.error)||t('upFail');throw e2}
 }
 
 document.getElementById('btnMk').onclick=function(){var n=document.getElementById('folderInput').value.trim();if(!n)return;api('/api/mkdir?path='+encodeURIComponent(cur),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}).then(function(){document.getElementById('folderInput').value='';load()})};
 document.getElementById('folderInput').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnMk').click()};
 
-function load(){render();loadUsage()}
+// ===== 视图路由：仪表盘首页 / 文件页 =====
+var currentView='home', currentNav='home';
+function showFilesView(){
+  if(currentView==='files')return;
+  currentView='files';
+  var h=document.getElementById('viewHome'),f=document.getElementById('viewFiles');
+  if(h)h.classList.remove('active');if(f)f.classList.add('active');
+  syncNav();
+}
+function showHomeView(){
+  currentView='home';currentNav='home';
+  var h=document.getElementById('viewHome'),f=document.getElementById('viewFiles');
+  if(h)h.classList.add('active');if(f)f.classList.remove('active');
+  syncNav();
+}
+function syncNav(){
+  var items=document.querySelectorAll('#sideNav .side-item');
+  for(var i=0;i<items.length;i++){
+    var k=items[i].getAttribute('data-nav');
+    var on=(k==='home'&&currentView==='home')||(currentView==='files'&&k===currentNav);
+    items[i].classList.toggle('active',on);
+  }
+  var tb=document.querySelectorAll('#tabBar [data-tb]');
+  for(var j=0;j<tb.length;j++){
+    var tk2=tb[j].getAttribute('data-tb');
+    var on2=(tk2==='home'&&currentView==='home')||(currentView==='files'&&((tk2==='files'&&currentNav==='files')||(tk2==='fav'&&currentNav==='fav')||(tk2==='recent'&&currentNav==='recent')));
+    tb[j].classList.toggle('on',on2);
+  }
+  try{history.replaceState(null,'','#/'+(currentView==='home'?'home':(currentNav==='files'?('files'+cur):currentNav)))}catch(e){}
+}
+function goHome(){showHomeView();loadDashboard()}
+function goFiles(mode){
+  currentNav=mode||'files';
+  showFilesView();
+  syncNav();
+}
+function navTo(k){
+  if(k==='home'){setMode('');goHome();return}
+  if(k==='albums'){try{showAlbums()}catch(e){};return}
+  if(k==='trash'){try{showTrash()}catch(e){};return}
+  if(k==='upload'){try{showULinkMgmt()}catch(e){};return}
+  if(k==='fav'){goFiles('fav');setMode('fav');render();return}
+  if(k==='recent'){goFiles('recent');setMode('recent');render();return}
+  goFiles('files');setMode('');cur='/';load();
+}
+(function bindSideNav(){
+  var nav=document.getElementById('sideNav');
+  if(!nav)return;
+  nav.querySelectorAll('[data-nav]').forEach(function(b){b.onclick=function(){navTo(b.getAttribute('data-nav'))}});
+})();
+// 仪表盘
+function dashSize(b){return fmt(b||0)}
+function loadDashboard(){
+  var box=document.getElementById('dashWrap');
+  if(!box)return;
+  box.innerHTML='<div class="dash-loading">'+(lang==='zh'?'加载概览…':'Loading overview…')+'</div>';
+  api('/api/dashboard').then(function(d){
+    box.innerHTML=dashHtml(d||{});
+    bindDash(box,d||{});
+  }).catch(function(){
+    box.innerHTML='<div class="dash-loading">'+(lang==='zh'?'概览加载失败':'Failed to load overview')+' <button class="btn gray tiny" id="dashRetry">'+(lang==='zh'?'重试':'Retry')+'</button></div>';
+    var r=document.getElementById('dashRetry');if(r)r.onclick=loadDashboard;
+  });
+}
+function dashHtml(d){
+  var zh=lang==='zh';
+  var u=d.usage||{},t=d.today||{},trend=d.trend||[];
+  var pct=u.total?Math.min(100,(u.used||0)/u.total*100):0;
+  var h='<div class="dash">';
+  // 快捷上传区
+  h+='<div class="dash-card span-12"><h4>⚡ '+(zh?'快捷操作':'Quick actions')+'</h4><div class="quick-zone">'
+    +'<div class="drop-mini" id="dashDrop">⬆ '+(zh?'拖拽文件到此处上传，或点击选择':'Drop files here or click to upload')+'</div>'
+    +'<button class="btn" id="dashNewDir">📁 '+(zh?'新建文件夹':'New folder')+'</button>'
+    +'<button class="btn gray" id="dashPaste">📋 '+(zh?'粘贴到根目录':'Paste to root')+'</button>'
+    +'<button class="btn gray" id="dashPalette">⌘K '+(zh?'命令面板':'Commands')+'</button>'
+    +'</div></div>';
+  // 容量 + 统计
+  h+='<div class="dash-card span-4"><h4>💾 '+(zh?'存储容量':'Storage')+'</h4><div class="ring-wrap">'
+    +'<div class="ring" style="--p:'+pct.toFixed(1)+'"><div>'+pct.toFixed(0)+'%<small>'+dashSize(u.used)+'</small></div></div>'
+    +'<div style="flex:1;min-width:0"><div style="font-size:13px;color:var(--sys-text-2)">'+dashSize(u.used)+' / '+dashSize(u.total)+'</div>'
+    +'<div class="dup-path" style="margin-top:4px">'+dashSize(Math.max(0,(u.total||0)-(u.used||0)))+' '+(zh?'可用':'free')+'</div>'
+    +'<button class="btn gray tiny" id="dashFiles" style="margin-top:8px">'+(zh?'查看全部文件':'All files')+' →</button>'
+    +'</div></div></div>';
+  h+='<div class="dash-card span-8"><h4>📊 '+(zh?'统计':'Stats')+'<button class="dash-more" id="dashStats">'+(zh?'详细统计':'Details')+' →</button></h4>'
+    +'<div class="stat-row">'
+    +'<div class="stat"><b>'+(u.count||0)+'</b><span>'+(zh?'文件':'Files')+'</span></div>'
+    +'<div class="stat"><b>'+(d.dirs||0)+'</b><span>'+(zh?'目录':'Folders')+'</span></div>'
+    +'<div class="stat"><b>'+(d.shares||0)+'</b><span>'+(zh?'分享链接':'Shares')+'</span></div>'
+    +'<div class="stat"><b>'+(d.ulinks||0)+'</b><span>'+(zh?'上传链接':'Upload links')+'</span></div>'
+    +'<div class="stat"><b>'+(t.up||0)+'/'+(t.dl||0)+'</b><span>'+(zh?'今日上传/下载':'Today up/dl')+'</span></div>'
+    +'<div class="stat"><b>'+dashSize((t.upBytes||0)+(t.dlBytes||0))+'</b><span>'+(zh?'今日流量':'Today traffic')+'</span></div>'
+    +'</div>'
+    +'<div class="spark">'+trend.map(function(x){
+        var mx=1;
+        for(var i=0;i<trend.length;i++)mx=Math.max(mx,(trend[i].up||0)+(trend[i].dl||0));
+        var v=(x.up||0)+(x.dl||0);
+        return '<i style="height:'+Math.max(3,Math.round(v/mx*100))+'%" title="'+esc(x.date)+' ↑'+x.up+' ↓'+x.dl+'"></i>';
+      }).join('')+'</div><div class="dup-path">'+(zh?'近 7 天上传/下载趋势':'7-day up/download trend')+'</div></div>';
+  // 最近
+  var recent=d.recentItems||[];
+  h+='<div class="dash-card span-6"><h4>🕐 '+(zh?'最近访问':'Recent')+'</h4><div class="recent-list">';
+  if(!recent.length)h+='<div class="dup-path">'+(zh?'还没有记录':'Nothing yet')+'</div>';
+  recent.slice(0,8).forEach(function(it){
+    var full=(it.path||'/')+it.name;
+    var isImg=it.type==='file'&&(it.mime||'').indexOf('image/')===0;
+    h+='<div class="recent-item" data-rp="'+esc(full)+'" data-rn="'+esc(it.name)+'" data-rm="'+esc(it.mime||'')+'" data-rt="'+esc(it.type||'file')+'">'
+      +(isImg?'<img loading="lazy" src="/api/thumb?path='+encodeURIComponent(full)+'&token='+tk+'">':'<span class="ri-ic">'+getIcon(it)+'</span>')
+      +'<span class="ri-tx">'+esc(it.name)+'</span><span class="ri-sub">'+esc(it.path||'/')+'</span></div>';
+  });
+  h+='</div></div>';
+  // 收藏 + 标签
+  var favs=d.favItems||[],tags=d.tags||[];
+  h+='<div class="dash-card span-6"><h4>★ '+(zh?'收藏与标签':'Favorites & tags')+'<button class="dash-more" id="dashFavMore">'+(zh?'收藏分组':'Groups')+' →</button></h4>';
+  h+='<div class="recent-list" style="margin-bottom:10px">';
+  if(!favs.length)h+='<div class="dup-path">'+(zh?'暂无收藏':'No favorites')+'</div>';
+  favs.slice(0,5).forEach(function(it){
+    var full=(it.path||'/')+it.name;
+    h+='<div class="recent-item" data-rp="'+esc(full)+'" data-rn="'+esc(it.name)+'" data-rm="'+esc(it.mime||'')+'" data-rt="'+esc(it.type||'file')+'"><span class="ri-ic">★</span><span class="ri-tx">'+esc(it.name)+'</span><span class="ri-sub">'+esc(it.path||'/')+'</span></div>';
+  });
+  h+='</div><div class="tag-cloud" id="dashTags">';
+  if(!tags.length)h+='<span class="dup-path">'+(zh?'暂无标签':'No tags')+'</span>';
+  tags.forEach(function(x){
+    h+='<button data-dtag="'+esc(x.name)+'"><span class="tc-dot" style="background:'+safeColor(x.color)+'"></span>'+esc(x.name)+'</button>';
+  });
+  h+='</div></div>';
+  // Top 目录
+  var td=d.topDirs||[];
+  var mx=1;td.forEach(function(x){mx=Math.max(mx,x.bytes||0)});
+  h+='<div class="dash-card span-12"><h4>📁 '+(zh?'占用排行':'Largest folders')+'</h4>';
+  if(!td.length)h+='<div class="dup-path">'+(zh?'暂无数据':'No data')+'</div>';
+  td.forEach(function(x){
+    h+='<div class="topdir" data-dgo="'+esc(x.path)+'"><span class="td-path">'+esc(x.path)+'</span>'
+      +'<span class="td-bar" style="width:'+Math.max(4,Math.round((x.bytes||0)/mx*160))+'px"></span>'
+      +'<span class="dup-path">'+dashSize(x.bytes)+'</span></div>';
+  });
+  h+='</div>';
+  h+='</div>';
+  return h;
+}
+function bindDash(box,d){
+  var dz=document.getElementById('dashDrop');
+  if(dz){
+    dz.onclick=function(){document.getElementById('fileInput').click()};
+    dz.addEventListener('dragover',function(e){e.preventDefault();dz.classList.add('over')});
+    dz.addEventListener('dragleave',function(){dz.classList.remove('over')});
+    dz.addEventListener('drop',function(e){
+      e.preventDefault();dz.classList.remove('over');
+      var fs=e.dataTransfer&&e.dataTransfer.files;if(fs&&fs.length)uploadFiles(fs,'/');
+    });
+  }
+  var nd=document.getElementById('dashNewDir');
+  if(nd)nd.onclick=function(){
+    var n=prompt(lang==='zh'?'新文件夹名称':'Folder name','');if(!n)return;
+    api('/api/mkdir?path=/',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}).then(function(){loadDashboard();load()});
+  };
+  var pa=document.getElementById('dashPaste');
+  if(pa)pa.onclick=function(){cur='/';pasteHere('/')};
+  var pl=document.getElementById('dashPalette');
+  if(pl)pl.onclick=function(){paletteOpen()};
+  var sp=document.getElementById('dashStats');
+  if(sp)sp.onclick=function(){try{showStats()}catch(e){}};
+  var fm=document.getElementById('dashFavMore');
+  if(fm)fm.onclick=function(){try{showFavGroups()}catch(e){}};
+  var af=document.getElementById('dashFiles');
+  if(af)af.onclick=function(){navTo('files')};
+  box.querySelectorAll('[data-rp]').forEach(function(el){
+    el.onclick=function(){
+      var p=el.getAttribute('data-rp'),n=el.getAttribute('data-rn'),m=el.getAttribute('data-rm'),t=el.getAttribute('data-rt');
+      var dir=p.substring(0,p.lastIndexOf('/')+1)||'/';
+      if(t==='dir'){cur=p.endsWith('/')?p:p+'/';goFiles('files');setMode('');load();return}
+      doPreview(n,m,-1,dir);
+    };
+  });
+  box.querySelectorAll('[data-dtag]').forEach(function(b){
+    b.onclick=function(){goFiles('files');tagFilterMode=true;tagFilterName=b.getAttribute('data-dtag');favMode=false;recentMode=false;searchMode=false;QUERY.on=false;load()};
+  });
+  box.querySelectorAll('[data-dgo]').forEach(function(el){
+    el.onclick=function(){cur=el.getAttribute('data-dgo');goFiles('files');setMode('');load()};
+  });
+}
+// 侧栏底部：主题 / 密度 / 主题色 / 语言 / 退出
+function hexToRgba(hex,a){
+  var h=String(hex||'').replace('#','');
+  if(h.length===3)h=h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+  var n=parseInt(h,16);
+  if(!isFinite(n))return 'rgba(10,132,255,'+a+')';
+  return 'rgba('+((n>>16)&255)+','+((n>>8)&255)+','+(n&255)+','+a+')';
+}
+function applyDensity(v){
+  v=(v==='compact')?'compact':'cozy';
+  document.documentElement.setAttribute('data-density',v);
+  try{localStorage.setItem('dDensity',v)}catch(e){}
+  var b=document.getElementById('footDensity');
+  if(b)b.title=(v==='compact'?'紧凑':'宽松');
+}
+function applyAccent(c){
+  c=/^#[0-9a-fA-F]{6}$/.test(String(c||''))?String(c):'#0a84ff';
+  var r=document.documentElement;
+  if(r&&r.style&&r.style.setProperty){
+    r.style.setProperty('--sys-blue',c);
+    r.style.setProperty('--sys-blue-hover',c);
+    r.style.setProperty('--sys-blue-soft',hexToRgba(c,0.14));
+  }
+  try{localStorage.setItem('dAccent',c)}catch(e){}
+  var i=document.getElementById('footAccent');if(i)i.value=c;
+}
+(function initAppearance(){
+  try{applyDensity(localStorage.getItem('dDensity')||'cozy')}catch(e){}
+  try{var a=localStorage.getItem('dAccent');if(a)applyAccent(a)}catch(e){}
+  try{if(localStorage.getItem('dSidebar')==='0'){var lay0=document.querySelector('.layout');if(lay0)lay0.classList.add('sidebar-hidden')}}catch(e){}
+  var ft=document.getElementById('footTheme');
+  if(ft)ft.onclick=function(){var b=document.getElementById('btnTheme');if(b)b.click()};
+  var fd=document.getElementById('footDensity');
+  if(fd)fd.onclick=function(){
+    var cur2=document.documentElement.getAttribute('data-density')==='compact'?'cozy':'compact';
+    applyDensity(cur2);
+  };
+  var fa=document.getElementById('footAccent');
+  if(fa)fa.oninput=function(){applyAccent(fa.value)};
+  var fl=document.getElementById('footLang');
+  if(fl)fl.onclick=function(){var b=document.getElementById('btnLang');if(b)b.click()};
+  var fo=document.getElementById('footLogout');
+  if(fo)fo.onclick=function(){var b=document.getElementById('btnLogout');if(b)b.click()};
+})();
+// 顶部「＋」新建菜单 / 搜索折叠
+(function bindAppBar(){
+  var btnNew=document.getElementById('btnNew'),menu=document.getElementById('newMenu');
+  if(btnNew&&menu){
+    btnNew.onclick=function(e){
+      e.stopPropagation();
+      var open=menu.classList.contains('show');
+      document.querySelectorAll('.pop-menu.show').forEach(function(m){if(m!==menu)m.classList.remove('show')});
+      menu.classList.toggle('show',!open);
+    };
+    menu.querySelectorAll('[data-new]').forEach(function(b){
+      b.onclick=function(){
+        var k=b.getAttribute('data-new');
+        menu.classList.remove('show');
+        if(k==='file')document.getElementById('fileInput').click();
+        else if(k==='files'){var fi=document.getElementById('fileInput');if(fi){fi.setAttribute('webkitdirectory','');fi.click();setTimeout(function(){fi.removeAttribute('webkitdirectory')},500)}}
+        else if(k==='dir'){
+          var w=document.getElementById('folderInputWrap');
+          if(w){w.style.display='flex';var inp=document.getElementById('folderInput');if(inp){inp.focus();inp.select()}}
+        }
+        else if(k==='text'){
+          var nm=prompt(lang==='zh'?'文件名（会自动补 .txt）':'File name','note.txt');
+          if(!nm)return;
+          if(!/\\.\\w+$/.test(nm))nm+='.txt';
+          var dirp=cur.substring(0,cur.lastIndexOf('/')+1)||'/';
+          api('/api/save?path='+encodeURIComponent(dirp+nm),{method:'POST',headers:{'Content-Type':'text/plain'},body:''}).then(function(r){
+            if(r&&r.ok){goFiles('files');load();setTimeout(function(){try{editText(nm,dirp)}catch(e){}},300)}
+          });
+        }
+        else if(k==='folder-pw'){
+          try{
+            showOps('rules');
+          }catch(e){}
+        }
+      };
+    });
+  }
+  var st=document.getElementById('btnSearchToggle'),sw=document.getElementById('searchWrap');
+  if(st&&sw){
+    st.onclick=function(){
+      var col=sw.classList.toggle('collapsed');
+      if(!col){var i=document.getElementById('searchInput');if(i)i.focus()}
+    };
+  }
+  document.addEventListener('click',function(e){
+    if(!e.target.closest||!e.target.closest('.menu-wrap')){if(menu)menu.classList.remove('show')}
+    if(!e.target.closest||!e.target.closest('.row-more-wrap')){document.querySelectorAll('.row-menu.show').forEach(function(m){m.classList.remove('show')})}
+  });
+  window.addEventListener('hashchange',function(){
+    var h=String(location.hash||'');
+    if(/#\\/?home/.test(h)){setMode('');goHome();return}
+    var m=/#\\/files(.*)$/.exec(h);
+    if(m){var p=decodeURIComponent(m[1]||'/')||'/';cur=p;goFiles('files');setMode('');load();return}
+    if(/#\\/fav/.test(h)){navTo('fav');return}
+    if(/#\\/recent/.test(h)){navTo('recent');return}
+  });
+})();
+function load(){goFiles(currentNav==='fav'||currentNav==='recent'?currentNav:'files');render();loadUsage();syncViewBtn();}
+// ===== 移动端：底部标签栏 + 选择模式 =====
+var selMode=false;
+function toggleSelMode(on){
+  selMode=(on===undefined)?!selMode:!!on;
+  document.body.classList.toggle('selmode',selMode);
+  var b=document.getElementById('btnSelect');
+  if(b)b.classList.toggle('active',selMode);
+  if(!selMode){selected={};updateBatch()}
+}
+(function bindTabBar(){
+  var bar=document.getElementById('tabBar');
+  if(!bar)return;
+  bar.querySelectorAll('[data-tb]').forEach(function(b){
+    b.onclick=function(){
+      var k=b.getAttribute('data-tb');
+      if(k==='home'){toggleSelMode(false);navTo('home')}
+      else if(k==='files'){toggleSelMode(false);navTo('files')}
+      else if(k==='fav'){toggleSelMode(false);navTo('fav')}
+      else if(k==='recent'){toggleSelMode(false);navTo('recent')}
+      else{document.getElementById('btnMore').click()}
+      syncNav();
+    };
+  });
+})();
+(function bindSelectBtn(){
+  var b=document.getElementById('btnSelect');
+  if(b)b.onclick=function(){toggleSelMode()};
+})();
+(function bindSidebarToggle(){
+  var b=document.getElementById('btnSidebar');
+  if(!b)return;
+  b.onclick=function(){
+    var sb=document.getElementById('sidebar');
+    if(!sb)return;
+    if(window.innerWidth<=760){sb.classList.toggle('show');return}
+    var lay=document.querySelector('.layout');
+    var hidden=lay?lay.classList.toggle('sidebar-hidden'):false;
+    try{localStorage.setItem('dSidebar',hidden?'0':'1')}catch(e){}
+  };
+})();
+// 移动端底部标签栏
+(function(){
+  var bar=document.getElementById('tabBar');
+  if(!bar)return;
+  bar.querySelectorAll('[data-tb]').forEach(function(b){
+    b.onclick=function(){
+      var k=b.getAttribute('data-tb');
+      if(k==='files'){setMode('');cur='/';load()}
+      else if(k==='fav'){setMode('fav');render()}
+      else if(k==='recent'){setMode('recent');render()}
+      else if(k==='up'){document.getElementById('fileInput').click()}
+      else{document.getElementById('btnMore').click()}
+      bar.querySelectorAll('[data-tb]').forEach(function(x){x.classList.toggle('on',x===b)});
+    };
+  });
+})();
 function loadUsage(){api('/api/usage').then(function(d){var p=Math.min(100,(d.used/d.total)*100).toFixed(1);document.getElementById('uUsed').textContent=t('used')+': '+fmt(d.used)+' / '+fmt(d.total);document.getElementById('uFiles').textContent=d.files+' '+t('files');document.getElementById('uFill').style.width=p+'%'})}
 document.getElementById('btnRecalc').onclick=function(){api('/api/recalc-usage',{method:'POST'}).then(function(){loadUsage();alert('OK')})};
 
@@ -5376,12 +9989,24 @@ document.addEventListener('paste',function(e){
       }
     }
   }
-  if(files.length){e.preventDefault();uploadFiles(files)}
+  if(files.length){e.preventDefault();uploadFiles(files);return}
+  // 剪贴板里没有文件：若站内剪贴板有内容，则执行"粘贴到当前目录"
+  if(clipGet()){e.preventDefault();pasteHere(cur)}
 });
 
 
 // ===== Keyboard shortcuts =====
 document.addEventListener('keydown',function(e){
+  // 命令面板：任何焦点下都可用
+  if((e.ctrlKey||e.metaKey)&&(e.key==='k'||e.key==='K')){
+    e.preventDefault();
+    if(PALETTE.open)paletteClose();else paletteOpen();
+    return;
+  }
+  if(PALETTE.open){
+    if(e.key==='Escape'){e.preventDefault();paletteClose()}
+    return;
+  }
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT')return;
   if(document.getElementById('pvModal').classList.contains('show'))return;
   if(document.querySelector('.modal-bg.show'))return;
@@ -5395,24 +10020,38 @@ document.addEventListener('keydown',function(e){
   }
   if(e.key==='Delete'&&Object.keys(selected).length){
     if(!confirm('Delete '+Object.keys(selected).length+'?'))return;
-    api('/api/batch-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:Object.keys(selected).map(function(k){return cur+k})})}).then(function(){selected={};load()});
+    api('/api/batch-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:Object.keys(selected)})}).then(function(){selected={};load()});
     return;
   }
   if(e.key==='F2'){
     var keys=Object.keys(selected);
-    if(keys.length===1){var o=keys[0];var n=prompt(t('rename'),o);if(n&&n!==o)api('/api/rename',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur+o,newName:n})}).then(load)}
+    if(keys.length===1){var o=keys[0];var bn=o.split('/').filter(Boolean).pop();var n=prompt(t('rename'),bn);if(n&&n!==bn)api('/api/rename',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:o,newName:n})}).then(load)}
     return;
   }
   if(e.key==='Backspace'&&cur!=='/'){
     e.preventDefault();
     var parts=cur.split('/').filter(Boolean);parts.pop();
     cur=parts.length?'/'+parts.join('/')+'/':'/' ;
-    searchMode=false;favMode=false;recentMode=false;load();
+    setMode('');load();
     return;
   }
   if((e.ctrlKey||e.metaKey)&&e.key==='f'){
     e.preventDefault();
     document.getElementById('searchInput').focus();
+    return;
+  }
+  if(e.key==='v'||e.key==='V'){cycleView();return}
+  if(e.key==='/'||e.key==='?'){e.preventDefault();paletteOpen();return}
+  if((e.ctrlKey||e.metaKey)&&(e.key==='c'||e.key==='x')){
+    if(!Object.keys(selected).length)return;   // 没有选中就不拦截，保留浏览器原生复制
+    e.preventDefault();
+    clipFromSelection(e.key==='x'?'cut':'copy');
+    return;
+  }
+  if((e.ctrlKey||e.metaKey)&&e.key==='v'){
+    if(!clipGet())return;                      // 让原生粘贴（含文件）走 paste 事件
+    e.preventDefault();
+    pasteHere(cur);
     return;
   }
 });
@@ -5422,8 +10061,9 @@ document.addEventListener('keydown',function(e){
 document.getElementById('btnEnc').onclick=function(){showEncryptPrompt()};
 document.getElementById('encClose').onclick=function(){document.getElementById('encModal').classList.remove('show')};
 document.getElementById('encModal').onclick=function(e){if(e.target===this)this.classList.remove('show')};
-function showEncrypt(name){showEncryptPrompt(name)}
-function showEncryptPrompt(name){
+function showEncrypt(name,base){showEncryptPrompt(name,base)}
+function showEncryptPrompt(name,base){
+  base=base||cur;
   var box=document.getElementById('encContent');
   document.getElementById('encTitle').textContent=t('enc')+(name?' · '+name:'');
   var h='<div style="margin-bottom:14px"><label style="font-size:13px;color:var(--sys-text-2);display:block;margin-bottom:6px">'+t('encPw')+'</label>';
@@ -5450,7 +10090,7 @@ async function doEncrypt(name,encrypt){
   var status=document.getElementById('encStatus');
   status.textContent='Processing...';
   try{
-    var path=cur+name;
+    var path=base+name;
     var res=await fetch('/api/preview?path='+encodeURIComponent(path)+'&token='+tk);
     if(!res.ok)throw new Error('Download failed');
     var data=await res.arrayBuffer();
@@ -5477,12 +10117,12 @@ async function doEncrypt(name,encrypt){
       newName=name+'.enc';
     }else{
       blob=new Blob([result]);
-      newName=name.replace(/\.enc$/,'');
+      newName=name.replace(/\\.enc$/,'');
     }
     var fd=new FormData();
     fd.append('file',blob,newName);
     var xhr=new XMLHttpRequest();
-    xhr.open('POST','/api/upload?path='+encodeURIComponent(cur)+'&token='+tk);
+    xhr.open('POST','/api/upload?path='+encodeURIComponent(base)+'&token='+tk);
     xhr.onload=function(){
       if(xhr.status>=200&&xhr.status<300){
         status.textContent=encrypt?t('encDone'):t('decDone');
@@ -5549,34 +10189,51 @@ function showStats(){
 document.getElementById('btnLog').onclick=function(){showLog()};
 document.getElementById('logClose').onclick=function(){document.getElementById('logModal').classList.remove('show')};
 document.getElementById('logModal').onclick=function(e){if(e.target===this)this.classList.remove('show')};
-var logFilter='',logCache=[];
+var logFilter='',logCache=[],logQuery={q:'',from:'',to:''};
 function showLog(){
   var box=document.getElementById('logContent');
   box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">Loading...</p>';
   document.getElementById('logModal').classList.add('show');
-  api('/api/log').then(function(d){logCache=d.logs||[];renderLog()}).catch(function(){
-    box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">'+(lang==='zh'?'加载失败':'Failed')+'</p>';
+  logFetch();
+}
+function logFetch(){
+  var qs='?limit=1000';
+  if(logFilter)qs+='&action='+encodeURIComponent(logFilter);
+  if(logQuery.q)qs+='&q='+encodeURIComponent(logQuery.q);
+  if(logQuery.from)qs+='&from='+encodeURIComponent(logQuery.from);
+  if(logQuery.to)qs+='&to='+encodeURIComponent(logQuery.to);
+  api('/api/log'+qs).then(function(d){logCache=d.logs||[];logTotal=d.total||logCache.length;renderLog()}).catch(function(){
+    document.getElementById('logContent').innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">'+(lang==='zh'?'加载失败':'Failed')+'</p>';
   });
 }
+var logTotal=0;
 function renderLog(){
   var box=document.getElementById('logContent');
-  var ACT={up:{zh:'上传',en:'upload',c:'var(--sys-green)',i:'⬆'},del:{zh:'删除',en:'delete',c:'var(--sys-red)',i:'🗑'},shr:{zh:'分享',en:'share',c:'var(--sys-orange)',i:'🔗'},mov:{zh:'移动',en:'move',c:'var(--sys-blue)',i:'➡'},res:{zh:'恢复',en:'restore',c:'var(--sys-green)',i:'↩'},sec:{zh:'安全',en:'security',c:'var(--sys-red)',i:'🔒'}};
+  var ACT={up:{zh:'上传',en:'upload',c:'var(--sys-green)',i:'⬆'},del:{zh:'删除',en:'delete',c:'var(--sys-red)',i:'🗑'},shr:{zh:'分享',en:'share',c:'var(--sys-orange)',i:'🔗'},mov:{zh:'移动',en:'move',c:'var(--sys-blue)',i:'➡'},res:{zh:'恢复',en:'restore',c:'var(--sys-green)',i:'↩'},sec:{zh:'安全',en:'security',c:'var(--sys-red)',i:'🔒'},cpy:{zh:'复制',en:'copy',c:'var(--sys-blue)',i:'📋'},login:{zh:'登录',en:'login',c:'var(--sys-orange)',i:'🔑'}};
   var counts={};
   logCache.forEach(function(l){counts[l.action]=(counts[l.action]||0)+1});
-  var tabs=[['','全部','All'],['up','上传','Upload'],['del','删除','Delete'],['shr','分享','Share'],['mov','移动','Move']];
-  var h='<div class="filter-bar" style="border:0;padding:0 0 10px">';
+  var tabs=[['','全部','All'],['up','上传','Upload'],['del','删除','Delete'],['shr','分享','Share'],['mov','移动','Move'],['cpy','复制','Copy'],['sec','安全','Security']];
+  var h='<div class="filter-bar" style="border:0;padding:0 0 8px;flex-wrap:wrap">';
   tabs.forEach(function(x){
-    var n=x[0]?counts[x[0]]||0:logCache.length;
+    var n=x[0]?(counts[x[0]]||0):logCache.length;
     h+='<button class="fchip'+(logFilter===x[0]?' active':'')+'" data-lf="'+x[0]+'">'+(lang==='zh'?x[1]:x[2])+' '+n+'</button>';
   });
   h+='</div>';
-  var list=logCache.filter(function(l){return !logFilter||l.action===logFilter});
+  h+='<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px">';
+  h+='<input id="logQ" placeholder="'+(lang==='zh'?'关键词 / 路径':'keyword')+'" value="'+esc(logQuery.q)+'" style="flex:1;min-width:120px;padding:6px 10px;font-size:13px">';
+  h+='<input id="logFrom" type="date" value="'+esc(logQuery.from)+'" style="padding:6px 8px;font-size:13px">';
+  h+='<input id="logTo" type="date" value="'+esc(logQuery.to)+'" style="padding:6px 8px;font-size:13px">';
+  h+='<button id="logApply" class="btn gray tiny">'+(lang==='zh'?'筛选':'Filter')+'</button>';
+  h+='<button id="logReset" class="btn gray tiny">'+(lang==='zh'?'重置':'Reset')+'</button>';
+  h+='<button id="logCsv" class="btn gray tiny">⬇ CSV</button>';
+  h+='</div>';
+  var list=logCache;
   if(!list.length){h+='<p style="text-align:center;color:var(--sys-text-3);padding:20px">'+(lang==='zh'?'暂无记录':'No logs')+'</p>'}
   else{
-    h+='<div style="font-size:12px;color:var(--sys-text-3);margin-bottom:4px">'+list.length+(lang==='zh'?' 条记录':' records')+'</div>';
+    h+='<div style="font-size:12px;color:var(--sys-text-3);margin-bottom:4px">'+list.length+(lang==='zh'?' 条记录（共 ':' records (total ')+logTotal+(lang==='zh'?'）':'）')+'</div>';
     h+='<div style="max-height:440px;overflow:auto">';
     var curDay='';
-    list.slice(0,200).forEach(function(l){
+    list.slice(0,500).forEach(function(l){
       var day=String(l.time||'').substring(0,10);
       if(day!==curDay){curDay=day;h+='<div class="log-day">'+esc(day)+'</div>'}
       var a=ACT[l.action]||{zh:l.action||'-',en:l.action||'-',c:'var(--sys-text-2)',i:'•'};
@@ -5588,7 +10245,18 @@ function renderLog(){
     h+='</div>';
   }
   box.innerHTML=h;
-  box.querySelectorAll('[data-lf]').forEach(function(b){b.onclick=function(){logFilter=b.getAttribute('data-lf');renderLog()}});
+  box.querySelectorAll('[data-lf]').forEach(function(b){b.onclick=function(){logFilter=b.getAttribute('data-lf');logFetch()}});
+  var ap=document.getElementById('logApply');
+  if(ap)ap.onclick=function(){
+    logQuery.q=document.getElementById('logQ').value.trim();
+    logQuery.from=document.getElementById('logFrom').value;
+    logQuery.to=document.getElementById('logTo').value;
+    logFetch();
+  };
+  var rs=document.getElementById('logReset');
+  if(rs)rs.onclick=function(){logFilter='';logQuery={q:'',from:'',to:''};logFetch()};
+  var cs=document.getElementById('logCsv');
+  if(cs)cs.onclick=function(){window.open('/api/log.csv?token='+encodeURIComponent(tk),'_blank')};
 }
 
 
@@ -5608,7 +10276,7 @@ function showTokens(){
     if(tokens.length){
       tokens.forEach(function(t){
         h+='<div class="token-row"><span class="token-name">'+esc(t.name)+'</span><span class="token-perm '+t.perm+'">'+t.perm+'</span>';
-        if(t.exp)h+='<span style="font-size:11px;color:var(--sys-text-3)">'+t.exp+'</span>';
+        if(t.exp)h+='<span style="font-size:11px;color:var(--sys-text-3)">'+esc(String(t.exp))+'</span>';
         h+='<button class="btn tiny danger" data-tkdel="'+esc(t.id||'')+'">✕</button></div>';
       });
     }else{h+='<p style="text-align:center;color:var(--sys-text-3);padding:16px">'+(lang==='zh'?'暂无令牌':'No tokens')+'</p>'}
@@ -5666,18 +10334,150 @@ function showShareMgmt(){
         h+='<div style="font-weight:500;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(s.name||s.path)+'</div>';
         h+='<div class="dup-path">'+esc(s.path)+' · '+(s.max>0?(s.hits+'/'+s.max):(s.hits+' hits'))+' · '+esc(fmtWhen(s.exp))+(s.hasPassword?' · 🔒':'')+'</div></div>';
         h+='<button class="btn gray tiny" data-shcopy="'+esc(s.token)+'">'+(lang==='zh'?'复制':'Copy')+'</button>';
+        h+='<button class="btn gray tiny" data-shset="'+esc(s.token)+'">⚙</button>';
         h+='<button class="btn tiny danger" data-shdel="'+esc(s.token)+'">✕</button></div>';
       });
     }
     h+='<div id="shareExtra" style="margin-top:14px;padding-top:12px;border-top:.5px solid var(--sys-separator);font-size:12px;color:var(--sys-text-3)"></div>';
     box.innerHTML=h;
     box.querySelectorAll('[data-shcopy]').forEach(function(b){b.onclick=function(){var u=location.origin+'/s/'+b.getAttribute('data-shcopy');try{navigator.clipboard.writeText(u)}catch(e){}prompt(t('link'),u)}});
+    box.querySelectorAll('[data-shset]').forEach(function(b){b.onclick=function(){showShareSettings(b.getAttribute('data-shset'),false)}});
     box.querySelectorAll('[data-shdel]').forEach(function(b){b.onclick=function(){if(!confirm(t('delete')))return;api('/api/share',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:b.getAttribute('data-shdel')})}).then(showShareMgmt)}});
     api('/api/public-upload-info').then(function(pi){
       var el=document.getElementById('shareExtra');if(!el)return;
       el.textContent=pi.enabled?('公开上传：'+location.origin+'/upload → '+pi.dir+'（'+(pi.turnstile?'已开启人机验证':'未开启人机验证')+'）'):'公开上传未开启：设置环境变量 PUBLIC_UPLOAD_DIR 后可用 /upload 页面接收文件。';
     }).catch(function(){});
   }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">Error</p>'});
+}
+
+// ===== 分享设置 / 统计面板 =====
+function shareSetModal(){
+  var m=document.getElementById('shareSetModal');
+  if(!m){
+    m=document.createElement('div');
+    m.id='shareSetModal';m.className='modal-bg';
+    m.innerHTML='<div class="modal" style="min-width:420px;max-width:680px"><button class="mclose" id="shareSetClose">✕</button><h3>🔗 分享设置</h3><div id="shareSetContent"></div></div>';
+    document.body.appendChild(m);
+    document.getElementById('shareSetClose').onclick=function(){m.classList.remove('show')};
+    m.onclick=function(e){if(e.target===m)m.classList.remove('show')};
+  }
+  return m;
+}
+function showShareSettings(token,isNew){
+  var m=shareSetModal(),box=document.getElementById('shareSetContent');
+  box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">Loading...</p>';
+  m.classList.add('show');
+  api('/api/share-stats?token='+encodeURIComponent(token)).then(function(d){
+    if(!d||d.error){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">'+esc((d&&d.error)||'Error')+'</p>';return}
+    var url=location.origin+'/s/'+(d.slug||token);
+    var st=d.stats||{views:0,downloads:0};
+    var v=d.view||{};
+    var h='';
+    if(isNew)h+='<div style="font-size:13px;color:var(--sys-green);margin-bottom:10px">'+(lang==='zh'?'分享已创建，可继续调整权限与外观':'Share created')+'</div>';
+    h+='<div class="dup-path" style="word-break:break-all;margin-bottom:8px">'+esc(url)+'</div>';
+    h+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'
+      +'<button class="btn gray tiny" id="ssCopy">'+(lang==='zh'?'复制链接':'Copy')+'</button>'
+      +'<button class="btn gray tiny" id="ssOpen">'+(lang==='zh'?'打开':'Open')+'</button>'
+      +'<button class="btn gray tiny" id="ssQR">'+(lang==='zh'?'二维码':'QR')+'</button>'
+      +(d.type==='dir'?'<button class="btn gray tiny" id="ssZip">📦 '+(lang==='zh'?'打包下载':'ZIP')+'</button>':'')
+      +'</div>';
+    h+='<div class="token-row"><span class="token-name">'+(d.type==='dir'?'📁 ':'📄 ')+esc(d.name||'')+'</span><span class="dup-path">'+esc(d.path||'')+'</span></div>';
+    h+='<div class="dup-path" style="line-height:1.9">'
+      +(lang==='zh'?'访问 ':'views ')+(st.views||0)+' · '+(lang==='zh'?'下载 ':'downloads ')+(st.downloads||0)
+      +(d.max>0?(' · '+(lang==='zh'?'配额 ':'limit ')+d.hits+'/'+d.max):'')
+      +' · '+(lang==='zh'?'过期 ':'expires ')+esc(fmtWhen(d.exp))+(d.hasPassword?' · 🔒':'')+'</div>';
+    h+='<div style="margin:14px 0 6px;font-size:13px;font-weight:600">'+(lang==='zh'?'权限':'Permissions')+'</div>';
+    h+='<label style="display:flex;gap:8px;align-items:center;font-size:13.5px;margin:6px 0"><input type="checkbox" id="ssDl" '+(d.allowDownload?'checked':'')+'>'+(lang==='zh'?'允许下载（关闭后仅可在线预览）':'Allow download')+'</label>';
+    h+='<label style="display:flex;gap:8px;align-items:center;font-size:13.5px;margin:6px 0"><input type="checkbox" id="ssOnce" '+(d.once?'checked':'')+'>'+(lang==='zh'?'一次性下载（下载一次后失效）':'One-time download')+'</label>';
+    h+='<label style="display:flex;gap:8px;align-items:center;font-size:13.5px;margin:6px 0"><input type="checkbox" id="ssCmt" '+(d.allowComment?'checked':'')+'>'+(lang==='zh'?'允许访客留言':'Allow comments')+'</label>';
+    h+='<div style="margin:14px 0 6px;font-size:13px;font-weight:600">'+(lang==='zh'?'外观与说明':'Appearance')+'</div>';
+    h+='<input id="ssTitle" placeholder="'+(lang==='zh'?'分享标题':'Title')+'" value="'+esc(v.title||'')+'" style="width:100%;padding:8px 12px;margin-bottom:6px">';
+    h+='<input id="ssDesc" placeholder="'+(lang==='zh'?'一句话描述':'Description')+'" value="'+esc(v.desc||'')+'" style="width:100%;padding:8px 12px;margin-bottom:6px">';
+    h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><input id="ssColor" type="color" value="'+esc(v.color||'#0a84ff')+'" style="width:40px;height:34px;padding:0;border:none;background:none">'
+      +'<input id="ssNote" placeholder="'+(lang==='zh'?'给访客的提示（显示在页面上）':'Note for visitors')+'" value="'+esc(d.note||'')+'" style="flex:1;padding:8px 12px"></div>';
+    h+='<div style="margin:14px 0 6px;font-size:13px;font-weight:600">'+(lang==='zh'?'友好短链与访问限制':'Slug &amp; restrictions')+'</div>';
+    h+='<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px"><span class="dup-path">/s/</span><input id="ssSlug" placeholder="my-photos" value="'+esc(d.slug||'')+'" style="flex:1;padding:8px 12px"></div>';
+    h+='<input id="ssIpAllow" placeholder="'+(lang==='zh'?'仅允许这些 IP/CIDR（逗号分隔，留空不限）':'IP allow')+'" value="'+esc(d.ipAllow||'')+'" style="width:100%;padding:8px 12px;margin-bottom:6px">';
+    h+='<input id="ssIpDeny" placeholder="'+(lang==='zh'?'拒绝这些 IP/CIDR':'IP deny')+'" value="'+esc(d.ipDeny||'')+'" style="width:100%;padding:8px 12px;margin-bottom:6px">';
+    h+='<input id="ssCountry" placeholder="'+(lang==='zh'?'仅允许这些国家码（如 CN,HK）':'Country allow')+'" value="'+esc(d.countryAllow||'')+'" style="width:100%;padding:8px 12px;margin-bottom:6px">';
+    h+='<input id="ssUa" placeholder="'+(lang==='zh'?'拒绝这些 UA 关键字':'UA deny')+'" value="'+esc(d.uaDeny||'')+'" style="width:100%;padding:8px 12px;margin-bottom:8px">';
+    h+='<div id="ssMsg" style="font-size:13px;min-height:18px;margin-bottom:8px"></div>';
+    h+='<div style="text-align:right"><button class="btn small" id="ssSave">'+(lang==='zh'?'保存':'Save')+'</button></div>';
+    if((d.visits||[]).length){
+      h+='<div style="margin:14px 0 6px;font-size:13px;font-weight:600">'+(lang==='zh'?'最近访问':'Recent visits')+'</div>';
+      h+='<div style="max-height:180px;overflow:auto;font-size:12px">';
+      d.visits.forEach(function(x){
+        h+='<div class="log-entry"><span class="log-time">'+esc(new Date(x.t).toLocaleString())+'</span><span style="flex:1">'+esc((x.k==='download'?'⬇ ':'👁 ')+(x.ip||'')+(x.c?(' · '+x.c):'')+(x.b?(' · '+x.b):''))+'</span></div>';
+      });
+      h+='</div>';
+    }
+    box.innerHTML=h;
+    document.getElementById('ssCopy').onclick=function(){try{navigator.clipboard.writeText(url)}catch(e){};this.textContent=(lang==='zh'?'已复制':'Copied')};
+    document.getElementById('ssOpen').onclick=function(){window.open('/s/'+(d.slug||token),'_blank')};
+    document.getElementById('ssQR').onclick=function(){try{showQR(url)}catch(e){}};
+    var zipBtn=document.getElementById('ssZip');
+    if(zipBtn)zipBtn.onclick=function(){window.open('/s/'+(d.slug||token)+'/zip','_blank')};
+    document.getElementById('ssSave').onclick=function(){
+      var msg=document.getElementById('ssMsg');
+      var body={
+        token:token,
+        allowDownload:document.getElementById('ssDl').checked,
+        once:document.getElementById('ssOnce').checked,
+        allowComment:document.getElementById('ssCmt').checked,
+        note:document.getElementById('ssNote').value,
+        view:{title:document.getElementById('ssTitle').value,desc:document.getElementById('ssDesc').value,color:document.getElementById('ssColor').value},
+        slug:document.getElementById('ssSlug').value.trim(),
+        ipAllow:document.getElementById('ssIpAllow').value,
+        ipDeny:document.getElementById('ssIpDeny').value,
+        countryAllow:document.getElementById('ssCountry').value,
+        uaDeny:document.getElementById('ssUa').value
+      };
+      api('/api/share/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){
+        if(r&&r.ok){msg.style.color='var(--sys-green)';msg.textContent=(lang==='zh'?'已保存':'Saved');showShareSettings(token,false)}
+        else{msg.style.color='var(--sys-red)';msg.textContent=(r&&r.error)||'failed'}
+      });
+    };
+  }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">Error</p>'});
+}
+// ===== 文件评论面板 =====
+function cmtModal(){
+  var m=document.getElementById('cmtModal');
+  if(!m){
+    m=document.createElement('div');
+    m.id='cmtModal';m.className='modal-bg';
+    m.innerHTML='<div class="modal" style="min-width:380px;max-width:600px"><button class="mclose" id="cmtClose">✕</button><h3 id="cmtTitle">💬 留言</h3><div id="cmtContent"></div></div>';
+    document.body.appendChild(m);
+    document.getElementById('cmtClose').onclick=function(){m.classList.remove('show')};
+    m.onclick=function(e){if(e.target===m)m.classList.remove('show')};
+  }
+  return m;
+}
+function showComments(filePath,name){
+  var m=cmtModal(),box=document.getElementById('cmtContent');
+  document.getElementById('cmtTitle').textContent='💬 '+(name||'');
+  box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:16px">Loading...</p>';
+  m.classList.add('show');
+  function render(){
+    api('/api/comments?path='+encodeURIComponent(filePath)).then(function(d){
+      var list=d.comments||[];
+      var h='<div style="max-height:300px;overflow:auto;font-size:13px">';
+      if(!list.length)h+='<div style="color:var(--sys-text-3);padding:10px 0">'+(lang==='zh'?'还没有留言':'No comments')+'</div>';
+      list.forEach(function(c){
+        h+='<div style="padding:8px 0;border-bottom:.5px solid var(--sys-separator)"><div style="display:flex;gap:8px;align-items:center"><span style="font-weight:600">'+esc(c.by||'')+'</span><span class="dup-path">'+esc(fmtWhen(c.t))+(c.country?(' · '+esc(c.country)):'')+'</span><span style="flex:1"></span><button class="btn tiny danger" data-cdel="'+esc(c.id)+'">✕</button></div>'
+          +'<div style="white-space:pre-wrap;word-break:break-word;margin-top:4px">'+esc(c.text||'')+'</div></div>';
+      });
+      h+='</div><div style="display:flex;gap:8px;margin-top:10px"><input id="cmtNew" placeholder="'+(lang==='zh'?'写下留言...':'Write a comment...')+'" style="flex:1"><button class="btn small" id="cmtAdd">'+(lang==='zh'?'发送':'Send')+'</button></div>';
+      box.innerHTML=h;
+      document.getElementById('cmtAdd').onclick=function(){
+        var v=document.getElementById('cmtNew').value.trim();if(!v)return;
+        api('/api/comments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:filePath,text:v,by:'owner'})}).then(function(){render()});
+      };
+      box.querySelectorAll('[data-cdel]').forEach(function(b){b.onclick=function(){
+        api('/api/comments?path='+encodeURIComponent(filePath)+'&id='+encodeURIComponent(b.getAttribute('data-cdel')),{method:'DELETE'}).then(function(){render()});
+      }});
+    }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">Error</p>'});
+  }
+  render();
 }
 
 // ===== 上传链接管理 =====
@@ -5826,17 +10626,329 @@ function showAdminPass(){
   }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">Error</p>'});
 }
 
+// ===== 二次验证（TOTP）=====
+document.getElementById('btnTotp').onclick=function(){showTotp()};
+function totpModal(){
+  var box=document.getElementById('totpModal');
+  if(!box){
+    box=document.createElement('div');
+    box.id='totpModal';box.className='modal-bg';
+    box.innerHTML='<div class="modal" style="min-width:380px;max-width:560px"><button class="mclose" id="totpClose">✕</button><h3>🛡 '+(lang==='zh'?'二次验证':'Two-factor')+'</h3><div id="totpContent"></div></div>';
+    document.body.appendChild(box);
+    document.getElementById('totpClose').onclick=function(){box.classList.remove('show')};
+    box.onclick=function(e){if(e.target===box)box.classList.remove('show')};
+  }
+  return box;
+}
+function totpCodesHtml(codes){
+  if(!codes||!codes.length)return '';
+  var h='<div style="margin-top:12px;padding:10px 12px;background:var(--sys-red-soft);border-radius:10px">';
+  h+='<div style="font-size:12px;color:var(--sys-red);margin-bottom:6px">'+(lang==='zh'?'备用码（仅显示这一次，请立即保存）':'Backup codes (shown once)')+'</div>';
+  h+='<pre style="margin:0;font-size:13px;white-space:pre-wrap;word-break:break-all">'+esc(codes.join('  '))+'</pre>';
+  h+='<div style="margin-top:8px;text-align:right"><button id="totpCopyCodes" class="btn gray tiny">'+(lang==='zh'?'复制':'Copy')+'</button></div></div>';
+  return h;
+}
+function showTotp(){
+  var box=totpModal();
+  var c=document.getElementById('totpContent');
+  c.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">Loading...</p>';
+  box.classList.add('show');
+  api('/api/totp').then(function(d){
+    var h='';
+    h+='<div style="font-size:12px;color:var(--sys-text-3);line-height:1.8;margin-bottom:12px">'+(lang==='zh'
+      ?'开启后登录需要额外输入 6 位动态码（Google Authenticator / 1Password / Authy 等），并可生成一次性备用码。'
+      :'After enabling, login requires a 6-digit code (Google Authenticator / 1Password / Authy).')+'</div>';
+    if(d.enabled){
+      h+='<div class="token-row"><span class="token-name">'+(lang==='zh'?'状态：已开启':'Status: enabled')+'</span><span class="dup-path">'+(lang==='zh'?'备用码剩余 ':'backup left ')+(d.backupLeft||0)+'</span></div>';
+      h+='<label style="font-size:13px;color:var(--sys-text-2);display:block;margin:10px 0 4px">'+(lang==='zh'?'管理员密码':'Admin password')+'</label><input id="totpPw" type="password" autocomplete="off" style="width:100%;padding:10px 14px">';
+      h+='<label style="font-size:13px;color:var(--sys-text-2);display:block;margin:10px 0 4px">'+(lang==='zh'?'动态码':'Code')+'</label><input id="totpCode2" inputmode="numeric" autocomplete="one-time-code" style="width:100%;padding:10px 14px">';
+      h+='<div id="totpMsg" style="margin-top:10px;font-size:13px;min-height:18px"></div>';
+      h+='<div id="totpCodes"></div>';
+      h+='<div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end"><button id="totpRegen" class="btn gray small">'+(lang==='zh'?'重新生成备用码':'New backup codes')+'</button><button id="totpOff" class="btn danger small">'+(lang==='zh'?'关闭二次验证':'Disable')+'</button></div>';
+    }else if(d.pending){
+      h+='<div class="dup-path" style="line-height:1.8">'+(lang==='zh'?'已生成密钥，请用验证器扫码并输入一次动态码完成绑定。':'Scan the QR and enter a code to finish setup.')+'</div>';
+      h+='<div id="totpSetupBox"></div>';
+      h+='<div style="margin-top:10px"><button id="totpAgain" class="btn gray small">'+(lang==='zh'?'重新生成密钥':'New secret')+'</button></div>';
+    }else{      h+='<div style="margin-top:6px"><button id="totpStart" class="btn small">'+(lang==='zh'?'生成密钥并绑定':'Set up')+'</button></div>';
+    }
+    h+='<div id="totpMsg2" style="margin-top:10px;font-size:13px;min-height:18px"></div>';
+    c.innerHTML=h;
+    var startBtn=document.getElementById('totpStart');
+    if(startBtn)startBtn.onclick=function(){totpSetup()};
+    var againBtn=document.getElementById('totpAgain');
+    if(againBtn)againBtn.onclick=function(){totpSetup()};
+    // pending（已有待确认密钥）时直接显示出二维码，省一次点击
+    if(!d.enabled&&d.pending)try{totpSetup()}catch(e){}
+    var offBtn=document.getElementById('totpOff');
+    if(offBtn)offBtn.onclick=function(){
+      var msg=document.getElementById('totpMsg');
+      api('/api/totp/disable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('totpPw').value,code:document.getElementById('totpCode2').value})}).then(function(r){
+        if(r&&r.ok){showTotp()}else{msg.style.color='var(--sys-red)';msg.textContent=(r&&r.error)||'failed'}
+      });
+    };
+    var regenBtn=document.getElementById('totpRegen');
+    if(regenBtn)regenBtn.onclick=function(){
+      var msg=document.getElementById('totpMsg');
+      api('/api/totp/backup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('totpPw').value,code:document.getElementById('totpCode2').value})}).then(function(r){
+        if(r&&r.ok){
+          var box2=document.getElementById('totpCodes');
+          box2.innerHTML=totpCodesHtml(r.backupCodes);
+          bindCopyCodes();
+        }else{msg.style.color='var(--sys-red)';msg.textContent=(r&&r.error)||'failed'}
+      });
+    };
+  }).catch(function(){c.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">Error</p>'});
+}
+function bindCopyCodes(){
+  var b=document.getElementById('totpCopyCodes');
+  if(b)b.onclick=function(){
+    var pre=document.querySelector('#totpCodes pre');
+    if(pre){try{navigator.clipboard.writeText(pre.textContent)}catch(e){};b.textContent=(lang==='zh'?'已复制':'Copied')}
+  };
+}
+function totpSetup(){
+  var host=document.getElementById('totpContent');
+  var box=document.getElementById('totpSetupBox');
+  if(!box){box=document.createElement('div');box.id='totpSetupBox';host.appendChild(box)}
+  api('/api/totp/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:location.hostname||'PersonalDrive'})}).then(function(d){
+    if(!d||!d.secret){var m=document.getElementById('totpMsg2');if(m){m.style.color='var(--sys-red)';m.textContent=(d&&d.error)||'failed'}return}
+    var grouped=d.secret.replace(/(.{4})/g,'$1 ').trim();
+    var h='<div style="text-align:center;margin:10px 0"><div id="totpQR" style="display:inline-block;padding:8px;background:#fff;border-radius:10px"></div></div>';
+    h+='<div class="dup-path" style="word-break:break-all">'+esc(grouped)+'</div>';
+    h+='<div style="margin-top:8px"><button id="totpCopySecret" class="btn gray tiny">'+(lang==='zh'?'复制密钥':'Copy secret')+'</button></div>';
+    h+='<label style="font-size:13px;color:var(--sys-text-2);display:block;margin:10px 0 4px">'+(lang==='zh'?'输入验证器上的 6 位码':'6-digit code')+'</label>';
+    h+='<input id="totpEnableCode" inputmode="numeric" autocomplete="one-time-code" style="width:100%;padding:10px 14px">';
+    h+='<div style="margin-top:10px;text-align:right"><button id="totpDoEnable" class="btn small">'+(lang==='zh'?'启用':'Enable')+'</button></div>';
+    h+='<div id="totpCodes"></div>';
+    box.innerHTML=h;
+    try{
+      if(typeof QRCode!=='undefined'){new QRCode(document.getElementById('totpQR'),{text:d.otpauth,width:168,height:168,correctLevel:QRCode.CorrectLevel.M})}
+      else{document.getElementById('totpQR').textContent='QR lib not loaded'}
+    }catch(e){}
+    document.getElementById('totpCopySecret').onclick=function(){try{navigator.clipboard.writeText(d.secret)}catch(e){};this.textContent=(lang==='zh'?'已复制':'Copied')};
+    document.getElementById('totpDoEnable').onclick=function(){
+      api('/api/totp/enable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:document.getElementById('totpEnableCode').value})}).then(function(r){
+        if(r&&r.ok){
+          document.getElementById('totpCodes').innerHTML=totpCodesHtml(r.backupCodes);
+          bindCopyCodes();
+          var btn=document.getElementById('totpDoEnable');if(btn){btn.disabled=true;btn.textContent=(lang==='zh'?'已启用':'Enabled')}
+        }else{
+          var m=document.getElementById('totpMsg2');if(m){m.style.color='var(--sys-red)';m.textContent=(r&&r.error)||'failed'}
+        }
+      });
+    };
+  }).catch(function(){var m=document.getElementById('totpMsg2');if(m){m.style.color='var(--sys-red)';m.textContent='failed'}});
+}
+
+// ===== 防外链：限时直链 =====
+function signedLink(path,base){
+  base=base||cur;
+  var full=path||'';
+  if(full.indexOf('/')!==0)full=base+full;
+  var ttl=prompt((lang==='zh'?'有效期（分钟，1–43200）：':'TTL (minutes):'),'60');
+  if(ttl===null)return;
+  var bind=(prompt((lang==='zh'?'绑定当前 IP？输入 1 绑定，其它为不绑定：':'Bind to my IP? 1=yes:'),'')||'')==='1';
+  api('/api/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:full,ttl:(parseInt(ttl,10)||60)*60,bindIp:bind})}).then(function(r){
+    if(r&&r.url){
+      var u=location.origin+r.url;
+      try{navigator.clipboard.writeText(u)}catch(e){}
+      prompt((lang==='zh'?'限时直链（已复制）：':'Signed link (copied):'),u);
+    }else alert((r&&r.error)||'failed');
+  });
+}
+
+// ===== 运维与配置（站点配置 / 目录规则 / 定时任务）=====
+document.getElementById('btnOps').onclick=function(){showOps('config')};
+document.getElementById('btnImport').onclick=function(){importWebdav()};
+document.getElementById('btnSimilar').onclick=function(){showSimilar()};
+document.getElementById('btnImgTools').onclick=function(){showImgTools()};
+document.getElementById('btnQuery').onclick=function(){queryScope=cur;showQuery()};
+document.getElementById('btnFavGroups').onclick=function(){showFavGroups()};
+document.getElementById('btnMeta').onclick=function(){showMetaIO()};
+function opsModal(){
+  var m=document.getElementById('opsModal');
+  if(!m){
+    m=document.createElement('div');
+    m.id='opsModal';m.className='modal-bg';
+    m.innerHTML='<div class="modal" style="min-width:440px;max-width:760px"><button class="mclose" id="opsClose">✕</button><h3>🛠 '+(lang==='zh'?'运维与配置':'Ops &amp; Config')+'</h3><div class="filter-bar" style="border:0;padding:0 0 10px"><button class="fchip" data-opst="config">'+(lang==='zh'?'站点配置':'Config')+'</button><button class="fchip" data-opst="rules">'+(lang==='zh'?'目录规则':'Dir rules')+'</button><button class="fchip" data-opst="cron">'+(lang==='zh'?'定时任务':'Cron')+'</button></div><div id="opsContent"></div></div>';
+    document.body.appendChild(m);
+    document.getElementById('opsClose').onclick=function(){m.classList.remove('show')};
+    m.onclick=function(e){if(e.target===m)m.classList.remove('show')};
+  }
+  return m;
+}
+function showOps(tab){
+  var m=opsModal();
+  var box=document.getElementById('opsContent');
+  m.classList.add('show');
+  m.querySelectorAll('[data-opst]').forEach(function(b){b.classList.toggle('active',b.getAttribute('data-opst')===tab);b.onclick=function(){showOps(b.getAttribute('data-opst'))}});
+  box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">Loading...</p>';
+  if(tab==='config')opsConfig(box);
+  else if(tab==='rules')opsRules(box);
+  else opsCron(box);
+}
+function opsConfig(box){
+  api('/api/config').then(function(d){
+    var eff=d.effective||{},src=d.sources||{};
+    var groups=[
+      [ '站点',[['title','标题','text'],['logo','Logo','text'],['notice','公告（显示在顶部）','text']] ],
+      [ '配额与上传',[['quotaGB','总配额 (GB)','number'],['maxUploadMB','单文件上限 (MB)','number'],['maxDirItems','单目录条目上限','number'],['kvValueMB','目录元数据 KV 上限 (MB)','number']] ],
+      [ '版本与回收站',[['versionMaxMB','保留历史版本的文件上限 (MB)','number'],['versionsMax','每个文件保留版本数','number'],['versionsTtlDays','版本索引 TTL (天)','number'],['hashTtlDays','秒传索引 TTL (天)','number'],['trashDays','回收站保留 (天)','number'],['chunkGcHours','分片回收 (小时)','number']] ],
+      [ '备份',[['backupIncremental','增量快照','bool'],['backupKeep','保留份数','number'],['backupMaxMB','单份快照元数据上限 (MB)','number'],['backupTotalMB','快照总占用上限 (MB)','number']] ],
+      [ '防爆与性能',[['telemetryMaxPerDay','每日遥测写预算','number'],['telemetryFlushMs','遥测合并窗口 (ms)','number'],['sessionCacheSec','会话缓存 (秒)','number'],['kvBudgetPerMin','KV 每分钟写预算','number'],['rlReadPerMin','读限流 (次/分)','number'],['rlWritePerMin','写限流 (次/分)','number']] ],
+      [ '安全与风控',[['disableUrlFetch','禁用远程 URL 抓取','bool'],['ipAllow','IP 白名单','text'],['ipDeny','IP 黑名单','text'],['countryAllow','地区白名单','text'],['countryDeny','地区黑名单','text'],['uaAllow','UA 白名单','text'],['uaDeny','UA 黑名单','text'],['signTtlMin','直链默认有效期 (分)','number']] ],
+      [ '公开上传 / 分享',[['publicUploadDir','公开上传目录','text'],['publicUploadMaxMB','公开上传单文件上限 (MB)','number'],['shareZipMaxMB','分享打包上限 (MB)','number']] ]
+    ];
+    var h='<div style="font-size:12px;color:var(--sys-text-3);margin-bottom:10px">'+(lang==='zh'?'这里保存的配置写入 KV，优先级高于环境变量；留空表示使用环境变量/默认值。':'KV overrides > env vars > defaults.')+'</div>';
+    groups.forEach(function(g){
+      h+='<div style="margin:10px 0 6px;font-size:13px;font-weight:600">'+g[0]+'</div>';
+      g[1].forEach(function(f){
+        var k=f[0],label=f[1],t=f[2];
+        var v=eff[k];
+        var badge=src[k]==='kv'?'<span style="color:var(--sys-blue)">KV</span>':(src[k]==='env'?'<span style="color:var(--sys-orange)">ENV</span>':'<span style="color:var(--sys-text-3)">默认</span>');
+        h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+label+' <span style="font-size:11px">'+badge+'</span></span>';
+        if(t==='bool')h+='<input type="checkbox" id="cfg_'+k+'" '+(v?'checked':'')+'>';
+        else h+='<input id="cfg_'+k+'" type="'+(t==='number'?'number':'text')+'" value="'+esc(v==null?'':String(v))+'" style="flex:1;padding:6px 10px">';
+        h+='</div>';
+      });
+    });
+    h+='<div id="cfgMsg" style="font-size:13px;min-height:18px;margin:8px 0"></div>';
+    h+='<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end"><button id="cfgReset" class="btn gray small">'+(lang==='zh'?'全部恢复默认':'Reset')+'</button><button id="cfgSave" class="btn small">'+(lang==='zh'?'保存':'Save')+'</button></div>';
+    box.innerHTML=h;
+    document.getElementById('cfgSave').onclick=function(){
+      var patch={};
+      groups.forEach(function(g){g[1].forEach(function(f){
+        var el=document.getElementById('cfg_'+f[0]);if(!el)return;
+        if(f[2]==='bool')patch[f[0]]=el.checked;
+        else{var val=(el.value||'').trim();patch[f[0]]=val===''?null:(f[2]==='number'?Number(val):val)}
+      })});
+      var msg=document.getElementById('cfgMsg');
+      api('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({patch:patch})}).then(function(r){
+        if(r&&r.ok){msg.style.color='var(--sys-green)';msg.textContent=(lang==='zh'?'已保存并立即生效':'Saved');showOps('config')}
+        else{msg.style.color='var(--sys-red)';msg.textContent=(r&&r.error)||'failed'}
+      });
+    };
+    document.getElementById('cfgReset').onclick=function(){
+      if(!confirm(lang==='zh'?'清除所有 KV 配置覆盖？':'Clear all KV overrides?'))return;
+      api('/api/config/reset',{method:'POST'}).then(function(){showOps('config')});
+    };
+  }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">Error</p>'});
+}
+function opsRules(box){
+  api('/api/dirrules').then(function(d){
+    var rules=d.rules||[];
+    var mine=null;
+    rules.forEach(function(r){if(normP(r.path)===cur)mine=r});
+    var h='<div style="font-size:12px;color:var(--sys-text-3);margin-bottom:8px">'+(lang==='zh'?'当前目录：':'Current folder: ')+esc(cur)+'</div>';
+    h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'文件数上限':'Max files')+'</span><input id="drItems" type="number" value="'+(mine&&mine.maxItems||'')+'" style="flex:1;padding:6px 10px"></div>';
+    h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'目录容量上限 (MB)':'Max MB')+'</span><input id="drBytes" type="number" value="'+(mine&&mine.maxBytes||'')+'" style="flex:1;padding:6px 10px"></div>';
+    h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'单文件上限 (MB)':'Max file MB')+'</span><input id="drFile" type="number" value="'+(mine&&mine.maxFileMB||'')+'" style="flex:1;padding:6px 10px"></div>';
+    h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'只允许扩展名（如 .jpg,.png）':'Allow ext')+'</span><input id="drAllow" value="'+esc(mine&&mine.extAllow||'')+'" style="flex:1;padding:6px 10px"></div>';
+    h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'拒绝扩展名':'Deny ext')+'</span><input id="drDeny" value="'+esc(mine&&mine.extDeny||'')+'" style="flex:1;padding:6px 10px"></div>';
+    h+='<div id="drMsg" style="font-size:13px;min-height:18px"></div>';
+    h+='<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end"><button id="drDel" class="btn gray small">'+(lang==='zh'?'删除本目录规则':'Delete rule')+'</button><button id="drSave" class="btn small">'+(lang==='zh'?'保存':'Save')+'</button></div>';
+    h+='<div style="margin:14px 0 6px;font-size:13px;font-weight:600">'+(lang==='zh'?'全部规则':'All rules')+' ('+rules.length+')</div>';
+    if(!rules.length)h+='<div class="dup-path">'+(lang==='zh'?'暂无规则':'No rules')+'</div>';
+    rules.forEach(function(r){
+      h+='<div class="token-row"><span class="token-name">'+esc(r.path)+'</span><span class="dup-path">'
+        +(r.maxItems?('≤'+r.maxItems+' files '):'')+(r.maxBytes?('≤'+r.maxBytes+'MB '):'')+(r.maxFileMB?('file≤'+r.maxFileMB+'MB '):'')
+        +(r.extAllow?('allow:'+esc(r.extAllow)+' '):'')+(r.extDeny?('deny:'+esc(r.extDeny)):'')+'</span>'
+        +'<button class="btn tiny danger" data-drdel="'+esc(r.path)+'">✕</button></div>';
+    });
+    box.innerHTML=h;
+    function post(extra){
+      var body=Object.assign({path:cur,delete:extra&&extra.del?cur:undefined},{
+        maxItems:parseInt(document.getElementById('drItems').value,10)||0,
+        maxBytes:parseInt(document.getElementById('drBytes').value,10)||0,
+        maxFileMB:parseInt(document.getElementById('drFile').value,10)||0,
+        extAllow:document.getElementById('drAllow').value,
+        extDeny:document.getElementById('drDeny').value
+      });
+      api('/api/dirrules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){
+        if(r&&r.ok)showOps('rules');else{var m=document.getElementById('drMsg');if(m){m.style.color='var(--sys-red)';m.textContent=(r&&r.error)||'failed'}}
+      });
+    }
+    document.getElementById('drSave').onclick=function(){post()};
+    document.getElementById('drDel').onclick=function(){post({del:true})};
+    box.querySelectorAll('[data-drdel]').forEach(function(b){b.onclick=function(){
+      api('/api/dirrules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({delete:b.getAttribute('data-drdel')})}).then(function(){showOps('rules')});
+    }});
+  }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">Error</p>'});
+}
+function opsCron(box){
+  api('/api/cron').then(function(d){
+    var jobs=d.jobs||[];
+    var K={ 'ttl-dir':(lang==='zh'?'过期清理':'TTL clean'), 'clean-dir':(lang==='zh'?'清空目录':'Empty dir'), 'archive':(lang==='zh'?'自动归档':'Archive') };
+    var h='<div style="font-size:12px;color:var(--sys-text-3);margin-bottom:8px">'+(lang==='zh'?'定时任务在 cron 触发时执行，也可手动运行；单次最多处理 500 个条目。':'Runs on cron; max 500 entries per run.')+'</div>';
+    if(!jobs.length)h+='<div class="dup-path" style="margin-bottom:8px">'+(lang==='zh'?'暂无任务':'No jobs')+'</div>';
+    jobs.forEach(function(j){
+      h+='<div class="token-row"><div style="flex:1;min-width:0"><div style="font-size:13.5px">'+esc(K[j.kind]||j.kind)+' · '+esc(j.path)+'</div><div class="dup-path">'+(lang==='zh'?'days ':'days ')+j.days+(j.toTrash?' → '+(lang==='zh'?'回收站':'trash'):' → '+(lang==='zh'?'彻底删除':'purge'))+' · '+esc(j.lastResult||(lang==='zh'?'未运行':'never'))+'</div></div>'
+        +'<button class="btn gray tiny" data-crun="'+esc(j.id)+'">▶</button><button class="btn tiny danger" data-cdel="'+esc(j.id)+'">✕</button></div>';
+    });
+    h+='<div style="margin:14px 0 6px;font-size:13px;font-weight:600">'+(lang==='zh'?'新建任务':'New job')+'</div>';
+    h+='<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">'
+      +'<select id="cjKind" style="padding:6px 8px"><option value="ttl-dir">'+K['ttl-dir']+'</option><option value="archive">'+K['archive']+'</option><option value="clean-dir">'+K['clean-dir']+'</option></select>'
+      +'<input id="cjPath" value="'+esc(cur)+'" style="flex:1;min-width:140px;padding:6px 10px">'
+      +'<input id="cjDays" type="number" value="30" style="width:80px;padding:6px 10px" title="days">'
+      +'<label style="display:flex;gap:4px;align-items:center;font-size:12.5px"><input type="checkbox" id="cjTrash" checked>'+(lang==='zh'?'进回收站':'to trash')+'</label>'
+      +'<button id="cjAdd" class="btn small">'+(lang==='zh'?'添加':'Add')+'</button></div>';
+    h+='<div id="cjMsg" style="font-size:13px;min-height:18px;margin-top:6px"></div>';
+    box.innerHTML=h;
+    document.getElementById('cjAdd').onclick=function(){
+      var dv=parseInt(document.getElementById('cjDays').value,10);
+      var body={kind:document.getElementById('cjKind').value,path:document.getElementById('cjPath').value,days:isNaN(dv)?30:Math.max(0,dv),toTrash:document.getElementById('cjTrash').checked};
+      api('/api/cron',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){
+        if(r&&r.ok)showOps('cron');else{var m=document.getElementById('cjMsg');if(m){m.style.color='var(--sys-red)';m.textContent=(r&&r.error)||'failed'}}
+      });
+    };
+    box.querySelectorAll('[data-crun]').forEach(function(b){b.onclick=function(){
+      b.textContent='…';
+      api('/api/cron',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:b.getAttribute('data-crun')})}).then(function(r){
+        if(r&&r.result)alert(JSON.stringify(r.result));showOps('cron');
+      });
+    }});
+    box.querySelectorAll('[data-cdel]').forEach(function(b){b.onclick=function(){
+      api('/api/cron',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({delete:b.getAttribute('data-cdel')})}).then(function(){showOps('cron')});
+    }});
+  }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">Error</p>'});
+}
+// ===== 从 WebDAV 导入 =====
+function importWebdav(){
+  var url=prompt((lang==='zh'?'远程 WebDAV 地址（目录）:':'WebDAV folder URL:'),'https://example.com/dav/folder/');
+  if(!url)return;
+  var user=prompt((lang==='zh'?'用户名（可留空）:':'Username (optional):'),'')||'';
+  var pass=user?(prompt((lang==='zh'?'密码:':'Password:'),'')||''):'';
+  var maxFiles=parseInt(prompt((lang==='zh'?'本次最多导入文件数（≤200）:':'Max files (≤200):'),'100')||'100',10)||100;
+  var div=makeUpItem((lang==='zh'?'WebDAV 导入':'WebDAV import'));
+  div.querySelector('.upst').textContent='...';
+  api('/api/import-webdav',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url,user:user,pass:pass,path:cur,maxFiles:maxFiles})}).then(function(r){
+    if(r&&r.ok){
+      div.querySelector('.upfill').style.width='100%';
+      div.querySelector('.upst').textContent=(lang==='zh'?'完成 ':'done ')+r.imported;
+      div.querySelector('.upst').style.color='var(--sys-green)';
+      setTimeout(function(){if(div.parentNode)div.parentNode.removeChild(div)},2000);
+      alert((lang==='zh'?'导入完成：':'Imported: ')+r.imported+' · '+(lang==='zh'?'跳过 ':'skipped ')+r.skipped+' · '+(lang==='zh'?'失败 ':'failed ')+r.failed+' · '+fmt(r.bytes));
+      load();
+    }else{
+      div.querySelector('.upst').textContent=(r&&r.error)||t('upFail');
+      div.querySelector('.upst').style.color='var(--sys-red)';
+    }
+  }).catch(function(){div.querySelector('.upst').textContent=t('upFail');div.querySelector('.upst').style.color='var(--sys-red)'});
+}
+
 // ===== 批量分享 / 批量移动 =====
 document.getElementById('batchShare').onclick=function(){
   var keys=Object.keys(selected);if(!keys.length)return;
   var days=prompt(t('days'),'7');if(!days)return;
   var mx=prompt(t('maxAcc'),'0');if(mx===null)return;
   var pw=prompt(t('sharePw'),'');if(pw===null)return;
-  api('/api/batch-share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:keys.map(function(k){return cur+k}),days:parseInt(days),max:parseInt(mx)||0,password:pw||''})}).then(function(r){
-    var items=r.items||[];
-    var txt=items.map(function(i){return location.origin+i.url}).join('\\n');
+  api('/api/batch-share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:keys,days:parseInt(days),max:parseInt(mx)||0,password:pw||''})}).then(function(r){
+    var items=(r&&r.items)||[];
+    // 锁定/失败的条目服务端只返回 {path,error}（没有 url），必须过滤，否则会复制出 "域名undefined"
+    var txt=items.filter(function(i){return i&&i.url}).map(function(i){return location.origin+i.url}).join('\\n');
+    var bad=items.filter(function(i){return i&&!i.url}).length;
     if(txt){try{navigator.clipboard.writeText(txt)}catch(e){}}
-    prompt((lang==='zh'?'已创建 ':'Created ')+(r.created||0)+'/'+keys.length,txt||'-');
+    prompt((lang==='zh'?'已创建 ':'Created ')+((r&&r.created)||0)+'/'+keys.length+(bad?((lang==='zh'?'（'+bad+' 项失败）':' ('+bad+' failed)')):''),txt||'-');
     render();
   });
 };
@@ -5850,7 +10962,7 @@ document.getElementById('batchMv').onclick=function(){
     box.innerHTML=h;document.getElementById('mvTitle').textContent=t('moveTo');document.getElementById('mvModal').classList.add('show');
     box.querySelectorAll('[data-bmp]').forEach(function(el){
       el.onclick=function(){
-        api('/api/batch-move',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:keys.map(function(k){return cur+k}),target:el.getAttribute('data-bmp')})}).then(function(){
+        api('/api/batch-move',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:keys,target:el.getAttribute('data-bmp')})}).then(function(){
           document.getElementById('mvModal').classList.remove('show');selected={};load();
         });
       };
@@ -5888,11 +11000,7 @@ function showAutoRule(){
     };
   }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">Error</p>'});
 }
-document.getElementById('btnClearPend').onclick=function(){
-  if(!confirm(lang==='zh'?'清除本机未完成的上传记录？':'Clear local upload records?'))return;
-  try{localStorage.removeItem('du_pending')}catch(e){}
-  alert(lang==='zh'?'已清除':'Cleared');
-};
+document.getElementById('btnClearPend').onclick=function(){showPending()};
 
 // ===== 登录设备 / 会话管理 =====
 document.getElementById('btnSessions').onclick=function(){showSessions()};
@@ -5941,13 +11049,16 @@ function loadBackups(){
   api('/api/backups').then(function(d){
     var arr=d.backups||[];
     var h='<div style="display:flex;gap:10px;align-items:center;margin-bottom:10px"><button id="bkNow" class="btn small">'+(lang==='zh'?'立即备份':'Backup now')+'</button><span id="bkMsg" style="font-size:12px;color:var(--sys-text-3)"></span></div>';
-    h+='<div style="font-size:12px;color:var(--sys-text-3);line-height:1.75;margin-bottom:10px">'+(lang==='zh'?'快照包含<b>目录树、标签、备注、分享链接、上传链接、文件夹密码、收藏、最近、用量</b>，保存在 R2 的 <code>.backup/</code> 下（不出现在文件列表），最多保留 14 份。开启 Cron 触发器后每日自动备份一次。<br><b style="color:var(--sys-orange)">注意：快照只含元数据，不含文件内容本身</b>（文件已在 R2 里，无需重复备份；若文件被彻底删除，恢复后只能找回目录记录，文件本体无法找回）。':'Snapshots contain metadata only (tree, tags, notes, shares, links, folder passwords, favs, recents, usage) under R2 .backup/, keep 14. Daily auto-backup needs a Cron trigger. <b>File contents are not duplicated.</b>')+'</div>';
+    h+='<div style="font-size:12px;color:var(--sys-text-3);line-height:1.75;margin-bottom:10px">'+(lang==='zh'?'快照包含<b>目录树、标签、备注、分享链接、上传链接、文件夹密码、收藏、最近、用量</b>，保存在 R2 的 <code>.backup/</code> 下（不出现在文件列表），保留份数与总占用均可在运维面板调整。增量快照只记录发生变化的目录，恢复时会自动沿快照链合并。<br><b style="color:var(--sys-orange)">注意：快照只含元数据，不含文件内容本身</b>。':'Metadata-only snapshots under R2 .backup/; incremental snapshots store only changed folders and are merged on restore.')+'</div>';
+    if(d.last)h+='<div class="dup-path" style="margin-bottom:8px">'+(lang==='zh'?'最近一份：':'Latest: ')+esc(fmtWhen(Date.parse(d.last.created))||'')+' · '+(d.last.base?(lang==='zh'?'增量（链长 ':'incremental (chain ')+d.last.chain+')':(lang==='zh'?'全量':'full'))+' · '+(d.last.dirs||0)+(lang==='zh'?' 个目录':' dirs')+'</div>';
     if(!arr.length){h+='<p style="text-align:center;color:var(--sys-text-3);padding:16px">'+(lang==='zh'?'还没有快照，点「立即备份」创建第一份':'No snapshots yet')+'</p>'}
     else{
       h+='<div style="max-height:260px;overflow:auto">';
       arr.forEach(function(b){
         var nm=String(b.key).replace('.backup/','');
-        h+='<div class="token-row"><div style="flex:1;min-width:0"><div style="font-size:13px;font-family:ui-monospace,Menlo,monospace">'+esc(nm)+'</div><div class="dup-path">'+fmt(b.size||0)+(b.uploaded?(' · '+esc(fmtWhen(Date.parse(b.uploaded)))):'')+'</div></div>';
+        var isLast=d.last&&d.last.key===b.key;
+        h+='<div class="token-row"><div style="flex:1;min-width:0"><div style="font-size:13px;font-family:ui-monospace,Menlo,monospace">'+esc(nm)+(isLast?' <span style="color:var(--sys-blue);font-size:11px">'+(lang==='zh'?'最新':'latest')+'</span>':'')+'</div><div class="dup-path">'+fmt(b.size||0)+(b.uploaded?(' · '+esc(fmtWhen(Date.parse(b.uploaded)))):'')+(isLast&&d.last.base?(' · '+(lang==='zh'?'增量':'incr')):'')+'</div></div>';
+        h+='<button class="btn gray tiny" data-bkdf="'+esc(b.key)+'">'+(lang==='zh'?'差异':'Diff')+'</button>';
         h+='<button class="btn gray tiny" data-bkdl="'+esc(b.key)+'">'+(lang==='zh'?'下载':'Download')+'</button>';
         h+='<button class="btn gray tiny" data-bkrs="'+esc(b.key)+'">'+(lang==='zh'?'恢复':'Restore')+'</button></div>';
       });
@@ -5964,6 +11075,15 @@ function loadBackups(){
     };
     box.querySelectorAll('[data-bkdl]').forEach(function(b){b.onclick=function(){window.open('/api/backup-download?key='+encodeURIComponent(b.getAttribute('data-bkdl'))+'&token='+tk,'_blank')}});
     box.querySelectorAll('[data-bkrs]').forEach(function(b){b.onclick=function(){askRestore(b.getAttribute('data-bkrs'))}});
+    box.querySelectorAll('[data-bkdf]').forEach(function(b){b.onclick=function(){
+      var key=b.getAttribute('data-bkdf');b.textContent='…';
+      api('/api/backup-diff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key})}).then(function(r){
+        b.textContent=(lang==='zh'?'差异':'Diff');
+        if(r&&r.addedTotal!==undefined){
+          alert((lang==='zh'?'相对当前状态：\\n新增目录 ':'vs now:\\nadded ')+r.addedTotal+'\\n'+(lang==='zh'?'删除目录 ':'removed ')+r.removedTotal+'\\n'+(lang==='zh'?'内容变化 ':'changed ')+r.changedTotal+'\\n'+(lang==='zh'?'快照目录 ':'snapshot dirs ')+r.snapshotDirs+' · '+(lang==='zh'?'链长 ':'chain ')+r.chain);
+        }else alert((r&&r.error)||'failed');
+      }).catch(function(){b.textContent=(lang==='zh'?'差异':'Diff');alert('failed')});
+    }});
   }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:14px">'+(lang==='zh'?'加载失败':'Failed')+'</p>'});
 }
 function askRestore(key){
@@ -5998,6 +11118,31 @@ function showHealth(){
       h+='<span class="tr-meta">'+c.ms+'ms</span></div>';
     });
     h+='<div style="margin-top:12px;text-align:right"><button id="hlAgain" class="btn small">'+(lang==='zh'?'重新检查':'Re-check')+'</button></div>';
+    // KV / R2 防爆面板：读写预算、内部占用与上限一览
+    var g=d.guard;
+    if(g){
+      var kv=g.kv||{},lm=g.limits||{},r2=g.r2||{},inr=r2.internal||{};
+      h+='<div style="margin:16px 0 6px;font-size:13px;font-weight:600">'+(lang==='zh'?'KV / R2 防爆状态':'KV / R2 guard')+'</div>';
+      h+='<div class="dup-path" style="line-height:1.8">'
+        +(lang==='zh'?'KV 写（近 1 分钟）':'KV writes/min')+' '+kv.writesLastMin+' / '+kv.budgetPerMin
+        +' · '+(lang==='zh'?'缓存项':'cache')+' '+kv.cacheEntries
+        +' · '+(lang==='zh'?'缓冲条目':'buffered')+' '+kv.telemetryBuffered+'</div>';
+      h+='<div class="dup-path" style="line-height:1.8">'
+        +(lang==='zh'?'R2 采样':'R2 sampled')+' '+fmt(r2.bytes||0)+' / '+(r2.objects||0)+(lang==='zh'?' 对象':' obj')+(r2.capped?(lang==='zh'?'（已截断）':' (capped)'):'')
+        +' · '+(lang==='zh'?'用量计数':'tracked')+' '+fmt((g.usage||{}).tracked||0)+'</div>';
+      h+='<div class="dup-path" style="line-height:1.8">'
+        +(lang==='zh'?'内部分布：分片':'internal: chunks')+' '+fmt(inr.chunks||0)
+        +' · '+(lang==='zh'?'缩略图':'thumbs')+' '+fmt(inr.thumbs||0)
+        +' · '+(lang==='zh'?'版本':'versions')+' '+fmt(inr.versions||0)
+        +' · '+(lang==='zh'?'回收站':'trash')+' '+fmt(inr.trash||0)
+        +' · '+(lang==='zh'?'备份':'backup')+' '+fmt(inr.backup||0)+'</div>';
+      h+='<div class="dup-path" style="line-height:1.8">'
+        +(lang==='zh'?'单目录上限':'max items/dir')+' '+lm.maxDirItems
+        +' · KV '+(lang==='zh'?'单值上限':'value max')+' '+lm.kvValueMaxMB+'MB'
+        +' · '+(lang==='zh'?'版本上限':'version max')+' '+lm.versionMaxMB+'MB'
+        +' · '+(lang==='zh'?'回收站保留':'trash days')+' '+lm.trashDays
+        +' · '+(lang==='zh'?'分片回收':'chunk GC')+' '+lm.chunkGcHours+'h</div>';
+    }
     box.innerHTML=h;
     document.getElementById('hlAgain').onclick=showHealth;
   }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">'+(lang==='zh'?'检查失败':'Failed')+'</p>'});
@@ -6052,7 +11197,8 @@ function showWebhook(){
     var EV=[['up','上传','Upload'],['del','删除','Delete'],['shr','分享','Share'],['mov','移动','Move'],['res','恢复','Restore']];
     var h='<label style="display:flex;align-items:center;gap:8px;font-size:14px;margin-bottom:12px"><input type="checkbox" id="whOn" '+(w.enabled?'checked':'')+' style="width:16px;height:16px;accent-color:var(--sys-blue)">'+(lang==='zh'?'开启通知':'Enable')+'</label>';
     h+='<input id="whUrl" placeholder="https://... (接受 JSON POST)" value="'+esc(w.url||'')+'" style="width:100%;padding:9px 12px;margin-bottom:8px">';
-    h+='<input id="whSecret" type="password" placeholder="'+(lang==='zh'?'签名密钥（可选，会带 X-Signature 头）':'Secret (optional)')+'" value="" style="width:100%;padding:9px 12px;margin-bottom:10px">';
+    h+='<input id="whSecret" type="password" placeholder="'+(w.hasSecret?(lang==='zh'?'已配置签名密钥（留空表示不修改）':'Secret configured (leave blank to keep)'):(lang==='zh'?'签名密钥（可选，会带 X-Signature 头）':'Secret (optional)'))+'" value="" style="width:100%;padding:9px 12px;margin-bottom:8px">';
+    if(w.hasSecret)h+='<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sys-text-3);margin-bottom:8px"><input type="checkbox" id="whClearSecret" style="width:14px;height:14px;accent-color:var(--sys-red)">'+(lang==='zh'?'清除已保存的密钥':'Clear saved secret')+'</label>';
     h+='<div style="font-size:12px;color:var(--sys-text-3);margin-bottom:6px">'+(lang==='zh'?'触发事件：':'Events: ')+'</div><div style="display:flex;gap:10px;flex-wrap:wrap">';
     EV.forEach(function(e){
       var on=(w.events||[]).indexOf(e[0])>=0;
@@ -6063,7 +11209,9 @@ function showWebhook(){
     box.innerHTML=h;
     function collect(){
       var evs=[];box.querySelectorAll('[data-ev]').forEach(function(c){if(c.checked)evs.push(c.getAttribute('data-ev'))});
-      return {enabled:document.getElementById('whOn').checked,url:document.getElementById('whUrl').value.trim(),secret:document.getElementById('whSecret').value,events:evs};
+      var clr=document.getElementById('whClearSecret');
+      var sec=document.getElementById('whSecret').value;
+      return {enabled:document.getElementById('whOn').checked,url:document.getElementById('whUrl').value.trim(),secret:(clr&&clr.checked)?null:sec,events:evs};
     }
     var m=document.getElementById('whMsg');
     document.getElementById('whSave').onclick=function(){
@@ -6095,7 +11243,9 @@ function showApi(){
     var toks=d.tokens||[];
     var h='<div style="font-size:12px;color:var(--sys-text-3);line-height:1.8;margin-bottom:10px">'+(lang==='zh'?'用下方令牌即可在脚本/手机上调用接口（令牌放在 <code>Authorization: Bearer</code> 里，也可用 <code>?token=</code>）。只读令牌只能读。':'Use a token below in scripts/phones via Authorization: Bearer.')+'</div>';
     h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px"><button id="apiNew" class="btn small">'+(lang==='zh'?'生成读写令牌':'New RW token')+'</button><span id="apiMsg" style="font-size:12px;color:var(--sys-text-3)"></span></div>';
-    var cur=toks.length?toks[0].id:'YOUR_TOKEN';
+    // 列表里的 id 是掩码（前 6 位 + ****），不能直接当令牌用，示例统一用占位符
+    var cur='<TOKEN>';
+    h+='<div style="font-size:12px;color:var(--sys-orange);margin-bottom:8px">'+(lang==='zh'?'注意：下方示例中的 &lt;TOKEN&gt; 请替换为创建时保存的真实令牌（列表里只显示前 6 位）。':'Replace &lt;TOKEN&gt; with the real token shown once at creation time.')+'</div>';
     function code(t){return '<pre class="hl-pre" style="max-height:none;margin:0 0 10px">'+esc(t)+'</pre>'}
     h+='<div style="font-size:12px;color:var(--sys-text-3);margin-bottom:4px">'+(lang==='zh'?'上传文件':'Upload')+'</div>';
     h+=code('curl -H "Authorization: Bearer '+cur+'" -F "file=@本地文件.zip" "'+host+'/api/upload?path=/"');
@@ -6149,7 +11299,13 @@ function showAlbums(){
   }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">'+(lang==='zh'?'加载失败':'Failed')+'</p>'});
 }
 
-if(tk){api('/api/list?path=/').then(function(){show('main');load()}).catch(function(){show('login')})}else show('login');
+if(tk){api('/api/list?path=/').then(function(){show('main');goHome();loadUsage()}).catch(function(){show('login')})}else show('login');
+// 启动时恢复：未完成上传记录、上传队列栏、剪贴板栏
+try{pendPrune()}catch(e){}
+try{renderQueueBar()}catch(e){}
+try{renderClipBar()}catch(e){}
+var pendTip=pendList().length;
+if(pendTip){setTimeout(function(){if(confirm(t('resumeTitle')+'\\n\\n'+(lang==='zh'?'查看并管理？':'Manage now?')))showPending()},600)}
 </script></body></html>`;
 }
 
@@ -6165,12 +11321,24 @@ async function handleWebDAV(req, env) {
     const np = davPathNorm(davPath);
 
     const auth = req.headers.get('Authorization') || '';
-    if (!auth.startsWith('Bearer ')) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } });
-    const tok = auth.substring(7).trim();
+    // 同时支持 Bearer（脚本/API）与 Basic（操作系统 WebDAV 客户端：用户名任意，密码填令牌）
+    let tok = '';
+    if (auth.startsWith('Bearer ')) tok = auth.substring(7).trim();
+    else if (auth.startsWith('Basic ')) {
+      try {
+        const dec = atob(auth.substring(6).trim());
+        const i = dec.indexOf(':');
+        const u = i < 0 ? dec : dec.substring(0, i);
+        const p = i < 0 ? '' : dec.substring(i + 1);
+        tok = p || u;
+      } catch (e) { tok = ''; }
+    }
+    const challenge = { 'WWW-Authenticate': 'Basic realm="WebDAV", Bearer' };
+    if (!tok) return new Response('Unauthorized', { status: 401, headers: challenge });
     const tokens = await getAccessTokens(env);
     const found = tokens.find(t => safeEqual(t.token, tok));
-    if (!found) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } });
-    if (found.exp && Date.now() > new Date(found.exp).getTime()) return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer' } });
+    if (!found) return new Response('Unauthorized', { status: 401, headers: challenge });
+    if (found.exp && Date.now() > new Date(found.exp).getTime()) return new Response('Unauthorized', { status: 401, headers: challenge });
 
     const WRITE_METHODS = ['PUT', 'DELETE', 'MKCOL', 'MOVE', 'COPY', 'PROPPATCH', 'LOCK', 'UNLOCK'];
     if (WRITE_METHODS.indexOf(method) >= 0 && found.perm !== 'rw') return new Response('Forbidden (read-only token)', { status: 403 });
@@ -6186,8 +11354,9 @@ async function handleWebDAV(req, env) {
 
     if (method === 'PROPFIND') {
       const isDir = np.endsWith('/');
+      const depth = String(req.headers.get('Depth') || '1').toLowerCase();
       if (isDir) {
-        const items = await getDir(env, np);
+        const items = depth === '0' ? [] : await getDir(env, np);
         let xml = '<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">';
         xml += '<D:response><D:href>' + xmlEsc(np) + '</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>' + xmlEsc(np === '/' ? 'Root' : np.split('/').filter(Boolean).pop()) + '</D:displayname></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>';
         for (const item of items) {
@@ -6263,12 +11432,18 @@ async function handleWebDAV(req, env) {
       // Content-Length 缺失（chunked）：限 100MB 后落盘，仍做配额检查
       const buf = await req.arrayBuffer();
       if (buf.byteLength > 100 * 1024 * 1024) return new Response('File too large', { status: 413 });
-      const u2 = await getUsage(env);
-      if ((u2.used || 0) + buf.byteLength > quotaTotal(env)) return new Response('Quota exceeded', { status: 413 });
+      // 必须按实际写入的字节数算配额（此前的 delta 基于 Content-Length=0，覆盖上传会被少算）
+      const realDelta = oldItem ? (buf.byteLength - (oldItem.size || 0)) : buf.byteLength;
+      if (realDelta > 0) {
+        const u2 = await getUsage(env);
+        if ((u2.used || 0) + realDelta > quotaTotal(env)) return new Response('Quota exceeded', { status: 413 });
+      }
+      if (oldItem) await pushVersion(env, key, oldItem);
       await putAndMirror(env, key, buf, { httpMetadata: { contentType } });
+      if (oldItem && oldItem.hasThumb) await deleteThumb(env, key);
       const entry2 = { name: safeName, type: 'file', size: buf.byteLength, mime: contentType, time: new Date().toISOString() };
       await upsertDirItem(env, dirPath, entry2);
-      await addUsage(env, buf.byteLength, 1);
+      await addUsage(env, realDelta, oldItem ? 0 : 1);
       await addLog(env, 'up', np, buf.byteLength + ' bytes (WebDAV)');
       return new Response('', { status: 201 });
     }
@@ -6310,6 +11485,10 @@ async function handleWebDAV(req, env) {
         await deleteAndMirror(env, srcKey);
         await deleteThumb(env, srcKey);
         await deleteVersions(env, srcKey);
+      } else {
+        // COPY 会新增一份数据，必须计入用量（此前完全不记账，配额被绕过）
+        const deltaCopy = buf.byteLength - (existingDest.item ? (existingDest.item.size || 0) : 0);
+        await addUsage(env, (existingDest.item ? deltaCopy : buf.byteLength), existingDest.item ? 0 : 1);
       }
       return new Response(null, { status: existingDest.item ? 204 : 201 });
     }
@@ -6320,7 +11499,10 @@ async function handleWebDAV(req, env) {
       if (!fn) return new Response('Bad Request', { status: 400 });
       const existing = await findDirItem(env, dirPath, fn);
       if (!existing.item) return new Response('Not Found', { status: 404 });
-      await handleDelete(env, np.replace(/^\//, ''));
+      const delRes = await handleDelete(env, np.replace(/^\//, ''));
+      let delBody = {};
+      try { delBody = await delRes.clone().json(); } catch (e) {}
+      if (!delBody || !delBody.ok) return new Response((delBody && delBody.error) || 'Delete failed', { status: delRes.status || 500 });
       return new Response(null, { status: 204 });
     }
 
@@ -6345,17 +11527,31 @@ async function handleWebDAV(req, env) {
 
 // ===== Router =====
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
+    // 遥测（日志/下载明细/最近访问）走内存缓冲，请求结束时按时间窗口合并写入 KV
+    const res = await this.handle(req, env, ctx);
+    try {
+      const flush = flushTelemetry(env);
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(flush);
+      else await flush;
+    } catch (e) {}
+    return res;
+  },
+
+  async handle(req, env, ctx) {
     try {
       const url = new URL(req.url); const p = url.pathname;
+      // 站点配置：KV 覆盖（30 秒缓存），供后续同步取上限的函数使用
+      try { await loadConfig(env); } catch (e) {}
 
-      // IP 黑/白名单（可选环境变量，未配置则放行）
-      if (!ipAllowed(env, req.headers.get('CF-Connecting-IP') || '')) return json({ error: 'Forbidden' }, 403);
+      // IP / 地区 / User-Agent 风控（可选环境变量，未配置则放行）
+      const ra = requestAllowed(env, req);
+      if (!ra.ok) return json({ error: 'Forbidden', reason: ra.reason }, 403);
 
       if (p === '/api/login' && req.method === 'POST') return await handleLogin(req, env);
 
       // 公开路由（无需登录）
-      if (p === '/api/version') return json({ version: APP_VERSION });
+      if (p === '/api/version') return json({ version: APP_VERSION, totp: await totpEnabled(env) });
       if (p === '/manifest.webmanifest') return new Response(JSON.stringify(manifestJSON(env)), { headers: { 'Content-Type': 'application/manifest+json; charset=utf-8', 'Cache-Control': 'public, max-age=3600' } });
       if (p === '/icon.svg') return new Response(iconSvg(), { headers: { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'public, max-age=86400' } });
       if (p === '/sw.js') return new Response(swJS(), { headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' } });
@@ -6364,6 +11560,10 @@ export default {
         return html(publicUploadPage(env));
       }
       if (p === '/api/public-upload' && req.method === 'POST') return await handlePublicUpload(req, env);
+      // Web Share Target 兜底：Service Worker 未激活时，POST 会直接到这里
+      if (p === '/share-target' && req.method === 'POST') {
+        return new Response(null, { status: 303, headers: { Location: '/?shared=0' } });
+      }
 
       if (p.startsWith('/a/')) {
         const id = p.substring(3);
@@ -6375,7 +11575,7 @@ export default {
         const slash = rest.indexOf('/');
         const id = slash < 0 ? rest : rest.substring(0, slash);
         const sub = slash < 0 ? '' : rest.substring(slash + 1);
-        if (sub === 'list') return await handleAlbumList(env, id);
+        if (sub === 'list') return await handleAlbumList(env, req, id);
         if (sub === 'raw') return await handleAlbumRaw(env, req, id);
         return json({ error: 'Not found' }, 404);
       }
@@ -6383,17 +11583,39 @@ export default {
       if (p.startsWith('/s/')) {
         const rest = p.substring(3);
         const slash = rest.indexOf('/');
-        const token = slash < 0 ? rest : rest.substring(0, slash);
+        const name = slash < 0 ? rest : rest.substring(0, slash);
         const sub = slash < 0 ? '' : rest.substring(slash + 1);
-        if (!token) return html(errorPage('分享链接无效'));
+        if (!name) return html(errorPage('分享链接无效'));
+        // 支持自定义短链：/s/<别名> 解析成真实 token
+        const resolved = await resolveShareToken(env, name);
+        const token = resolved ? resolved.token : name;
         if (sub === 'data') return await handleShareData(env, token, req);
         if (sub === 'list') return await handleShareList(env, token, req);
         if (sub === 'dl') return await handleShareDownload(env, token, req);
         if (sub === 'pv') return await handleSharePreview(env, token, req);
-        let sd = null;
-        try { sd = await env.STORE.get('share:' + token, 'json'); } catch (e) {}
-        if (sd && sd.type === 'dir') return html(shareDirPage(token));
-        return html(sharePage(token));
+        if (sub === 'zip') {
+          const g = await shareGuard(env, token, req, false, true);
+          if (g.resp) return g.resp;
+          return await handleShareZip(env, req, token, g);
+        }
+        if (sub === 'comment' && req.method === 'POST') return await handleShareComment(env, token, req);
+        if (sub === 'comments' && req.method === 'GET') {
+          const g = await shareGuard(env, token, req, false, true);
+          if (g.resp) return g.resp;
+          const d = g.data;
+          let target;
+          if (d.type === 'dir') {
+            const base = normPath(d.path);
+            const full = normPath(base + (url.searchParams.get('p') || ''));
+            if (!full.startsWith(base)) return json({ error: 'Forbidden' }, 403);
+            target = full.replace(/\/+$/, '') || '/';
+          } else target = '/' + String(d.path || '').replace(/^\/+/, '');
+          return json({ comments: await getComments(env, target), allowComment: d.allowComment !== false });
+        }
+        const sd = resolved ? resolved.data : null;
+        if (!sd) return html(errorPage('分享链接无效或已过期'));
+        if (sd.type === 'dir') return html(shareDirPage(token, sd));
+        return html(sharePage(token, sd));
       }
 
       if (p.startsWith('/u/')) {
@@ -6407,7 +11629,15 @@ export default {
       if (p.startsWith('/dav')) return await handleWebDAV(req, env);
 
       if (p.startsWith('/api/')) {
-        const auth = await authInfo(env, req);
+        let auth = await authInfo(env, req);
+        // 防外链：下载/预览/缩略图允许用签名直链访问（?exp=&sig=&ip=），无需登录态
+        if (!auth.ok && (p === '/api/download' || p === '/api/preview' || p === '/api/thumb')) {
+          const sk = String(url.searchParams.get('path') || '').replace(/^\/+/, '');
+          if (sk) {
+            const v = await verifySignedUrl(env, req, sk);
+            if (v.ok) auth = { ok: true, perm: 'ro', kind: 'sig' };
+          }
+        }
         if (!auth.ok) return json({ error: 'Unauthorized' }, 401);
         // 按会话/令牌限流（防单令牌刷爆 KV 读写配额）：写方法走写桶，读方法走读桶
         const rlRes = await rateLimitCheck(env, extractToken(req), req.method !== 'GET' && req.method !== 'HEAD');
@@ -6421,8 +11651,8 @@ export default {
         const requireRw = (auth.perm === 'rw');
         const denyRo = () => json({ error: 'Read-only token' }, 403);
         try {
-          if (p === '/api/list') return await handleList(env, url.searchParams.get('path') || '/', url.searchParams.get('size') === '1', url.searchParams.get('token') || '');
-          if (p === '/api/unlock' && req.method === 'POST') { const b = await req.json(); return await handleUnlockDir(env, url.searchParams.get('token') || '', b.path, b.password); }
+          if (p === '/api/list') return await handleList(env, url.searchParams.get('path') || '/', url.searchParams.get('size') === '1', extractToken(req));
+          if (p === '/api/unlock' && req.method === 'POST') { const b = await req.json(); return await handleUnlockDir(env, extractToken(req), b.path, b.password); }
           if (p === '/api/upload' && req.method === 'POST') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handleUpload(req, env, url.searchParams.get('path') || '/'); }
           if (p === '/api/download') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handleDownload(env, req, url.searchParams.get('path') || ''); }
           if (p === '/api/preview') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handlePreview(env, req, url.searchParams.get('path') || ''); }
@@ -6431,11 +11661,32 @@ export default {
           if (p === '/api/delete' && req.method === 'DELETE') { const fp = url.searchParams.get('path') || ''; const np = '/' + String(fp).replace(/^\/+/, ''); const g = await guard(env, req, np, parentOf(np)); if (g) return g; return await handleDelete(env, fp); }
           if (p === '/api/batch-delete' && req.method === 'POST') { const b = await req.json(); const paths = Array.isArray(b.paths) ? b.paths.map(x => '/' + String(x || '').replace(/^\/+/, '')) : []; const g = await guard(env, req, ...paths, ...paths.map(x => parentOf(x))); if (g) return g; return await handleBatchDelete(env, b.paths); }
           if (p === '/api/batch-rename' && req.method === 'POST') { const b = await req.json(); const paths = Array.isArray(b.paths) ? b.paths.map(x => '/' + String(x || '').replace(/^\/+/, '')) : []; const g = await guard(env, req, ...paths, ...paths.map(x => parentOf(x))); if (g) return g; return await handleBatchRename(env, b.paths, b.pattern); }
-          if (p === '/api/batch-share' && req.method === 'POST') { const b = await req.json(); return await handleBatchShare(env, b.paths, b.days, b.max, b.password, url.searchParams.get('token') || ''); }
+          if (p === '/api/batch-share' && req.method === 'POST') { const b = await req.json(); return await handleBatchShare(env, b.paths, b.days, b.max, b.password, extractToken(req)); }
+          if (p === '/api/copy' && req.method === 'POST') {
+            const b = await req.json();
+            const paths = Array.isArray(b.paths) ? b.paths.map(x => '/' + String(x || '').replace(/^\/+/, '')) : [];
+            const parents = paths.map(x => parentOf(x));
+            const g = await guard(env, req, b.target, ...paths, ...parents);
+            if (g) return g;
+            return await handleCopy(env, b.paths, b.target, extractToken(req));
+          }
           if (p === '/api/batch-move' && req.method === 'POST') { const b = await req.json(); const paths = Array.isArray(b.paths) ? b.paths.map(x => '/' + String(x || '').replace(/^\/+/, '')) : []; const parents = paths.map(x => parentOf(x)); const g = await guard(env, req, b.target, ...paths, ...parents); if (g) return g; return await handleBatchMove(env, b.paths, b.target); }
           if (p === '/api/admin-pass' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleAdminPassGet(env); }
           if (p === '/api/admin-pass' && req.method === 'POST') { const b = await req.json(); return await handleAdminPassSet(env, b.current, b.next); }
-          if (p === '/api/sessions' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleListSessions(env, url.searchParams.get('token') || ''); }
+          // 二次验证（TOTP）
+          if (p === '/api/totp' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleTotpGet(env); }
+          if (p === '/api/totp/setup' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json().catch(() => ({})); return await handleTotpSetup(env, (b && b.label) || (env.DRIVE_TITLE || 'PersonalDrive')); }
+          if (p === '/api/totp/enable' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleTotpEnable(env, b.code); }
+          if (p === '/api/totp/disable' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleTotpDisable(env, b.password, b.code); }
+          if (p === '/api/totp/backup' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleTotpBackup(env, b.password, b.code); }
+          // 防外链：签发限时直链（可绑定请求 IP）
+          if (p === '/api/sign' && req.method === 'POST') {
+            const b = await req.json();
+            const g = await guard(env, req, b.path);
+            if (g) return g;
+            return await handleSign(env, req, b.path, b.ttl, !!b.bindIp);
+          }
+          if (p === '/api/sessions' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleListSessions(env, extractToken(req)); }
           if (p === '/api/session-revoke' && req.method === 'POST') { const b = await req.json(); return await handleRevokeSession(env, b.id, !!b.all); }
           if (p === '/api/duplicates') return await handleDuplicates(env);
           if (p === '/api/note' && req.method === 'GET') return await handleGetNote(env, url.searchParams.get('path') || '');
@@ -6444,7 +11695,7 @@ export default {
           if (p === '/api/tags' && req.method === 'GET') {
             const f = url.searchParams.get('filter');
             if (f === '__get__') return json({ tags: await getFileTags(env, '/' + String(url.searchParams.get('path') || '').replace(/^\/+/, '')) });
-            if (f) return await handleTagFilter(env, f);
+            if (f) return await handleTagFilter(env, f, url.searchParams.get('mode') || 'any', csvList(url.searchParams.get('more')));
             return await handleGetTags(env);
           }
           if (p === '/api/chunk-init' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.path || '/'); if (g) return g; return await handleChunkInit(env, b.fileName, b.totalSize, b.hash, b.path || '/', b.mime); }
@@ -6457,13 +11708,23 @@ export default {
           if (p === '/api/mkdir' && req.method === 'POST') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; const b = await req.json(); return await handleMkdir(env, url.searchParams.get('path') || '/', b.name); }
           if (p === '/api/rename' && req.method === 'PUT') { const b = await req.json(); const np = '/' + String(b.path || '').replace(/^\/+/, ''); const g = await guard(env, req, np, parentOf(np)); if (g) return g; return await handleRename(env, b.path, b.newName); }
           if (p === '/api/move' && req.method === 'PUT') { const b = await req.json(); const np = '/' + String(b.path || '').replace(/^\/+/, ''); const g = await guard(env, req, np, parentOf(np), b.target); if (g) return g; return await handleMove(env, b.path, b.target); }
-          if (p === '/api/search') return await handleSearch(env, url.searchParams.get('q') || '', url.searchParams.get('path') || '/', url.searchParams.get('token') || '');
-          if (p === '/api/tree') return await handleTree(env, url.searchParams.get('token') || '');
-          if (p === '/api/zip') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handleZip(env, url.searchParams.get('path') || '/', url.searchParams.get('token') || ''); }
+          if (p === '/api/search') return await handleSearch(env, url.searchParams.get('q') || '', url.searchParams.get('path') || '/', extractToken(req));
+          if (p === '/api/tree') return await handleTree(env, extractToken(req));
+          if (p === '/api/zip') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handleZip(env, url.searchParams.get('path') || '/', extractToken(req)); }
           if (p === '/api/unzip' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, parentOf(b.path)); if (g) return g; return await handleUnzip(env, b.path); }
           if (p === '/api/versions' && req.method === 'GET') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handleListVersions(env, url.searchParams.get('path') || ''); }
           if (p === '/api/versions/restore' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.path); if (g) return g; return await handleRestoreVersion(env, b.path, b.ts); }
-          if (p === '/api/share' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.path); if (g) return g; return await handleShare(env, b.path, b.days, b.max, b.password, b.dir); }
+          if (p === '/api/share' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.path); if (g) return g; return await handleShare(env, b.path, b.days, b.max, b.password, b.dir, b); }
+          if (p === '/api/share/update' && req.method === 'POST') { const b = await req.json(); return await handleShareUpdate(env, b.token, b); }
+          if (p === '/api/share-stats' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleShareStats(env, url.searchParams.get('token') || ''); }
+          if (p === '/api/comments' && (req.method === 'GET' || req.method === 'POST' || req.method === 'DELETE')) return await handleComments(env, req, url);
+          // 运维与配置
+          if (p === '/api/config' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleConfigGet(env); }
+          if (p === '/api/config' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleConfigSet(env, b); }
+          if (p === '/api/config/reset' && req.method === 'POST') { if (!requireRw) return denyRo(); return await handleConfigReset(env); }
+          if (p === '/api/dirrules' && (req.method === 'GET' || req.method === 'POST')) { if (!requireRw) return denyRo(); return await handleDirRules(env, req); }
+          if (p === '/api/cron' && (req.method === 'GET' || req.method === 'POST')) { if (!requireRw) return denyRo(); return await handleCron(env, req, url); }
+          if (p === '/api/import-webdav' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); const g = await guard(env, req, b.path || '/'); if (g) return g; return await handleImportWebdav(env, b); }
           if (p === '/api/zip-multi' && req.method === 'POST') { const b = await req.json(); const parents = Array.isArray(b.paths) ? b.paths.map(x => parentOf('/' + String(x || '').replace(/^\/+/, ''))) : []; const g = await guard(env, req, ...parents); if (g) return g; return await handleZipPaths(env, b.paths); }
           if (p === '/api/fetch-url' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.dir || '/'); if (g) return g; return await handleFetchUrl(req, env, b); }
           if (p === '/api/shares' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleListShares(env); }
@@ -6480,7 +11741,11 @@ export default {
           if (p === '/api/batch-purge' && req.method === 'POST') { const b = await req.json(); return await handleBatchPurge(env, b.ids); }
           if (p === '/api/usage') { const u = await getUsage(env); return json({ used: u.used, files: u.files, total: quotaTotal(env) }); }
           if (p === '/api/recalc-usage' && req.method === 'POST') { const u = await recalcUsage(env); return json({ ok: true, used: u.used, files: u.files }); }
-          if (p === '/api/log' && req.method === 'GET') { if (!requireRw) return denyRo(); return json({ logs: await getLogs(env) }); }
+          if (p === '/api/log' && req.method === 'GET') {
+            if (!requireRw) return denyRo();
+            return await handleLogs(env, { action: url.searchParams.get('action') || '', q: url.searchParams.get('q') || '', from: url.searchParams.get('from') || '', to: url.searchParams.get('to') || '', limit: url.searchParams.get('limit') || '' });
+          }
+          if (p === '/api/log.csv' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleLogsCsv(env); }
           if (p === '/api/dl-stats' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleDlStats(env); }
           if (p === '/api/clear-dl-stats' && req.method === 'POST') return await handleClearDlStats(env);
           if (p === '/api/public-upload-info') return json({ enabled: !!publicUploadDir(env), dir: publicUploadDir(env) || '', max: publicUploadMax(env), turnstile: !!turnstileSecret(env) });
@@ -6490,8 +11755,10 @@ export default {
           if (p === '/api/tokens' && req.method === 'POST') { const b = await req.json(); const tokens = await getAccessTokens(env); const nt = { name: b.name || 'Token', token: randToken(), perm: b.perm === 'rw' ? 'rw' : 'ro', exp: b.exp || null }; tokens.push(nt); await saveAccessTokens(env, tokens); return json({ ok: true, token: nt.token }); }
           if (p === '/api/tokens' && req.method === 'DELETE') { const b = await req.json(); const id = String(b.id || b.token || ''); const mask = id.replace(/\*+$/, ''); const tokens = (await getAccessTokens(env)).filter(t => t.token !== id && !(mask.length >= 6 && t.token.startsWith(mask))); await saveAccessTokens(env, tokens); return json({ ok: true }); }
           if (p === '/api/stats') { if (!requireRw) return denyRo(); return await handleStatsFull(env); }
+          if (p === '/api/dashboard') { if (!requireRw) return denyRo(); return await handleDashboard(env, extractToken(req)); }
           if (p === '/api/stats-trend') return await handleStatsTrend(env, url.searchParams.get('days') || '30');
           if (p === '/api/backup' && req.method === 'POST') return json(await createBackup(env, 'manual'));
+          if (p === '/api/backup-diff' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleBackupDiff(env, b.key); }
           if (p === '/api/backups' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleBackupList(env); }
           if (p === '/api/backup-download') { if (!requireRw) return denyRo(); const bk = url.searchParams.get('key') || ''; if (bk.indexOf(BACKUP_PREFIX) !== 0) return json({ error: 'Bad key' }, 400); return await serveObject(env, req, bk, { disposition: 'attachment; filename="' + encodeURIComponent(String(bk).split('/').pop()) + '"' }); }
           if (p === '/api/backup-restore' && req.method === 'POST') { const b = await req.json(); return await handleBackupRestore(env, b.key, b.password); }
@@ -6502,11 +11769,47 @@ export default {
           if (p === '/api/webhook' && req.method === 'POST') { const b = await req.json(); return await handleSetWebhook(env, b); }
           if (p === '/api/webhook-test' && req.method === 'POST') return await handleWebhookTest(env);
           if (p === '/api/albums' && req.method === 'GET') return await handleListAlbums(env);
-          if (p === '/api/albums' && req.method === 'POST') { const b = await req.json(); return await handleCreateAlbum(env, b.path, b.name); }
+          if (p === '/api/albums' && req.method === 'POST') { const b = await req.json(); return await handleCreateAlbum(env, b.path, b.name, b.password); }
+          if (p === '/api/albums/update' && req.method === 'POST') { const b = await req.json(); return await handleAlbumUpdate(env, b.id, b); }
+          if (p === '/api/media' && req.method === 'GET') return await handleMediaList(env, {
+            path: url.searchParams.get('path') || '/',
+            kind: url.searchParams.get('kind') || 'media',
+            limit: url.searchParams.get('limit') || ''
+          });
+          if (p === '/api/phash' && req.method === 'POST') { const b = await req.json(); return await handleSetPhash(env, b); }
+          // 检索与组织
+          if (p === '/api/query' && req.method === 'GET') return await handleQuery(env, {
+            path: url.searchParams.get('path') || '/',
+            q: url.searchParams.get('q') || '',
+            type: url.searchParams.get('type') || '',
+            ext: url.searchParams.get('ext') || '',
+            minSize: url.searchParams.get('minSize') || '',
+            maxSize: url.searchParams.get('maxSize') || '',
+            after: url.searchParams.get('after') || '',
+            before: url.searchParams.get('before') || '',
+            tags: url.searchParams.get('tags') || '',
+            tagMode: url.searchParams.get('tagMode') || '',
+            fav: url.searchParams.get('fav') || '',
+            deep: url.searchParams.get('deep') || '1',
+            sort: url.searchParams.get('sort') || 'name',
+            order: url.searchParams.get('order') || 'asc',
+            limit: url.searchParams.get('limit') || '',
+            offset: url.searchParams.get('offset') || ''
+          }, extractToken(req));
+          if (p === '/api/tags/rename' && req.method === 'POST') { const b = await req.json(); return await handleTagRename(env, b.from, b.to, b.color); }
+          if (p === '/api/tags/color' && req.method === 'POST') { const b = await req.json(); return await handleTagColor(env, b.name, b.color); }
+          if (p === '/api/tags/batch' && req.method === 'POST') { const b = await req.json(); return await handleTagBatch(env, b.paths, b.add, b.remove, b.mode); }
+          if (p === '/api/tags/auto' && req.method === 'POST') { const b = await req.json(); return await handleTagAuto(env, b); }
+          if (p === '/api/favgroups' && (req.method === 'GET' || req.method === 'POST')) { if (!requireRw) return denyRo(); return await handleFavGroups(env, req); }
+          if (p === '/api/export-meta' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleExportMeta(env, {
+            path: url.searchParams.get('path') || '/',
+            format: url.searchParams.get('format') || ''
+          }); }
+          if (p === '/api/import-meta' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleImportMeta(env, b); }
           if (p === '/api/albums' && req.method === 'DELETE') { const b = await req.json(); return await handleDeleteAlbum(env, b.id); }
-          if (p === '/api/recent' && req.method === 'GET') return json({ items: await getRecent(env) });
+          if (p === '/api/recent' && req.method === 'GET') return await handleGetRecent(env);
           if (p === '/api/recent' && req.method === 'POST') { const b = await req.json(); await addRecent(env, b.path); return json({ ok: true }); }
-          if (p === '/api/favs' && req.method === 'GET') { const favs = await getFavs(env); return json({ items: favs.map(path => ({ name: path.split('/').filter(Boolean).pop() || path, type: 'file', path: parentOf(path), size: 0, mime: '' })) }); }
+          if (p === '/api/favs' && req.method === 'GET') { return json({ items: await enrichPathItems(env, await getFavs(env)) }); }
           if (p === '/api/fav' && req.method === 'POST') { const b = await req.json(); await toggleFav(env, b.path); return json({ ok: true }); }
         } catch (e) { console.error(e); return json({ error: 'Internal error' }, 500); }
         return json({ error: 'Not found' }, 404);
@@ -6521,33 +11824,26 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
       try {
-        const trash = await getDir(env, '/.trash/');
-        const now = Date.now();
-        const keep = [];
-        let purged = 0, totalSize = 0;
-        for (const item of trash) {
-          const deletedTime = item.deletedAt ? new Date(item.deletedAt).getTime() : 0;
-          if (!Number.isFinite(deletedTime) || deletedTime <= 0) { keep.push(item); continue; }
-          if (now - deletedTime > 30 * 86400 * 1000) {
-            if (item.type === 'dir' && item.id) {
-              await recursiveDeleteDir(env, '/.trash/' + item.id + '/');  // 内部已扣减用量
-            } else {
-              const k = item.originalPath.replace(/^\//, '');
-              await deleteAndMirror(env, k);
-              await deleteThumb(env, k);
-              await deleteVersions(env, k);
-              totalSize += item.size || 0; purged++;
-            }
-          } else { keep.push(item); }
-        }
-        if (purged > 0) { await putDir(env, '/.trash/', keep); await addUsage(env, -totalSize, -purged); }
-        // 每日自动快照（当天已有则跳过）
+        // 1) 回收站过期清理（TRASH_DAYS，默认 30 天）
+        await gcTrash(env, 5000);
+        // 1.5) 用户自定义定时任务（TTL 目录 / 清空目录 / 自动归档）
+        try { await runAllCronJobs(env, 10); } catch (e) { console.error('cron jobs failed:', e); }
+        // 2) 未完成上传的分片回收（CHUNK_GC_HOURS，默认 24 小时）
+        const chunksGone = await gcChunks(env, 5000);
+        // 3) 版本/缩略图等内部对象的失效回收
+        const internalGone = await gcInternalObjects(env, 2000);
+        // 4) 用量校准（避免计数漂移导致配额形同虚设）
+        try { await recalcUsage(env); } catch (e) {}
+        // 5) 遥测缓冲落盘
+        try { await flushTelemetry(env); } catch (e) {}
+        // 6) 每日自动快照（当天已有则跳过）
         try {
           const listed = await env.DRIVE.list({ prefix: BACKUP_PREFIX, limit: 200 });
           const objs = listed.objects || [];
           const recent = objs.some(function (o) { return o.uploaded && (Date.now() - new Date(o.uploaded).getTime() < 20 * 3600 * 1000); });
           if (!recent) await createBackup(env, 'auto');
         } catch (e) { console.error('Backup failed:', e); }
+        console.log('scheduled: chunks=' + chunksGone + ' internal=' + internalGone);
       } catch (e) { console.error('Scheduled cleanup failed:', e); }
     })());
   }
