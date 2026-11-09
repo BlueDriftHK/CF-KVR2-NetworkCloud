@@ -60,7 +60,8 @@ const CHUNKS_PREFIX = '.chunks/';          // 以点开头，避免与用户目�
 const UNZIP_MAX_ENTRIES = 1000;            // 解压条目数上限
 const UNZIP_MAX_OUT_BYTES = 200 * 1024 * 1024; // 解压后总量上限
 const USAGE_DO_NAME = '__usage__';
-const DO_ITEMS_MAX = 96 * 1024;            // DO 单值上限 128KiB 的安全余量
+const DO_ITEMS_MAX = 96 * 1024;            // 字符数安全阈值（兼容旧逻辑）
+const DO_ITEMS_MAX_BYTES = 120 * 1024;     // DO 单值上限 128KiB 的字节安全余量
 
 // ===== Helpers =====
 function json(data, status) {
@@ -75,7 +76,10 @@ function html(body, status) {
     'CDN-Cache-Control': 'no-store',
     'Pragma': 'no-cache',
     'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'no-referrer'
+    'Referrer-Policy': 'no-referrer',
+    'X-Frame-Options': 'DENY',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self' https://challenges.cloudflare.com; worker-src 'self' blob: https://cdn.jsdelivr.net; frame-src https://challenges.cloudflare.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
   } });
 }
 // 每请求只解析一次 URL：handle / authInfo / extractToken 等多次用到 req.url，
@@ -100,6 +104,25 @@ function normPath(p) {
   }
   return '/' + resolved.join('/') + (resolved.length ? '/' : '');
 }
+// 文件路径规范化：解析 . / ..，但保留"目录带尾斜杠、文件不带"的语义（normPath 会强制加尾斜杠，不能用于文件路径）
+function normFilePath(p) {
+  const raw = String(p == null ? '' : p);
+  const isDir = raw.endsWith('/');
+  const resolved = [];
+  for (const seg of raw.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') { if (resolved.length) resolved.pop(); continue; }
+    resolved.push(seg);
+  }
+  if (!resolved.length) return '/';
+  return '/' + resolved.join('/') + (isDir ? '/' : '');
+}
+// 内部命名空间保护：任何以 "." 开头的路径段（.trash/.versions/.thumb/.backup/.chunks 等）都不允许普通文件 API 访问
+function isInternalPath(p) {
+  return String(p == null ? '' : p).split('/').filter(Boolean).some(function (seg) { return seg.charAt(0) === '.'; });
+}
+function internalDenied() { return json({ error: 'Not found' }, 404); }
+function utf8Bytes(s) { try { return new TextEncoder().encode(String(s)).length; } catch (e) { return String(s).length * 2; } }
 function sanitizeName(name) {
   if (!name) return 'untitled';
   return name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '').replace(/^\.+/, '').substring(0, 200) || 'untitled';
@@ -153,10 +176,28 @@ function quotaTotal(env) {
   return (Number.isFinite(n) && n > 0) ? n : 10 * 1024 * 1024 * 1024;
 }
 // 口令加盐（兼容历史无盐记录）
-async function hashPassword(pw, salt) { return sha256(salt + ':' + (pw || '')); }
+// 口令哈希：PBKDF2-SHA256（记录中保存 kdf/iter，便于以后提高强度）；兼容历史 SHA-256 记录
+const PBKDF2_ITER_DEFAULT = 20000;
+async function pbkdf2Hex(pw, salt, iter) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(String(pw || '')), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: enc.encode(String(salt || '')), iterations: iter || PBKDF2_ITER_DEFAULT, hash: 'SHA-256' }, key, 256);
+  return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function hashPassword(pw, salt, iter) { return pbkdf2Hex(pw, salt, iter); }
+async function makePasswordRecord(pw) {
+  const salt = randToken().substring(0, 16);
+  const iter = PBKDF2_ITER_DEFAULT;
+  return { hash: await hashPassword(pw, salt, iter), salt, iter, kdf: 'pbkdf2' };
+}
 async function verifyPassword(pw, rec) {
   if (!rec) return false;
-  if (rec.salt) return safeEqual(await hashPassword(pw, rec.salt), rec.hash);
+  if (rec.kdf === 'pbkdf2') {
+    if (!rec.salt) return false;
+    return safeEqual(await hashPassword(pw, rec.salt, rec.iter), rec.hash || '');
+  }
+  // 兼容历史无盐 / 单轮 SHA-256(盐:口令) 记录
+  if (rec.salt) return safeEqual(await sha256(rec.salt + ':' + (pw || '')), rec.hash || '');
   return safeEqual(await sha256(pw || ''), rec.hash || '');
 }
 // R2 对象搬运（复制 + 删除源），用于回收站
@@ -292,6 +333,21 @@ function validateConfig(patch) {
     const s = String(v);
     if (s.length > spec.max) { errs.push(k + ' too long (max ' + spec.max + ')'); continue; }
     out[k] = s;
+  }
+  // 危险配置钳制：防止误配导致误删/不可用（trashDays=0、chunkGcHours=0、backupKeep=1 等）
+  const clampSpecs = {
+    trashDays: [1, 3650], chunkGcHours: [1, 720], backupKeep: [2, 200],
+    backupTotalMB: [10, 1048576], maxDirItems: [100, 20000], kvValueMB: [1, 8],
+    versionMaxMB: [1, 1024], backupMaxMB: [1, 64]
+  };
+  for (const k of Object.keys(out)) {
+    const cs = clampSpecs[k];
+    if (cs && out[k] != null) out[k] = Math.min(Math.max(Number(out[k]), cs[0]), cs[1]);
+  }
+  if (typeof out.publicUploadDir === 'string') {
+    const d = normPath(out.publicUploadDir);
+    if (d === '/' || isInternalPath(d)) errs.push('publicUploadDir must not be root or internal path');
+    else out.publicUploadDir = d;
   }
   return { out, errs };
 }
@@ -485,8 +541,9 @@ function telMergeRecent(cur) {
 }
 
 // ===== Range / 流式响应 =====
+function mimeEssence(mime) { return String(mime || '').split(';')[0].trim().toLowerCase(); }
 function dangerType(mime) {
-  const m = String(mime || '').toLowerCase();
+  const m = mimeEssence(mime);
   if (!m) return false;
   if (/^(text\/html|application\/xhtml\+xml|image\/svg\+xml|text\/xml|application\/xml|application\/xhtml)$/.test(m)) return true;
   if (m.indexOf('+xml') >= 0) return true;
@@ -534,7 +591,7 @@ async function serveObject(env, req, key, opts) {
     try { obj = await env.DRIVE.get(key); } catch (e) { obj = null; }
     if (!obj) return json({ error: 'Not found' }, 404);
   }
-  let type = (obj.httpMetadata && obj.httpMetadata.contentType) || 'application/octet-stream';
+  let type = mimeEssence((obj.httpMetadata && obj.httpMetadata.contentType) || 'application/octet-stream');
   const headers = Object.assign({}, base);
   if (opts.sanitize && dangerType(type)) {
     type = 'text/plain; charset=utf-8';
@@ -822,6 +879,7 @@ export class DirStore {
     this.state = state;
     this.env = env;
     this.name = (state.id && state.id.name) ? state.id.name : '';
+    this._kvChain = Promise.resolve();   // 大目录 KV 退化路径的串行化队列
   }
 
   async fetch(req) {
@@ -842,7 +900,9 @@ export class DirStore {
     };
     // DO 单值上限 128KiB：过大时清空本地副本，让后续读走 KV，避免读到陈旧列表
     const saveItems = async (items) => {
-      if (JSON.stringify(items).length > DO_ITEMS_MAX) {
+      const json = JSON.stringify(items);
+      // DO storage 单值上限是 128KiB 字节；中文/emoji 文件名下按字符数判断会超限
+      if (json.length > DO_ITEMS_MAX || utf8Bytes(json) > DO_ITEMS_MAX_BYTES) {
         try { await this.state.storage.delete('items'); } catch (e) {}
         return false;
       }
@@ -850,6 +910,28 @@ export class DirStore {
       return true;
     };
 
+    // 超大目录无法进入 DO 本地缓存时，所有修改回到 KV，但由 DO 单线程串行执行，
+    // 避免多请求并发 read-modify-write 相互覆盖（此前由 Dir 层并发写 KV 会丢条目）
+    const loadKvItems = async () => {
+      try { return (await this.env.STORE.get('dir:' + this.name, 'json')) || []; } catch (e) { return []; }
+    };
+    const saveKvItems = async (items) => {
+      try {
+        const body = JSON.stringify(items);
+        if (utf8Bytes(body) > kvValueMax(this.env)) return false;
+        await this.env.STORE.put('dir:' + this.name, body);
+        // 权威副本在 KV 时，DO 本地缓存必须失效，否则下一次读会返回旧列表
+        try { await this.state.storage.delete('items'); } catch (e) {}
+        return true;
+      } catch (e) { return false; }
+    };
+    // 对 KV 的 read-modify-write 必须串行：await KV 期间 DO 会让其它请求插进来
+    const kvSerialized = (fn) => {
+      const prev = this._kvChain || Promise.resolve();
+      const run = prev.then(fn, fn);
+      this._kvChain = run.then(function () {}, function () {});
+      return run;
+    };
     if (op === 'get') {
       return json(await loadItems());
     }
@@ -884,6 +966,41 @@ export class DirStore {
       const items = await req.json();
       const ok = await saveItems(Array.isArray(items) ? items : []);
       return json({ ok: true, cached: ok, items: ok ? items : undefined });
+    }
+    if (op === 'upsertKv' && req.method === 'POST') {
+      const { item } = await req.json();
+      const out = await kvSerialized(async () => {
+        const items = await loadKvItems();
+        const idx = items.findIndex(i => i.name === item.name);
+        if (idx < 0 && items.length >= maxDirItems(this.env)) return { status: 507, body: { error: 'dir-full', limit: maxDirItems(this.env) } };
+        if (idx >= 0) items[idx] = item; else items.push(item);
+        if (!await saveKvItems(items)) return { status: 507, body: { error: 'dir-too-large' } };
+        return { status: 200, body: { ok: true, existed: idx >= 0, items } };
+      });
+      return json(out.body, out.status);
+    }
+    if (op === 'removeKv' && req.method === 'POST') {
+      const { name } = await req.json();
+      const out = await kvSerialized(async () => {
+        const items = await loadKvItems();
+        const filtered = items.filter(i => i.name !== name);
+        if (!await saveKvItems(filtered)) return { status: 507, body: { error: 'dir-too-large' } };
+        return { status: 200, body: { ok: true, removed: items.length - filtered.length } };
+      });
+      return json(out.body, out.status);
+    }
+    if (op === 'renameKv' && req.method === 'POST') {
+      const { oldName, newName } = await req.json();
+      const out = await kvSerialized(async () => {
+        const items = await loadKvItems();
+        const idx = items.findIndex(i => i.name === oldName);
+        if (idx < 0) return { status: 404, body: { error: 'not found' } };
+        if (items.find(i => i.name === newName)) return { status: 409, body: { error: 'exists' } };
+        items[idx] = Object.assign({}, items[idx], { name: newName, time: new Date().toISOString() });
+        if (!await saveKvItems(items)) return { status: 507, body: { error: 'dir-too-large' } };
+        return { status: 200, body: { ok: true, item: items[idx], items } };
+      });
+      return json(out.body, out.status);
     }
     if (op === 'find' && req.method === 'GET') {
       const name = url.searchParams.get('name');
@@ -986,6 +1103,7 @@ function usageStub(env) {
   return env.DIR.get(env.DIR.idFromName(USAGE_DO_NAME));
 }
 
+let DIR_READ_FAILS = 0;
 async function getDir(env, path) {
   const np = normPath(path);
   if (hasDO(env)) {
@@ -994,11 +1112,12 @@ async function getDir(env, path) {
       if (r && r.ok) return await r.json();
     } catch (e) { console.warn('DO getDir → KV:', e && e.message); }
   }
-  try { return await env.STORE.get('dir:' + np, 'json') || []; } catch (e) { return []; }
+  try { return await env.STORE.get('dir:' + np, 'json') || []; } catch (e) { DIR_READ_FAILS++; return []; }
 }
 
 async function putDir(env, path, items) {
   const np = normPath(path);
+  let doOk = false;
   if (hasDO(env)) {
     try {
       const r = await withTimeout(dirStub(env, np).fetch('https://dir/set', {
@@ -1006,12 +1125,13 @@ async function putDir(env, path, items) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(items)
       }), 3000);
+      doOk = !!(r && r.ok);
     } catch (e) { console.warn('DO putDir → KV:', e && e.message); }
   }
   const body = JSON.stringify(items || []);
-  if (body.length > kvValueMax(env)) { console.warn('dir metadata too large, KV write skipped:', np); return; }
-  if (!kvKeyOk('dir:' + np)) return;
-  try { await env.STORE.put('dir:' + np, body); } catch (e) {}
+  if (utf8Bytes(body) > kvValueMax(env)) { console.warn('dir metadata too large, KV write skipped:', np); return doOk; }
+  if (!kvKeyOk('dir:' + np)) return doOk;
+  try { await env.STORE.put('dir:' + np, body); return true; } catch (e) { return doOk; }
 }
 
 // DO 成功变更后，把最新目录镜像回 KV，避免 DO 故障时读到陈旧数据
@@ -1055,6 +1175,13 @@ async function upsertDirItem(env, path, item) {
         if (!out || out.cached !== false) { await mirrorItemsToKV(env, np, out && out.items); return out; }
       }
     } catch (e) { console.warn('DO upsert → KV:', e && e.message); }
+    try {
+      const r2 = await withTimeout(dirStub(env, np).fetch('https://dir/upsertKv', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ item })
+      }), 3000);
+      if (r2 && r2.status === 507) return { ok: false, error: 'Directory is full', limit: cap };
+      if (r2 && r2.ok) return await r2.json();
+    } catch (e2) { console.warn('DO upsertKv → KV:', e2 && e2.message); }
   }
   const items = await getDir(env, np);
   const idx = items.findIndex(i => i.name === item.name);
@@ -1095,6 +1222,12 @@ async function removeDirItem(env, path, name) {
         if (!out || out.cached !== false) { await mirrorItemsToKV(env, np, out && out.items); return out; }
       }
     } catch (e) { console.warn('DO remove → KV:', e && e.message); }
+    try {
+      const r2 = await withTimeout(dirStub(env, np).fetch('https://dir/removeKv', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name })
+      }), 3000);
+      if (r2 && r2.ok) return await r2.json();
+    } catch (e2) { console.warn('DO removeKv → KV:', e2 && e2.message); }
   }
   const items = await getDir(env, np);
   const filtered = items.filter(i => i.name !== name);
@@ -1118,6 +1251,14 @@ async function renameDirItem(env, path, oldName, newName) {
       if (r && r.status === 404) return { error: 'not found' };
       if (r && r.status === 409) return { error: 'exists' };
     } catch (e) { console.warn('DO rename → KV:', e && e.message); }
+    try {
+      const r2 = await withTimeout(dirStub(env, np).fetch('https://dir/renameKv', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ oldName, newName })
+      }), 3000);
+      if (r2 && r2.status === 404) return { error: 'not found' };
+      if (r2 && r2.status === 409) return { error: 'exists' };
+      if (r2 && r2.ok) return await r2.json();
+    } catch (e2) { console.warn('DO renameKv → KV:', e2 && e2.message); }
   }
   const items = await getDir(env, np);
   const idx = items.findIndex(i => i.name === oldName);
@@ -1249,10 +1390,12 @@ async function getRecent(env) {
 }
 // 把 "{path,time}" 之类的路径列表补全为真正的目录项（带 name/type/size/mime/path），
 // 否则前端会拿到没有 name 的条目，操作按钮会误作用到当前目录。
-async function enrichPathItems(env, paths) {
+async function enrichPathItems(env, paths, sessionToken) {
   const out = [];
+  const locked = await unlockedPrefixes(env, sessionToken || '');
   for (const p of (Array.isArray(paths) ? paths : [])) {
     const fp = '/' + String(p || '').replace(/^\/+/, '');
+    if (locked.size && insideLocked(fp, locked)) continue;
     const dir = parentOf(fp);
     const name = fp.split('/').filter(Boolean).pop();
     if (!name) continue;
@@ -1262,9 +1405,9 @@ async function enrichPathItems(env, paths) {
   }
   return out;
 }
-async function handleGetRecent(env) {
+async function handleGetRecent(env, sessionToken) {
   const list = await getRecent(env);
-  const items = await enrichPathItems(env, list.map(r => (r && r.path) || ''));
+  const items = await enrichPathItems(env, list.map(r => (r && r.path) || ''), sessionToken);
   return json({ items });
 }
 async function toggleFav(env, path) {
@@ -1398,8 +1541,7 @@ async function handleExportMeta(env, q) {
   if (q.format === 'csv') {
     const rows = ['path,size,mime,time,tags,note'];
     for (const f of out.files) {
-      rows.push([f.path, f.size, f.mime, f.time, f.tags.join('|'), String(f.note || '').replace(/[\r\n]+/g, ' ')]
-        .map(x => '"' + String(x == null ? '' : x).replace(/"/g, '""') + '"').join(','));
+      rows.push([f.path, f.size, f.mime, f.time, f.tags.join('|'), String(f.note || '').replace(/[\r\n]+/g, ' ')].map(csvCell).join(','));
     }
     return new Response('\ufeff' + rows.join('\n'), {
       headers: {
@@ -1485,14 +1627,18 @@ async function authInfo(env, req) {
       const s = await kvCached('session@' + t, sessionCacheSec(env), async () => {
         try { return await env.STORE.get('session:' + t, 'json'); } catch (e) { return null; }
       });
-      if (s && Date.now() < s.exp) return { ok: true, perm: 'rw', kind: 'session' };
+      if (s && Date.now() < s.exp) return { ok: true, perm: 'rw', kind: 'session', token: t };
     } catch (e) {}
   }
   for (const t of cands) {
     try {
       // 无状态会话兜底（KV 写入失败时签发）：HMAC 校验 + 过期检查，不依赖 KV
-      if (await verifyStatelessSession(env, t)) return { ok: true, perm: 'rw', kind: 'session', stateless: true };
+      if (await verifyStatelessSession(env, t)) return { ok: true, perm: 'rw', kind: 'session', stateless: true, token: t };
     } catch (e) {}
+  }
+  // 媒体令牌：短期只读（只用于 GET 文件类请求；写请求会被 ro 拦截）
+  for (const t of cands) {
+    try { if (await verifyMediaToken(env, t)) return { ok: true, perm: 'ro', kind: 'media', token: t }; } catch (e) {}
   }
   try {
     const tokens = await getAccessTokens(env);
@@ -1500,7 +1646,7 @@ async function authInfo(env, req) {
       const found = tokens.find(x => safeEqual(x.token, t));
       if (found) {
         if (found.exp && Date.now() > new Date(found.exp).getTime()) continue;
-        return { ok: true, perm: found.perm === 'ro' ? 'ro' : 'rw', kind: 'token' };
+        return { ok: true, perm: found.perm === 'ro' ? 'ro' : 'rw', kind: 'token', token: t };
       }
     }
   } catch (e) {}
@@ -1552,6 +1698,26 @@ async function handleSign(env, req, path, ttl, bindIp) {
     preview: '/api/preview?path=' + encodeURIComponent('/' + key) + '&' + q
   });
 }
+// ===== 媒体令牌：短期（10 分钟）只读令牌，用于 <img>/下载 URL，避免把 7 天会话令牌放进 URL =====
+async function issueMediaToken(env) {
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const mac = await hmacSha256(new TextEncoder().encode(await signSecretValue(env)), new TextEncoder().encode('media|' + exp));
+  const sig = Array.from(mac).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 24);
+  return { token: 'm1.' + exp.toString(36) + '.' + sig, exp };
+}
+const MEDIA_TOKEN_RE = /^m1\.[0-9a-z]{1,12}\.[0-9a-f]{24}$/;
+async function verifyMediaToken(env, token) {
+  try {
+    const t = String(token || '');
+    if (!MEDIA_TOKEN_RE.test(t)) return false;
+    const exp = parseInt(t.substring(3, t.indexOf('.', 3)), 36);
+    const now = Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(exp) || exp <= now || exp > now + 3600) return false;
+    const mac = await hmacSha256(new TextEncoder().encode(await signSecretValue(env)), new TextEncoder().encode('media|' + exp));
+    const sig = Array.from(mac).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 24);
+    return safeEqual(sig, t.substring(t.lastIndexOf('.') + 1));
+  } catch (e) { return false; }
+}
 
 // ===== 审计日志：筛选与 CSV 导出 =====
 async function handleLogs(env, q) {
@@ -1574,7 +1740,9 @@ async function handleLogs(env, q) {
   return json({ logs: out, total: logs.length, shown: out.length, actions });
 }
 function csvCell(v) {
-  const s = String(v == null ? '' : v);
+  let s = String(v == null ? '' : v);
+  // 防 CSV/Excel 公式注入：以 = + - @ 或制表符/回车开头时加前导单引号
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
   return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 async function handleLogsCsv(env) {
@@ -1632,6 +1800,34 @@ async function rateLimitCheck(env, token, isWrite) {
     if (r && r.ok) { const d = await r.json(); return { limited: !d.ok, retryAfter: d.retryAfter || 1 }; }
   } catch (e) { console.warn('DO rl → allow:', e && e.message); }
   return { limited: false };
+}
+// 公开路由（分享/相册/公开上传等）按 IP 限流：防止匿名刷 KV 读写与评论灌水
+const PUB_RL = (globalThis.__pubRl = globalThis.__pubRl || new Map());
+function publicRateLimit(env, req, bucket, perMin) {
+  try {
+    const ip = ((req && req.headers && req.headers.get('CF-Connecting-IP')) || '') + '|' + bucket;
+    if (!ip || ip === '|' + bucket) return null;
+    const now = Date.now();
+    let b = PUB_RL.get(ip);
+    if (!b) {
+      if (PUB_RL.size > 20000) PUB_RL.clear();
+      b = { tokens: perMin, at: now }; PUB_RL.set(ip, b);
+    }
+    const refill = (now - b.at) / 60000 * perMin;
+    if (refill > 0) { b.tokens = Math.min(perMin, b.tokens + refill); b.at = now; }
+    if (b.tokens < 1) {
+      const retryAfter = Math.max(1, Math.ceil((1 - b.tokens) / perMin * 60));
+      return new Response(JSON.stringify({ error: 'Too many requests', retryAfter }), { status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) } });
+    }
+    b.tokens -= 1;
+  } catch (e) {}
+  return null;
+}
+// 注销：吊销当前服务端会话（前端"退出"必须调用，不能只清 sessionStorage）
+async function handleLogout(req, env) {
+  const t = extractToken(req);
+  if (t) { try { await env.STORE.delete('session:' + t); } catch (e) {} kvInvalidate('session@' + t); }
+  return json({ ok: true });
 }
 async function makeSession(env, req) {
   const t = randToken();
@@ -1704,10 +1900,8 @@ async function checkAdminPassword(env, pw, rec) {
   if (rec && rec.hash) {
     const ok = await verifyPassword(pw || '', rec);
     // L1: 兼容历史无盐记录，验证通过后自动迁移为带盐哈希
-    if (ok && !rec.salt) {
-      const salt = randToken().substring(0, 16);
-      const hash = await hashPassword(String(pw || ''), salt);
-      try { await env.STORE.put('meta:adminpass', JSON.stringify({ hash, salt })); } catch (e) {}
+    if (ok && rec.kdf !== 'pbkdf2') {
+      try { await env.STORE.put('meta:adminpass', JSON.stringify(await makePasswordRecord(String(pw || '')))); } catch (e) {}
     }
     return ok;
   }
@@ -1767,8 +1961,8 @@ async function totpVerify(secretB32, code) {
 function makeBackupCodes(n) {
   const out = [];
   for (let i = 0; i < (n || 8); i++) {
-    const raw = randToken().substring(0, 8).toUpperCase();
-    out.push(raw.substring(0, 4) + '-' + raw.substring(4, 8));
+    const raw = randToken().substring(0, 16).toUpperCase();   // 8 字节 = 64 bit 熵
+    out.push(raw.substring(0, 4) + '-' + raw.substring(4, 8) + '-' + raw.substring(8, 12) + '-' + raw.substring(12, 16));
   }
   return out;
 }
@@ -1785,7 +1979,14 @@ async function totpCheck(env, code) {
   if (!rec || !rec.enabled || !rec.secret) return { ok: true, kind: 'off' };
   const c = String(code || '').trim();
   if (!c) return { ok: false, error: 'Missing code' };
-  if (await totpVerify(rec.secret, c)) return { ok: true, kind: 'totp' };
+  if (await totpVerify(rec.secret, c)) {
+    // 防重放：同一验证码 120 秒内只能使用一次（覆盖 ±1 步长窗口）
+    const ch = await sha256(c);
+    if (rec.lastCode === ch && Date.now() - (rec.lastAt || 0) < 120000) return { ok: false, error: 'Code already used' };
+    rec.lastCode = ch; rec.lastAt = Date.now();
+    try { await env.STORE.put('meta:totp', JSON.stringify(rec)); } catch (e) {}
+    return { ok: true, kind: 'totp' };
+  }
   const h = await sha256(c.toUpperCase().replace(/[^A-Z0-9]/g, ''));
   const list = Array.isArray(rec.backup) ? rec.backup : [];
   const idx = list.findIndex(x => safeEqual(x, h));
@@ -1806,7 +2007,8 @@ async function handleTotpGet(env) {
     created: (rec && rec.created) || ''
   });
 }
-async function handleTotpSetup(env, label) {
+async function handleTotpSetup(env, label, password) {
+  if (!await checkAdminPassword(env, password || '')) return json({ error: 'Wrong password' }, 403);
   const rec = (await totpRecord(env)) || {};
   if (rec.enabled) return json({ error: 'Already enabled' }, 400);
   const bytes = crypto.getRandomValues(new Uint8Array(20));
@@ -1817,7 +2019,8 @@ async function handleTotpSetup(env, label) {
   const otpauth = 'otpauth://totp/' + encodeURIComponent(name) + '?secret=' + secret + '&issuer=' + encodeURIComponent(name) + '&algorithm=SHA1&digits=6&period=30';
   return json({ ok: true, secret, otpauth });
 }
-async function handleTotpEnable(env, code) {
+async function handleTotpEnable(env, code, password) {
+  if (!await checkAdminPassword(env, password || '')) return json({ error: 'Wrong password' }, 403);
   const rec = await totpRecord(env);
   if (!rec || !rec.secret) return json({ error: 'No pending secret' }, 400);
   if (rec.enabled) return json({ error: 'Already enabled' }, 400);
@@ -1835,8 +2038,10 @@ async function handleTotpEnable(env, code) {
 }
 async function handleTotpDisable(env, password, code) {
   if (!await checkAdminPassword(env, password || '')) return json({ error: 'Wrong password' }, 403);
-  const v = await totpCheck(env, code);
-  if (!v.ok) return json({ error: v.error || 'Wrong code' }, 403);
+  // 关闭 2FA 直接校验动态码，不受"登录验证码重放保护"影响（刚登录后立刻关闭是常见操作）
+  const trec = await totpRecord(env);
+  if (!trec || !trec.enabled || !trec.secret) return json({ error: 'TOTP not enabled' }, 400);
+  if (!await totpVerify(trec.secret, code)) return json({ error: 'Wrong code' }, 403);
   try { await env.STORE.delete('meta:totp'); } catch (e) {}
   kvInvalidate('totpen@');
   try { await addLog(env, 'sec', '(二次验证)', 'TOTP disabled'); } catch (e) {}
@@ -1858,16 +2063,15 @@ async function handleAdminPassSet(env, current, next) {
   if (!next) return json({ error: 'Empty password' }, 400);
   if (!(await adminPasswordSet(env)) && !env.DRIVE_PASSWORD) return json({ error: 'Server not configured' }, 500);
   if (!await checkAdminPassword(env, current || '')) return json({ error: 'Wrong current password' }, 403);
-  const salt = randToken().substring(0, 16);
-  const hash = await hashPassword(String(next), salt);
-  await env.STORE.put('meta:adminpass', JSON.stringify({ hash, salt }));
-  // 修改密码后让所有旧会话失效
+  await env.STORE.put('meta:adminpass', JSON.stringify(await makePasswordRecord(String(next))));
+  // 修改密码后让所有旧会话与访问令牌失效（否则被盗令牌可绕过"改密踢人"）
   try {
     const keys = await listKV(env, 'session:', 1000);
     for (const k of keys) { try { await env.STORE.delete(k); } catch (e) {} }
     kvInvalidate('session@');
-    kvInvalidate('sesssecret@');   // 无状态会话的签名密钥也依赖口令哈希，必须一起失效
+    kvInvalidate('sesssecret@');
   } catch (e) {}
+  try { await env.STORE.delete('meta:tokens'); kvInvalidate('meta:tokens'); } catch (e) {}
   return json({ ok: true });
 }
 
@@ -1890,7 +2094,7 @@ function ipMatch(ip, rule) {
     const mask = bits === 0 ? 0 : ((0xffffffff << (32 - bits)) >>> 0);
     return ((a & mask) >>> 0) === ((n & mask) >>> 0);
   }
-  return ip === r || String(ip).indexOf(r) === 0;
+  return ip === r;
 }
 function ipAllowed(env, ip) {
   const allow = csvList(cfgStr(env, 'IP_ALLOW', 'ipAllow', ''));
@@ -2190,7 +2394,9 @@ async function handleLogin(req, env) {
     return json({ error: 'Wrong password' }, 401);
   }
   // 二次验证：启用后必须提供动态码或一次性备用码（失败同样计入爆破限频）
-  if (await totpEnabled(env)) {
+  let totpRec = null;
+  try { totpRec = await env.STORE.get('meta:totp', 'json'); } catch (e) { return json({ error: '2FA state unavailable, retry later' }, 503); }
+  if (totpRec && totpRec.enabled && totpRec.secret) {
     const v = await totpCheck(env, form.get('code') || '');
     if (!v.ok) {
       await bumpFail(loginUser);
@@ -2237,16 +2443,22 @@ async function handleList(env, path, withSize, sessionToken) {
   return json({ path, items });
 }
 
-async function handleUnlockDir(env, sessionToken, dirPath, password) {
+async function handleUnlockDir(env, sessionToken, dirPath, password, req) {
   dirPath = normPath(dirPath);
   const pass = await env.STORE.get('dirpass:' + dirPath, 'json');
   if (!pass) return json({ ok: true });
-  if (!await verifyPassword(password || '', pass)) return json({ error: 'Wrong password' }, 403);
+  // 目录密码失败限频：防止对锁目录密码做在线穷举
+  const ip = (req && req.headers && req.headers.get('CF-Connecting-IP')) || '';
+  const fk = 'dirpwfail:' + dirPath + ':' + (ip || 'x');
+  try { const f = await env.STORE.get(fk, 'json'); if (f && f.n >= 8 && Date.now() - f.t < 600000) return json({ error: 'Too many attempts, wait 10min' }, 429); } catch (e) {}
+  if (!await verifyPassword(password || '', pass)) {
+    try { const f = (await env.STORE.get(fk, 'json')) || { n: 0, t: 0 }; f.n = Date.now() - f.t > 600000 ? 1 : f.n + 1; f.t = Date.now(); await env.STORE.put(fk, JSON.stringify(f), { expirationTtl: 900 }); } catch (e) {}
+    return json({ error: 'Wrong password' }, 403);
+  }
+  try { await env.STORE.delete(fk); } catch (e) {}
   // L1: 目录密码同样支持无盐记录自动迁移
-  if (!pass.salt) {
-    const salt = randToken().substring(0, 16);
-    const hash = await hashPassword(String(password || ''), salt);
-    try { await env.STORE.put('dirpass:' + dirPath, JSON.stringify({ hash, salt })); } catch (e) {}
+  if (pass.kdf !== 'pbkdf2') {
+    try { await env.STORE.put('dirpass:' + dirPath, JSON.stringify(await makePasswordRecord(String(password || '')))); } catch (e) {}
   }
   await env.STORE.put('unlock:' + sessionToken + ':' + dirPath, JSON.stringify({ path: dirPath, exp: Date.now() + 3600000 }), { expirationTtl: 3700 });
   kvInvalidate('unlock@' + sessionToken + ':' + dirPath);
@@ -2255,13 +2467,14 @@ async function handleUnlockDir(env, sessionToken, dirPath, password) {
 
 async function ensureDir(env, parentPath, name) {
   const res = await findDirItem(env, parentPath, name);
-  if (!res.item || res.item.type !== 'dir') {
-    await upsertDirItem(env, parentPath, { name, type: 'dir', time: new Date().toISOString() });
-  }
+  if (res.item) return res.item.type === 'dir';   // 同名文件：拒绝，避免把文件条目替换成目录、子树成孤儿
+  const up = await upsertDirItem(env, parentPath, { name, type: 'dir', time: new Date().toISOString() });
+  return !(up && up.ok === false);
 }
 
 async function handleUpload(req, env, path) {
   path = normPath(path);
+  if (isInternalPath(path) || isInternalPath(reqURL(req).searchParams.get('path') || '')) return json({ error: 'Bad path' }, 400);
   const form = await req.formData();
   const file = form.get('file');
   const thumb = form.get('thumb');
@@ -2277,7 +2490,7 @@ async function handleUpload(req, env, path) {
     for (const raw of parts) {
       const safe = sanitizeName(raw);
       if (!safe) continue;
-      await ensureDir(env, cur, safe);
+      if (!await ensureDir(env, cur, safe)) return json({ error: 'Name conflict in path', path: cur + safe }, 409);
       cur = cur + safe + '/';
     }
     uploadDir = cur;
@@ -2291,6 +2504,7 @@ async function handleUpload(req, env, path) {
 
   const oldRes = await findDirItem(env, uploadDir, safeName);
   const oldItem = oldRes.item;
+  if (oldItem && oldItem.type === 'dir') return json({ error: 'Name conflicts with a folder' }, 409);
   if (!oldItem) {
     const ruleChk = await checkDirRule(env, uploadDir, safeName, file.size);
     if (ruleChk) return json({ error: ruleChk.error }, 403);
@@ -2320,7 +2534,12 @@ async function handleUpload(req, env, path) {
     const entry = { name: safeName, type: 'file', size: file.size, mime: file.type || '', time: new Date().toISOString(), hash: etag, hasThumb };
     const up = await upsertDirItem(env, uploadDir, entry);
     if (up && up.ok === false) { const err = new Error(up.error || 'Metadata rejected'); err.dirFull = true; err.limit = up.limit; throw err; }
-    if (isHex64(clientHash)) { try { await env.STORE.put('hash:' + clientHash, JSON.stringify({ key, time: Date.now() }), { expirationTtl: hashTtl(env) }); } catch (e) {} }
+    if (isHex64(clientHash)) {
+      try {
+        // 不覆盖已有 hash 索引，避免用伪造 hash 把已知内容指向别的对象（完整性投毒）
+        if (!(await env.STORE.get('hash:' + clientHash))) await env.STORE.put('hash:' + clientHash, JSON.stringify({ key, size: file.size, time: Date.now() }), { expirationTtl: hashTtl(env) });
+      } catch (e) {}
+    }
     if (oldItem) {
       if (oldItem.hasThumb && !hasThumb) await deleteThumb(env, key);
       await addUsage(env, file.size - (oldItem.size || 0), 0);
@@ -2329,14 +2548,22 @@ async function handleUpload(req, env, path) {
       await addLog(env, 'up', uploadDir + safeName, file.size + ' bytes');
     }
   } catch (e) {
-    // 元数据写入失败：回滚对象。若覆盖的是旧文件，先把旧内容从历史版本恢复回去，
-    // 否则目录条目会指向一个已被删除的 key（文件"消失"）。
+    // 元数据写入失败：回滚对象。若覆盖的是旧文件，先把旧内容从历史版本恢复回去；
+    // 若没有历史版本（旧对象超过版本上限），保留新对象并重试元数据，绝不能把新旧内容一起删掉。
     let restored = false;
     if (oldItem && versionTs) {
       try {
         const v = await env.DRIVE.get(VERSIONS_PREFIX + key + '/' + versionTs);
         if (v) { await putAndMirror(env, key, v.body, { httpMetadata: v.httpMetadata }); restored = true; }
       } catch (e2) {}
+    }
+    if (!restored && oldItem) {
+      try {
+        await upsertDirItem(env, uploadDir, { name: safeName, type: 'file', size: file.size, mime: file.type || '', time: new Date().toISOString(), hash: etag, hasThumb });
+        if (!hasThumb) await deleteThumb(env, key);
+        return json({ error: 'Metadata update failed (file content kept)', kept: true }, 500);
+      } catch (e2) {}
+      return json({ error: 'Metadata update failed', kept: true }, 500);
     }
     if (!restored) { try { await deleteAndMirror(env, key); } catch (e2) {} }
     if (!hasThumb) await deleteThumb(env, key);
@@ -2348,6 +2575,7 @@ async function handleUpload(req, env, path) {
 
 async function handleDownload(env, req, path) {
   const key = path.replace(/^\/+/, '');
+  if (isInternalPath(key)) return internalDenied();
   const name = key.split('/').pop();
   let size = 0;
   try { const h = await env.DRIVE.head(key); if (!h) return json({ error: 'Not found' }, 404); size = h.size; } catch (e) {}
@@ -2360,16 +2588,19 @@ async function handleDownload(env, req, path) {
 
 async function handlePreview(env, req, path) {
   const key = path.replace(/^\/+/, '');
+  if (isInternalPath(key)) return internalDenied();
   return serveObject(env, req, key, { disposition: 'inline', sanitize: true, cacheControl: 'private, max-age=3600' });
 }
 
 async function handleThumb(env, req, path) {
   const key = path.replace(/^\/+/, '');
+  if (isInternalPath(key)) return internalDenied();
   return serveObject(env, req, THUMB_PREFIX + key, { cacheControl: 'private, max-age=86400' });
 }
 
 async function handleSaveText(env, path, content) {
   if (typeof content !== 'string') return json({ error: 'Bad content' }, 400);
+  if (isInternalPath(path)) return internalDenied();
   if (content.length > 2 * 1024 * 1024) return json({ error: 'Text too large' }, 413);
   const norm = normPath('/' + String(path || '').replace(/^\/+/, ''));
   const dir = parentOf(norm);
@@ -2380,6 +2611,7 @@ async function handleSaveText(env, path, content) {
 
   const oldRes = await findDirItem(env, dir, name);
   const oldItem = oldRes.item;
+  if (oldItem && oldItem.type === 'dir') return json({ error: 'Name conflicts with a folder' }, 409);
   if (!oldItem) {
     const room = await dirRoom(env, dir, 1);
     if (room) return json({ error: room.error, limit: room.limit }, 507);
@@ -2412,7 +2644,8 @@ async function handleSaveText(env, path, content) {
 }
 
 async function handleDelete(env, path) {
-  path = '/' + path.replace(/^\/+/, '');
+  path = normFilePath(path);
+  if (path === '/' || isInternalPath(path)) return internalDenied();
   const dir = parentOf(path); const name = path.split('/').filter(Boolean).pop();
   const res = await findDirItem(env, dir, name);
   const entry = res.item;
@@ -2557,6 +2790,7 @@ async function handleRestore(env, id) {
   const entry = trash[idx];
   if (entry.type === 'dir') {
     // 恢复目录：把 /.trash/<id>/ 整体搬回 originalPath，并重建父目录引用
+    if (isInternalPath(entry.originalPath)) return { error: 'Bad path', status: 400 };
     const pdir = parentOf(entry.originalPath);
     const existing = await findDirItem(env, pdir, entry.name);
     if (existing.item) return { error: 'Name exists', status: 409 };
@@ -2566,6 +2800,7 @@ async function handleRestore(env, id) {
     try { await addLog(env, 'res', entry.originalPath, '从回收站恢复目录'); } catch (e) {}
     return { ok: true };
   }
+  if (isInternalPath(entry.originalPath)) return { error: 'Bad path', status: 400 };
   const dir = parentOf(entry.originalPath);
   const existing = await findDirItem(env, dir, entry.name);
   if (existing.item) return { error: 'Name exists', status: 409 };
@@ -2631,9 +2866,12 @@ async function handleBatchPurge(env, ids) {
 
 async function handleMkdir(env, path, name) {
   path = normPath(path);
+  if (isInternalPath(path)) return internalDenied();
   const safeName = sanitizeName(name);
   if (!safeName) return json({ error: 'Bad name' }, 400);
   if (pathTooLong(path + safeName + '/')) return json({ error: 'Path too long', max: PATH_MAX }, 400);
+  const existingDir = await findDirItem(env, path, safeName);
+  if (existingDir.item && existingDir.item.type !== 'dir') return json({ error: 'Name conflicts with a file' }, 409);
   // 单次 upsert 完成"判断是否已存在 + 容量校验 + 写入"：
   // DO 的 upsert 在 idx<0 且已达上限时返回 507，KV 回退路径同样校验；
   // 原先额外做的 findDirItem + dirRoom 是 2~3 次多余往返（同一目录被重复读取）。
@@ -2643,7 +2881,8 @@ async function handleMkdir(env, path, name) {
 }
 
 async function handleRename(env, oldPath, newName) {
-  oldPath = '/' + oldPath.replace(/^\/+/, ''); newName = sanitizeName(newName);
+  oldPath = normFilePath(oldPath); newName = sanitizeName(newName);
+  if (oldPath === '/' || isInternalPath(oldPath)) return internalDenied();
   const dir = parentOf(oldPath); const oldName = oldPath.split('/').filter(Boolean).pop();
 
   const r = await renameDirItem(env, dir, oldName, newName);
@@ -2698,7 +2937,8 @@ async function recursiveMoveDir(env, oldPrefix, newPrefix) {
 }
 
 async function handleMove(env, srcPath, targetDir) {
-  srcPath = '/' + srcPath.replace(/^\/+/, ''); targetDir = normPath(targetDir);
+  srcPath = normFilePath(srcPath); targetDir = normPath(targetDir);
+  if (srcPath === '/' || isInternalPath(srcPath) || isInternalPath(targetDir)) return internalDenied();
   const srcDir = parentOf(srcPath); const name = srcPath.split('/').filter(Boolean).pop();
   if (srcDir === targetDir) return json({ error: 'Same directory' }, 400);
   if (targetDir.startsWith(srcPath + '/')) return json({ error: 'Cannot move into itself' }, 400);
@@ -2738,7 +2978,7 @@ async function copyDirRecursive(env, srcPrefix, dstPrefix, depth, budget) {
   for (const it of items) {
     if (budget.n <= 0) return;
     if (it.type === 'dir') {
-      await ensureDir(env, dstPrefix, it.name);
+      if (!await ensureDir(env, dstPrefix, it.name)) continue;
       await copyDirRecursive(env, srcPrefix + it.name + '/', dstPrefix + it.name + '/', depth + 1, budget);
     } else {
       const sk = srcPrefix.replace(/^\//, '') + it.name;
@@ -2788,7 +3028,7 @@ async function handleCopy(env, paths, target, sessionToken) {
       if (room) { items.push({ path: src, error: room.error }); failed++; continue; }
 
       if (entry.type === 'dir') {
-        await ensureDir(env, t, finalName);
+        if (!await ensureDir(env, t, finalName)) { items.push({ path: src, error: 'name conflict' }); failed++; continue; }
         const dPre = dst.endsWith('/') ? dst : dst + '/';
         await copyDirRecursive(env, srcDir, dPre, 0, budget);
         await upsertDirItem(env, t, Object.assign({}, entry, { name: finalName, time: new Date().toISOString() }));
@@ -3285,12 +3525,12 @@ async function handleRestoreVersion(env, filePath, ts) {
 async function handleChunkInit(env, fileName, totalSize, hash, dirPath, mime) {
   const uploadId = randToken().substring(0, 16);
   dirPath = normPath(dirPath);
+  if (isInternalPath(dirPath)) return json({ error: 'Bad path' }, 400);
   const size = parseInt(totalSize, 10) || 0;
+  if (!(size > 0)) return json({ error: 'Invalid totalSize' }, 400);
   if (size > maxUploadBytes(env)) return json({ error: 'File too large', max: maxUploadBytes(env) }, 413);
-  if (size > 0) {
-    const u = await getUsage(env);
-    if ((u.used || 0) + size > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413);
-  }
+  const u = await getUsage(env);
+  if ((u.used || 0) + size > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413);
   await env.STORE.put('chunk:' + uploadId, JSON.stringify({ fileName: sanitizeName(fileName), totalSize: size, hash: hash || '', dirPath, mime: String(mime || ''), chunks: 0, created: Date.now() }), { expirationTtl: 86400 });
   // 顺手回收一次过期分片（每 isolate 每小时最多一次，避免中途放弃的上传长期占用 R2）
   if (Date.now() - TEL.lastChunkGc > 3600 * 1000) {
@@ -3368,10 +3608,15 @@ async function handleChunkComplete(req, env, uploadId) {
 
   const oldRes = await findDirItem(env, outDir, name);
   const oldItem = oldRes.item;
+  if (oldItem && oldItem.type === 'dir') return json({ error: 'Name conflicts with a folder' }, 409);
   if (!oldItem) {
     const ruleChk = await checkDirRule(env, outDir, name, declared);
     if (ruleChk) return json({ error: ruleChk.error }, 403);
   }
+  // complete 前复查配额（init 与 complete 之间配额可能已被其它请求占用）
+  const uq = await getUsage(env);
+  const need = declared - (oldItem ? (oldItem.size || 0) : 0);
+  if (need > 0 && (uq.used || 0) + need > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413);
   if (oldItem) await pushVersion(env, key, oldItem);
 
   let done = false;
@@ -3442,7 +3687,11 @@ async function handleChunkComplete(req, env, uploadId) {
     } while (gcursor);
   } catch (e) {}
   await env.STORE.delete('chunk:' + uploadId);
-  if (meta.hash) { try { await env.STORE.put('hash:' + meta.hash, JSON.stringify({ key, time: Date.now() }), { expirationTtl: hashTtl(env) }); } catch (e) {} }
+  if (meta.hash) {
+    try {
+      if (!(await env.STORE.get('hash:' + meta.hash))) await env.STORE.put('hash:' + meta.hash, JSON.stringify({ key, size: actualSize, time: Date.now() }), { expirationTtl: hashTtl(env) });
+    } catch (e) {}
+  }
 
   const finalSize = actualSize;
   const entry = { name, type: 'file', size: finalSize, mime: meta.mime || '', time: new Date().toISOString(), hash: meta.hash || '' };
@@ -3558,8 +3807,7 @@ async function createShare(env, filePath, days, maxAccesses, password, isDir, op
   filePath = '/' + String(filePath || '').replace(/^\/+/, '');
   const t = randToken();
   const ttl = clampDays(days) * 86400;
-  const pwSalt = password ? randToken().substring(0, 16) : '';
-  const pwHash = password ? await hashPassword(password, pwSalt) : '';
+  const pwRec = password ? await makePasswordRecord(password) : null;
   const clean = filePath.replace(/\/+$/, '') || '/';
   // H3: 创建分享前校验目录锁（目录分享查目录本身，文件分享查父目录）
   const lockPath = isDir ? clean + '/' : parentOf(clean);
@@ -3576,7 +3824,9 @@ async function createShare(env, filePath, days, maxAccesses, password, isDir, op
   }
   const rec = {
     path: filePath, type: isDir ? 'dir' : 'file', exp: Date.now() + ttl * 1000,
-    max: clampCount(maxAccesses), hits: 0, pwHash, pwSalt, name, size, mime,
+    max: clampCount(maxAccesses), hits: 0,
+    pwHash: pwRec ? pwRec.hash : '', pwSalt: pwRec ? pwRec.salt : '', pwKdf: pwRec ? pwRec.kdf : '', pwIter: pwRec ? pwRec.iter : 0,
+    name, size, mime,
     // 细粒度权限
     allowDownload: opts.allowDownload !== false,
     allowComment: opts.allowComment !== false,
@@ -3599,7 +3849,7 @@ async function createShare(env, filePath, days, maxAccesses, password, isDir, op
     if (sr.ok) rec.slug = sr.slug;
   }
   try { await addLog(env, 'shr', filePath, isDir ? '文件夹分享' : '文件分享'); } catch (e) {}
-  return { ok: true, url: '/s/' + (rec.slug || t), token: t, slug: rec.slug || '', hasPassword: !!pwHash, path: filePath, name };
+  return { ok: true, url: '/s/' + (rec.slug || t), token: t, slug: rec.slug || '', hasPassword: !!pwRec, path: filePath, name };
 }
 // 短链别名：slug:<name> → { token }
 async function setShareSlug(env, token, slug) {
@@ -3648,7 +3898,10 @@ async function handleShareUpdate(env, token, b) {
   if (b) {
     if (b.allowDownload !== undefined) data.allowDownload = !!b.allowDownload;
     if (b.allowComment !== undefined) data.allowComment = !!b.allowComment;
-    if (b.once !== undefined) { data.once = !!b.once; if (data.once) data.downloaded = false; }
+    if (b.once !== undefined) {
+      data.once = !!b.once; if (data.once) data.downloaded = false;
+      try { await counterDel(env, 'once:' + String(token)); await env.STORE.delete('oncekv:' + String(token)); } catch (e) {}
+    }
     if (b.note !== undefined) data.note = String(b.note || '').slice(0, 500);
     if (b.ipAllow !== undefined) data.ipAllow = String(b.ipAllow || '').slice(0, 300);
     if (b.ipDeny !== undefined) data.ipDeny = String(b.ipDeny || '').slice(0, 300);
@@ -3692,6 +3945,39 @@ function shareRelKey(data, rel) {
   const k = full.replace(/^\/+/, '').replace(/\/+$/, '');
   return k || null;
 }
+function sharePwRec(data) { return { hash: data.pwHash, salt: data.pwSalt, kdf: data.pwKdf, iter: data.pwIter }; }
+function sharePwFailKey(token, req) {
+  const ip = (req && req.headers && req.headers.get('CF-Connecting-IP')) || '';
+  return 'sharepwfail:' + token + ':' + (ip || 'x');
+}
+async function sharePwBlocked(env, token, req) {
+  try {
+    const r = await env.STORE.get(sharePwFailKey(token, req), 'json');
+    if (r && r.n >= 8 && Date.now() - r.t < 600000) return json({ error: 'Too many attempts, wait 10min' }, 429);
+  } catch (e) {}
+  return null;
+}
+async function sharePwFail(env, token, req) {
+  try {
+    const k = sharePwFailKey(token, req);
+    const r = (await env.STORE.get(k, 'json')) || { n: 0, t: 0 };
+    r.n = Date.now() - r.t > 600000 ? 1 : r.n + 1; r.t = Date.now();
+    await env.STORE.put(k, JSON.stringify(r), { expirationTtl: 900 });
+  } catch (e) {}
+}
+// 一次性链接的原子消费（DO 计数器；DO 不可用时退化为 KV）
+async function consumeShareOnce(env, token) {
+  const v = await counterAdd(env, 'once:' + token, 1);
+  if (v == null) {
+    try {
+      const k = 'oncekv:' + token;
+      if ((Number(await env.STORE.get(k, 'text')) || 0) >= 1) return false;
+      await env.STORE.put(k, '1', { expirationTtl: 86400 });
+      return true;
+    } catch (e) { return true; }
+  }
+  return v <= 1;
+}
 // 分享访问校验：过期 / 次数 / 密码 / 地区 / IP / UA（可选），返回 {data} 或 {resp}
 async function shareGuard(env, shareToken, req, countHit, needPw) {
   const data = await env.STORE.get('share:' + shareToken, 'json');
@@ -3727,7 +4013,13 @@ async function shareGuard(env, shareToken, req, countHit, needPw) {
   }
   if (needPw && data.pwHash) {
     const pw = (req ? (reqURL(req).searchParams.get('pw') || '') : '');
-    if (!await verifyPassword(pw, { hash: data.pwHash, salt: data.pwSalt })) return { resp: json({ error: 'Wrong password' }, 403) };
+    const blocked = await sharePwBlocked(env, shareToken, req);
+    if (blocked) return { resp: blocked };
+    if (!await verifyPassword(pw, sharePwRec(data))) {
+      await sharePwFail(env, shareToken, req);
+      return { resp: json({ error: 'Wrong password' }, 403) };
+    }
+    try { await env.STORE.delete(sharePwFailKey(shareToken, req)); } catch (e) {}
   }
   return { data };
 }
@@ -3756,8 +4048,14 @@ async function handleShareData(env, shareToken, req) {
     const d = g.data;
     const stats = { hits: d.max > 0 ? Math.min(d.hits || 0, d.max) : (d.hits || 0), max: d.max || 0 };
     const view = d.view || {};
-    if (d.pwHash && !await verifyPassword(pw, { hash: d.pwHash, salt: d.pwSalt })) {
-      return json(Object.assign({ needPassword: true, hasPassword: true, view, note: d.note || '' }, stats));
+    if (d.pwHash) {
+      const blocked = await sharePwBlocked(env, shareToken, req);
+      if (blocked) return blocked;
+      if (!await verifyPassword(pw, sharePwRec(d))) {
+        await sharePwFail(env, shareToken, req);
+        return json(Object.assign({ needPassword: true, hasPassword: true, view, note: d.note || '' }, stats));
+      }
+      try { if (d.pwKdf !== 'pbkdf2') { const rec2 = await makePasswordRecord(pw); d.pwHash = rec2.hash; d.pwSalt = rec2.salt; d.pwKdf = rec2.kdf; d.pwIter = rec2.iter; await env.STORE.put('share:' + shareToken, JSON.stringify(d), { expirationTtl: shareTtlFor(d) }); } } catch (e) {}
     }
     const c = await shareCount(env, shareToken, d, req);
     if (c.resp) return c.resp;
@@ -3800,6 +4098,7 @@ async function handleComments(env, req, url) {
   if (!path) return json({ error: 'No path' }, 400);
   if (req.method === 'GET') return json({ comments: await getComments(env, path) });
   if (req.method === 'POST') {
+    if (!await pathExists(env, path)) return json({ error: 'Not found' }, 404);
     const b = body || {};
     const r = await addComment(env, path, b.text, b.by || 'owner', req);
     if (r.error) return json({ error: r.error }, r.error === 'Comment too long' ? 413 : 400);
@@ -3816,6 +4115,15 @@ async function handleComments(env, req, url) {
   return json({ error: 'Method not allowed' }, 405);
 }
 // 分享访客评论（受限：必须在分享范围内，且分享允许评论）
+async function pathExists(env, p) {
+  try {
+    const np = normPath('/' + String(p || '').replace(/^\/+/, ''));
+    if (np === '/') return true;
+    const name = np.split('/').filter(Boolean).pop();
+    const it = await findDirItem(env, parentOf(np), name);
+    return !!(it && it.item);
+  } catch (e) { return false; }
+}
 async function handleShareComment(env, shareToken, req) {
   try {
     const g = await shareGuard(env, shareToken, req, false, true);
@@ -3833,6 +4141,7 @@ async function handleShareComment(env, shareToken, req) {
     } else {
       target = '/' + String(d.path || '').replace(/^\/+/, '');
     }
+    if (!await pathExists(env, target)) return json({ error: 'Not found' }, 404);
     const r = await addComment(env, target, b.text, (b.name ? String(b.name).slice(0, 40) : 'guest'), req);
     if (r.error) return json({ error: r.error }, r.error === 'Comment too long' ? 413 : 400);
     return json({ ok: true, count: r.count });
@@ -3844,6 +4153,8 @@ async function handleShareList(env, shareToken, req) {
     if (g.resp) return g.resp;
     const d = g.data;
     if (d.type !== 'dir') return json({ error: 'Not a folder share' }, 400);
+    const cnt = await shareCount(env, shareToken, d, req);
+    if (cnt.resp) return cnt.resp;
     const rel = reqURL(req).searchParams.get('p') || '';
     const base = normPath(d.path);
     const dir = normPath(base + rel);
@@ -3862,8 +4173,10 @@ async function handleSharePreview(env, shareToken, req) {
   try {
     const g = await shareGuard(env, shareToken, req, false, true);
     if (g.resp) return g.resp;
+    if (g.data.once) return json({ error: 'Once-only link: please download instead of preview', once: true }, 403);
     const key = shareRelKey(g.data, reqURL(req).searchParams.get('p') || '');
     if (!key) return json({ error: 'Not found' }, 404);
+    if (isInternalPath(key)) return internalDenied();
     if (await isPathLocked(env, parentOf('/' + key), '')) return json({ error: 'Locked' }, 423);
     return await serveObject(env, req, key, { disposition: 'inline', sanitize: true, cacheControl: 'private, max-age=3600' });
   } catch (e) { return json({ error: 'Invalid' }, 400); }
@@ -3874,13 +4187,15 @@ async function handleShareDownload(env, shareToken, req) {
     if (g.resp) return g.resp;
     const d = g.data;
     if (d.allowDownload === false) return json({ error: 'Download disabled' }, 403);
-    if (d.once && d.downloaded) return json({ error: 'Download already used', once: true }, 410);
+    if (d.once && req.method !== 'HEAD' && !await consumeShareOnce(env, shareToken)) return json({ error: 'Download already used', once: true }, 410);
+    const cnt = await shareCount(env, shareToken, d, req);
+    if (cnt.resp) return cnt.resp;
     const key = shareRelKey(d, reqURL(req).searchParams.get('p') || '');
     if (!key) return json({ error: 'Not found' }, 404);
     if (await isPathLocked(env, parentOf('/' + key), '')) return json({ error: 'Locked' }, 423);
     const name = key.split('/').pop();
     const resp = await serveObject(env, req, key, { disposition: 'attachment; filename="' + encodeURIComponent(name) + '"' });
-    if (resp.status === 200) {
+    if (resp.status === 200 || resp.status === 206) {
       await addDownloadLog(env, Object.assign({ time: new Date().toISOString(), path: '/' + key, name, size: d.size || 0, source: 'share' }, clientInfo(req)));
       if (d.once && !d.downloaded) {
         d.downloaded = true;
@@ -4301,7 +4616,9 @@ load();
 
 // ===== Upload Links =====
 async function handleCreateUploadLink(env, dirPath, days, maxFiles) {
-  dirPath = normPath(dirPath); const t = randToken(); const ttl = clampDays(days) * 86400;
+  dirPath = normPath(dirPath);
+  if (isInternalPath(dirPath)) return json({ error: 'Bad path' }, 400);
+  const t = randToken(); const ttl = clampDays(days) * 86400;
   await env.STORE.put('ulink:' + t, JSON.stringify({ path: dirPath, exp: Date.now() + ttl * 1000, max: clampCount(maxFiles), count: 0 }), { expirationTtl: ttl + 60 });
   return json({ ok: true, url: '/u/' + t });
 }
@@ -4413,25 +4730,29 @@ if(window.turnstile&&turnstile.reset){try{turnstile.reset()}catch(e){}}
 }
 
 // ===== 元数据快照备份（KV + 目录树 → R2 的 .backup/，不显示在文件列表） =====
+const COLLECT_DIRS_HEALTH = { failed: 0, depthCut: 0 };
 async function collectDirs(env) {
   const out = {};
   const seen = {};
+  COLLECT_DIRS_HEALTH.failed = 0; COLLECT_DIRS_HEALTH.depthCut = 0;
+  const failsBefore = DIR_READ_FAILS;
   async function walk(dirPath, depth) {
-    if (depth > 12 || seen[dirPath]) return;
+    if (depth > 64) { COLLECT_DIRS_HEALTH.depthCut++; return; }
+    if (seen[dirPath]) return;
     seen[dirPath] = 1;
-    let items = [];
-    try { items = await getDir(env, dirPath); } catch (e) { items = []; }
+    let items = await getDir(env, dirPath);
     out[dirPath] = items;
     for (const it of items) {
       if (it && it.type === 'dir' && it.name) await walk(dirPath + it.name + '/', depth + 1);
     }
   }
   await walk('/', 0);
+  COLLECT_DIRS_HEALTH.failed = Math.max(0, DIR_READ_FAILS - failsBefore);
   return out;
 }
 async function collectMeta(env) {
   // 注意：不纳入 meta:totp（二次验证密钥不应随快照/下载外泄，恢复时保留当前设置）
-  const singles = ['meta:tags', 'meta:favs', 'meta:recent', 'meta:tokens', 'meta:autorule', 'meta:usage', 'meta:dlstat',
+  const singles = ['meta:tags', 'meta:favs', 'meta:recent', 'meta:autorule', 'meta:usage', 'meta:dlstat',
     'meta:favgroups', 'meta:albums', 'meta:config', 'meta:dirrules', 'meta:cron', 'meta:bookmarks'];
   // 每个前缀限制读取条数；整体还有字节预算，防止备份本身把 KV 读配额/R2 体积吃满
   const prefixes = [['note:', 400], ['tags:', 400], ['share:', 200], ['ulink:', 200], ['dirpass:', 100], ['versions:', 200]];
@@ -4477,7 +4798,7 @@ async function resolveSnapshot(env, key, withKv) {
       const o = await env.DRIVE.get(cur);
       if (o) snap = JSON.parse(new TextDecoder().decode(await o.arrayBuffer()));
     } catch (e) { snap = null; }
-    if (!snap || typeof snap !== 'object') break;
+    if (!snap || typeof snap !== 'object') { out.broken = true; out.missing = cur; break; }
     stack.push(snap);
     out.truncated = out.truncated || !!snap.truncated;
     cur = snap.base || null;
@@ -4494,18 +4815,20 @@ async function resolveSnapshot(env, key, withKv) {
 }
 async function createBackup(env, reason) {
   const dirs = await collectDirs(env);
+  if (Object.keys(dirs).length > 20000) return { ok: false, error: 'Too many directories for backup', dirs: Object.keys(dirs).length, created: '' };
   const checksums = {};
   for (const p of Object.keys(dirs)) checksums[p] = await dirChecksum(dirs[p]);
   // 增量：只存变化的目录 + 已删除目录清单，base 指向上一份快照
   const idx = await backupIndex(env);
   const useIncremental = cfgBool(env, 'BACKUP_INCREMENTAL', 'backupIncremental', true) && !!(idx && idx.key) && (idx.chain || 0) < 19;
-  let base = null, storeDirs = dirs, removed = [], chain = 0;
+  let base = null, storeDirs = dirs, removed = [], chain = 0, chainPath = [];
   if (useIncremental) {
     const prev = idx.checksums || {};
     const changed = {};
     for (const p of Object.keys(dirs)) { if (prev[p] !== checksums[p]) changed[p] = dirs[p]; }
     for (const p of Object.keys(prev)) { if (!dirs[p]) removed.push(p); }
     base = idx.key; storeDirs = changed; chain = (idx.chain || 0) + 1;
+    chainPath = (Array.isArray(idx.chainPath) ? idx.chainPath : []).concat([idx.key]);
   }
   const meta = await collectMeta(env);
   const kv = meta.kv;
@@ -4516,14 +4839,15 @@ async function createBackup(env, reason) {
   }
   const snap = {
     version: APP_VERSION, created: new Date().toISOString(), reason: reason || 'manual',
-    incremental: !!base, base, chain, removed, truncated: meta.truncated,
+    incremental: !!base, base, chain, chainPath, removed, truncated: meta.truncated,
     dirs: storeDirs, checksums, kv
   };
   const body = JSON.stringify(snap);
+  if (utf8Bytes(body) > Math.max(backupMaxBytes(env) * 4, 16 * 1024 * 1024)) return { ok: false, error: 'Backup too large (metadata tree exceeds limit)', size: utf8Bytes(body), created: '' };
   const key = BACKUP_PREFIX + new Date().toISOString().substring(0, 10) + '-' + Date.now().toString(36) + '-' + randToken().substring(0, 6) + '.json';
   await env.DRIVE.put(key, body, { httpMetadata: { contentType: 'application/json' } });
   try {
-    await env.STORE.put('meta:backupidx', JSON.stringify({ key, created: snap.created, base, chain, checksums, dirs: dirCount }), { expirationTtl: 400 * 86400 });
+    await env.STORE.put('meta:backupidx', JSON.stringify({ key, created: snap.created, base, chain, chainPath, checksums, dirs: dirCount }), { expirationTtl: 400 * 86400 });
   } catch (e) {}
   // 备份保留策略：既限制份数，也限制总占用（防止快照把 R2 撑爆）
   try {
@@ -4536,11 +4860,18 @@ async function createBackup(env, reason) {
     });
     const keep = backupKeep(env);
     const totalMax = backupTotalBytes(env);
+    // 当前增量链的祖先快照必须保留，否则链会断、恢复静默不完整
+    const idxNow = await backupIndex(env);
+    const protectedKeys = new Set();
+    if (idxNow) {
+      protectedKeys.add(idxNow.key);
+      for (const ck of (Array.isArray(idxNow.chainPath) ? idxNow.chainPath : [])) protectedKeys.add(ck);
+    }
     let acc = 0;
     for (let i = 0; i < objs.length; i++) {
       const o = objs[i];
       acc += o.size || 0;
-      if (i >= keep || acc > totalMax) { try { await env.DRIVE.delete(o.key); } catch (e) {} }
+      if ((i >= keep || acc > totalMax) && !protectedKeys.has(o.key)) { try { await env.DRIVE.delete(o.key); } catch (e) {} }
     }
   } catch (e) {}
   return {
@@ -4554,6 +4885,7 @@ async function handleBackupDiff(env, key) {
   if (!key || String(key).indexOf(BACKUP_PREFIX) !== 0) return json({ error: 'Bad key' }, 400);
   const snap = await resolveSnapshot(env, key, false);
   if (!snap.chain) return json({ error: 'Not found' }, 404);
+  if (snap.broken) return json({ error: 'Backup chain incomplete (missing base snapshot)', missing: snap.missing || '', chain: snap.chain }, 409);
   const cur = await collectDirs(env);
   const added = [], removed = [], changed = [];
   for (const p of Object.keys(snap.dirs)) {
@@ -4590,6 +4922,7 @@ async function handleBackupRestore(env, key, password) {
   if (!key || String(key).indexOf(BACKUP_PREFIX) !== 0) return json({ error: 'Bad key' }, 400);
   const resolved = await resolveSnapshot(env, String(key), true);
   if (!resolved.chain) return json({ error: 'Not found' }, 404);
+  if (resolved.broken) return json({ error: 'Backup chain incomplete (missing base snapshot), restore refused', missing: resolved.missing || '', chain: resolved.chain }, 409);
   const snap = { dirs: resolved.dirs, kv: resolved.kv, created: resolved.created, truncated: resolved.truncated };
   let dirs = 0, kvN = 0;
   if (snap.dirs && typeof snap.dirs === 'object') {
@@ -4601,9 +4934,15 @@ async function handleBackupRestore(env, key, password) {
     }
   }
   if (snap.kv && typeof snap.kv === 'object') {
+    const okKeys = new Set(['meta:tags', 'meta:favs', 'meta:recent', 'meta:autorule', 'meta:usage', 'meta:dlstat', 'meta:favgroups', 'meta:albums', 'meta:config', 'meta:dirrules', 'meta:cron', 'meta:bookmarks', 'meta:webhook']);
+    const okPrefixes = ['note:', 'tags:', 'share:', 'ulink:', 'dirpass:', 'versions:'];
     for (const k of Object.keys(snap.kv)) {
-      // 敏感密钥：不随快照回滚
-      if (k.indexOf('meta:adminpass') === 0 || k.indexOf('meta:totp') === 0 || k.indexOf('session:') === 0 || k.indexOf('meta:tokens') === 0) continue;
+      // 只允许恢复已知的元数据键（敏感密钥与任意键写入都被拒绝）
+      const allowed = okKeys.has(k) || okPrefixes.some(pr => k.indexOf(pr) === 0);
+      if (!allowed) continue;
+      if (k === 'meta:config') {
+        try { const vv = validateConfig(JSON.parse(snap.kv[k])); if (vv.errs.length) continue; } catch (e) { continue; }
+      }
       try { await env.STORE.put(k, snap.kv[k]); kvN++; } catch (e) {}
     }
   }
@@ -4758,6 +5097,7 @@ async function handleCron(env, req, url) {
     return json({ ok: true, jobs: list });
   }
   if (b && b.run) {
+    if (!await checkAdminPassword(env, (b && b.password) || '')) return json({ error: 'Wrong password' }, 403);
     const jobs = await getCronJobs(env);
     const job = jobs.find(j => j.id === b.run);
     if (!job) return json({ error: 'Not found' }, 404);
@@ -4769,6 +5109,7 @@ async function handleCron(env, req, url) {
   if (['ttl-dir', 'clean-dir', 'archive'].indexOf(kind) < 0) return json({ error: 'Bad kind' }, 400);
   const path = normPath((b && b.path) || '/');
   if (path === '/') return json({ error: 'Refusing to run on root' }, 400);
+  if (await isPathLocked(env, path, '')) return json({ locked: true, path }, 423);
   const daysRaw = parseInt((b && b.days), 10);
   const job = {
     id: randToken().substring(0, 10), kind, path,
@@ -4786,6 +5127,8 @@ async function handleCron(env, req, url) {
 async function runCronJob(env, job) {
   const out = { id: job.id, kind: job.kind, path: job.path, moved: 0, deleted: 0, bytes: 0, errors: 0 };
   try {
+    // 任务运行前再查一次目录锁：避免"配置时未锁、后来加锁"的目录被定时任务删掉
+    if (await isPathLocked(env, job.path, '')) { out.errors++; job.lastResult = 'locked'; return out; }
     const items = await getDir(env, job.path);
     const cutoff = Date.now() - (job.days || 0) * 86400000;
     for (const it of items) {
@@ -4812,8 +5155,8 @@ async function runCronJob(env, job) {
         }
       } else if (job.kind === 'archive') {
         const sub = new Date(ts).toISOString().substring(0, 7).replace('-', '/');
-        await ensureDir(env, job.path, 'archive');
-        await ensureDir(env, job.path + 'archive/', sub.replace(/\/$/, ''));
+        if (!await ensureDir(env, job.path, 'archive')) continue;
+        if (!await ensureDir(env, job.path + 'archive/', sub.replace(/\/$/, ''))) continue;
         const r = await handleMove(env, srcRel, job.path + 'archive/' + sub + '/');
         if (r && r.status === 200) out.moved++; else out.errors++;
       }
@@ -4844,8 +5187,9 @@ async function handleImportWebdav(env, b) {
   let u;
   try { u = new URL(base); } catch (e) { return json({ error: 'Bad url' }, 400); }
   if (u.protocol !== 'https:' && u.protocol !== 'http:') return json({ error: 'Only http(s)' }, 400);
-  if (await resolveAndCheckHost(u.hostname)) return json({ error: 'Blocked host' }, 403);
+  if (await resolveAndCheckHost(u.hostname, true)) return json({ error: 'Blocked host' }, 403);
   const target = normPath((b && b.path) || '/');
+  if (isInternalPath(target)) return json({ error: 'Bad path' }, 400);
   if (await isPathLocked(env, target, '')) return json({ locked: true, path: target }, 423);
   const auth = (b && b.user) ? 'Basic ' + btoa(String(b.user) + ':' + String(b.pass || '')) : '';
   const maxFiles = Math.min(Math.max(parseInt((b && b.maxFiles), 10) || 100, 1), 200);
@@ -4855,9 +5199,11 @@ async function handleImportWebdav(env, b) {
     const out = [];
     const r = await fetch(dirUrl, {
       method: 'PROPFIND',
+      redirect: 'manual',
       headers: Object.assign({ Depth: '1', 'Content-Type': 'application/xml' }, auth ? { Authorization: auth } : {}),
       body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/><D:getcontentlength/></D:prop></D:propfind>'
     });
+    if (r.status >= 300) throw new Error('PROPFIND redirect/HTTP ' + r.status);
     if (!r.ok) throw new Error('PROPFIND HTTP ' + r.status);
     const xml = await r.text();
     const blocks = xml.match(/<(?:D:)?response[\s\S]*?<\/(?:D:)?response>/gi) || [];
@@ -4868,7 +5214,10 @@ async function handleImportWebdav(env, b) {
       try { href = decodeURIComponent(href); } catch (e) {}
       const isDir = /<(?:D:)?collection\s*\/?>/i.test(blk);
       const sizeM = /<(?:D:)?getcontentlength>(\d+)</i.exec(blk);
-      const full = new URL(href, dirUrl).toString();
+      let full;
+      try { full = new URL(href, dirUrl).toString(); } catch (e) { continue; }
+      // 只允许与配置的 WebDAV 同源，防止远端返回内网 href 造成 SSRF
+      try { if (new URL(full).host !== u.host) continue; } catch (e) { continue; }
       if (full.replace(/\/+$/, '') === dirUrl.replace(/\/+$/, '')) continue;
       out.push({ url: full, name: href.replace(/\/+$/, '').split('/').pop(), dir: isDir, size: sizeM ? parseInt(sizeM[1], 10) : 0 });
     }
@@ -4890,7 +5239,7 @@ async function handleImportWebdav(env, b) {
       const chk = await checkDirRule(env, cur.dir, name, e.size || 0);
       if (chk) { skipped++; continue; }
       try {
-        const rr = await fetch(e.url, { headers: auth ? { Authorization: auth } : {} });
+        const rr = await fetch(e.url, { headers: auth ? { Authorization: auth } : {}, redirect: 'manual' });
         if (!rr.ok) { failed++; continue; }
         const ab = await rr.arrayBuffer();
         if (bytes + ab.byteLength > maxBytes) { failed++; continue; }
@@ -5116,7 +5465,10 @@ async function scanOrphans(env) {
   }
   for (const e of entries) { if (!present.has(e.key)) missing.push(e); }
   return {
-    capped: listed.capped, scannedObjects: listed.keys.length, scannedFiles: entries.length,
+    capped: listed.capped,
+    incomplete: !!(COLLECT_DIRS_HEALTH.failed > 0 || COLLECT_DIRS_HEALTH.depthCut > 0),
+    readFailed: COLLECT_DIRS_HEALTH.failed, depthCut: COLLECT_DIRS_HEALTH.depthCut,
+    scannedObjects: listed.keys.length, scannedFiles: entries.length,
     orphans: orphanFiles.slice(0, 500), orphansTotal: orphanFiles.length, orphansBytes: orphanFiles.reduce(function (s, x) { return s + (x.size || 0); }, 0),
     internal: orphanInternal.slice(0, 500), internalTotal: orphanInternal.length,
     missing: missing.slice(0, 500), missingTotal: missing.length
@@ -5183,10 +5535,12 @@ async function gcInternalObjects(env, limit) {
     } while (cursor && checked < limit);
   } catch (e) {}
   return removed;
-}async function handlePurgeOrphans(env, mode) {
+}async function handlePurgeOrphans(env, mode, password) {
+  if (!await checkAdminPassword(env, password || '')) return json({ error: 'Wrong password' }, 403);
   const data = await scanOrphans(env);
-  // R3: 扫描被截断（对象数超过 2 万上限）时拒绝清理，防止误删
+  // R3: 扫描被截断或目录元数据读取不完整时拒绝清理，防止误删有效对象
   if (data.capped) return json({ error: 'Scan incomplete, purge refused', capped: true }, 409);
+  if (data.incomplete) return json({ error: 'Directory metadata read incomplete, purge refused', incomplete: true, readFailed: data.readFailed || 0, depthCut: data.depthCut || 0 }, 409);
   let deleted = 0, removed = 0;
   if (mode === 'objects' || mode === 'all') {
     for (const o of (data.orphans || [])) { try { await deleteAndMirror(env, o.key); deleted++; } catch (e) {} }
@@ -5216,7 +5570,7 @@ async function handleSetWebhook(env, b) {
     try {
       const u = new URL(url);
       if (u.protocol !== 'http:' && u.protocol !== 'https:') return json({ error: 'Only http(s)' }, 400);
-      if (await resolveAndCheckHost(u.hostname)) return json({ error: 'Blocked host' }, 403);
+      if (await resolveAndCheckHost(u.hostname, true)) return json({ error: 'Blocked host' }, 403);
     } catch (e) { return json({ error: 'Bad url' }, 400); }
   }
   const prev = await getWebhook(env);
@@ -5244,8 +5598,8 @@ async function notifyWebhook(env, payload) {
     const headers = { 'Content-Type': 'application/json', 'User-Agent': 'BlueDrift/' + APP_VERSION };
     if (w.secret) headers['X-Signature'] = 'sha256=' + await sha256HexBytes(new TextEncoder().encode(w.secret + ':' + body));
     // L4: 发送前二次校验目标 host，防 SSRF
-    try { const tu = new URL(w.url); if (await resolveAndCheckHost(tu.hostname)) return; } catch (e) { return; }
-    await fetch(w.url, { method: 'POST', headers, body, signal: AbortSignal.timeout(3000) });
+    try { const tu = new URL(w.url); if (await resolveAndCheckHost(tu.hostname, true)) return; } catch (e) { return; }
+    await fetch(w.url, { method: 'POST', headers, body, signal: AbortSignal.timeout(3000), redirect: 'manual' });
   } catch (e) {}
 }
 async function handleWebhookTest(env) {
@@ -5255,7 +5609,7 @@ async function handleWebhookTest(env) {
     const body = JSON.stringify({ version: APP_VERSION, event: 'test', path: '/', detail: '测试通知', at: new Date().toISOString() });
     const headers = { 'Content-Type': 'application/json', 'User-Agent': 'BlueDrift/' + APP_VERSION };
     if (w.secret) headers['X-Signature'] = 'sha256=' + await sha256HexBytes(new TextEncoder().encode(w.secret + ':' + body));
-    const r = await fetch(w.url, { method: 'POST', headers, body, signal: AbortSignal.timeout(5000) });
+    const r = await fetch(w.url, { method: 'POST', headers, body, signal: AbortSignal.timeout(5000), redirect: 'manual' });
     return json({ ok: r.ok, status: r.status });
   } catch (e) { return json({ error: (e && e.message) || 'failed' }, 502); }
 }
@@ -5275,14 +5629,15 @@ async function handleListAlbums(env) {
 }
 async function handleCreateAlbum(env, path, name, password) {
   const dir = normPath(path || '/');
+  if (isInternalPath(dir)) return json({ error: 'Bad path' }, 400);
   if (await isPathLocked(env, dir, '')) return json({ locked: true, path: dir }, 423);
   const albums = (await getAlbums(env)).slice();
   const id = randToken().substring(0, 16);
   const nm = sanitizeName(name || dir.split('/').filter(Boolean).pop() || '相册');
   const rec = { id, path: dir, name: nm, created: new Date().toISOString() };
   if (password) {
-    rec.pwSalt = randToken().substring(0, 16);
-    rec.pwHash = await hashPassword(String(password), rec.pwSalt);
+    const pr = await makePasswordRecord(String(password));
+    rec.pwSalt = pr.salt; rec.pwHash = pr.hash; rec.pwKdf = pr.kdf; rec.pwIter = pr.iter;
   }
   albums.push(rec);
   await env.STORE.put('meta:albums', JSON.stringify(albums));
@@ -5295,10 +5650,10 @@ async function handleAlbumUpdate(env, id, b) {
   if (!a) return json({ error: 'Not found' }, 404);
   if (b && b.name !== undefined) a.name = sanitizeName(String(b.name || a.name));
   if (b && b.password !== undefined) {
-    if (!b.password) { delete a.pwHash; delete a.pwSalt; }
+    if (!b.password) { delete a.pwHash; delete a.pwSalt; delete a.pwKdf; delete a.pwIter; }
     else {
-      a.pwSalt = randToken().substring(0, 16);
-      a.pwHash = await hashPassword(String(b.password), a.pwSalt);
+      const pr = await makePasswordRecord(String(b.password));
+      a.pwSalt = pr.salt; a.pwHash = pr.hash; a.pwKdf = pr.kdf; a.pwIter = pr.iter;
     }
   }
   await env.STORE.put('meta:albums', JSON.stringify(albums));
@@ -5315,19 +5670,27 @@ async function albumGuard(env, req, a) {
   if (await isPathLocked(env, a.path, '')) return { resp: json({ error: 'Locked' }, 423) };
   if (a.pwHash) {
     const pw = (req ? (reqURL(req).searchParams.get('pw') || '') : '');
-    if (!await verifyPassword(pw, { hash: a.pwHash, salt: a.pwSalt })) return { resp: json({ error: 'Wrong password', needPassword: true, hasPassword: true, name: a.name }, 403) };
+    const ip = (req && req.headers && req.headers.get('CF-Connecting-IP')) || '';
+    const fk = 'albumpwfail:' + a.id + ':' + (ip || 'x');
+    try { const f = await env.STORE.get(fk, 'json'); if (f && f.n >= 8 && Date.now() - f.t < 600000) return { resp: json({ error: 'Too many attempts, wait 10min' }, 429) }; } catch (e) {}
+    if (!await verifyPassword(pw, { hash: a.pwHash, salt: a.pwSalt, kdf: a.pwKdf, iter: a.pwIter })) {
+      try { const f = (await env.STORE.get(fk, 'json')) || { n: 0, t: 0 }; f.n = Date.now() - f.t > 600000 ? 1 : f.n + 1; f.t = Date.now(); await env.STORE.put(fk, JSON.stringify(f), { expirationTtl: 900 }); } catch (e) {}
+      return { resp: json({ error: 'Wrong password', needPassword: true, hasPassword: true, name: a.name }, 403) };
+    }
+    try { await env.STORE.delete(fk); } catch (e) {}
   }
   return { ok: true };
 }
-async function collectMedia(env, dirPath, out, depth, kind, cap) {
+async function collectMedia(env, dirPath, out, depth, kind, cap, locked) {
   const limit = cap || 300;
   if (depth > 8 || out.length >= limit) return;
+  if (locked && locked.size && (isLockedPrefix(dirPath, locked) || insideLocked(dirPath, locked))) return;   // 锁定目录（含嵌套，含根目录自身）不参与公开相册/媒体扫描
   let items = [];
   try { items = await getDir(env, dirPath); } catch (e) {}
   for (const it of items) {
     if (out.length >= limit) return;
     if (!it || !it.name) continue;
-    if (it.type === 'dir') { await collectMedia(env, dirPath + it.name + '/', out, depth + 1, kind, limit); continue; }
+    if (it.type === 'dir') { await collectMedia(env, dirPath + it.name + '/', out, depth + 1, kind, limit, locked); continue; }
     const m = String(it.mime || '');
     const isImg = m.indexOf('image/') === 0;
     const isVid = m.indexOf('video/') === 0;
@@ -5341,12 +5704,12 @@ async function collectMedia(env, dirPath, out, depth, kind, cap) {
   }
 }
 // 媒体清单（相似图片/相册等复用；带 ph 感知哈希）
-async function handleMediaList(env, q) {
+async function handleMediaList(env, q, sessionToken) {
   const dir = normPath(q.path || '/');
   const kind = String(q.kind || 'media');
   const limit = Math.min(Math.max(parseInt(q.limit, 10) || 500, 1), 2000);
   const out = [];
-  await collectMedia(env, dir, out, 0, kind, limit);
+  await collectMedia(env, dir, out, 0, kind, limit, await unlockedPrefixes(env, sessionToken || ''));
   out.sort(function (x, y) { return String(y.time).localeCompare(String(x.time)); });
   return json({ path: dir, kind, count: out.length, items: out, capped: out.length >= limit });
 }
@@ -5372,7 +5735,7 @@ async function handleAlbumList(env, req, id) {
   const offset = Math.max(0, parseInt(url.searchParams.get('offset'), 10) || 0);
   const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit'), 10) || 60, 1), 300);
   const out = [];
-  await collectMedia(env, a.path, out, 0, 'media', 600);
+  await collectMedia(env, a.path, out, 0, 'media', 600, await getLockedPrefixes(env));
   out.sort(function (x, y) { return String(y.time).localeCompare(String(x.time)); });
   const page = out.slice(offset, offset + limit);
   return json({
@@ -5392,6 +5755,8 @@ async function handleAlbumRaw(env, req, id) {
   if (!k || k.indexOf(base) !== 0 || k.indexOf('..') >= 0) return json({ error: 'Forbidden' }, 403);
   // 内部对象（.backup/.versions/.thumb/.trash/.chunks）不得通过公开相册读取
   if (k.split('/').some(seg => seg.charAt(0) === '.')) return json({ error: 'Forbidden' }, 403);
+  if (isInternalPath(k)) return json({ error: 'Forbidden' }, 403);
+  if (await isPathLocked(env, parentOf('/' + k), '')) return json({ error: 'Locked' }, 423);
   const dl = q.searchParams.get('dl') === '1';
   const filename = k.split('/').pop() || 'file';
   return await serveObject(env, req, k, dl
@@ -5591,6 +5956,7 @@ function swJS() {
     "  await Promise.all(ks.filter(k=>k!==SHELL&&k!==DATA&&k!==SHARE).map(k=>caches.delete(k)));",
     "  await self.clients.claim();",
     "})()));",
+    "self.addEventListener('message',e=>{if(e.data&&e.data.type==='clear-data'){e.waitUntil(Promise.all([caches.delete(DATA),caches.delete(SHARE)]).then(()=>self.clients.matchAll({includeUncontrolled:true,type:'window'})).then(cs=>cs.forEach(c=>{try{c.postMessage({type:'cleared'})}catch(_){}})))}});",
     // 分享目标：把文件暂存到缓存，通知页面并跳转回去
     "async function handleShare(req){",
     "  try{",
@@ -5660,9 +6026,12 @@ async function handleUploadViaLink(req, env, linkToken) {
     if (file.size > maxUploadBytes(env)) return json({ error: 'File too large', max: maxUploadBytes(env) }, 413);
 
     const dirPath = normPath(data.path);
+    if (isInternalPath(dirPath)) return json({ error: 'Bad path' }, 400);
     if (await isPathLocked(env, dirPath, '')) return json({ locked: true, path: dirPath }, 423);
 
-    const safeName = sanitizeName(file.name);
+    // 上传链接默认只新增不覆盖：拿到链接的访客不能静默替换已有文件
+    const baseName = sanitizeName(file.name);
+    const safeName = await uniqueFileName(env, dirPath, baseName);
     const key = dirPath.replace(/^\//, '') + safeName;
     if (pathTooLong('/' + key)) return json({ error: 'Path too long', max: PATH_MAX }, 400);
 
@@ -5715,6 +6084,7 @@ async function handlePublicUpload(req, env) {
   if (file.size > publicUploadMax(env)) return json({ error: 'File too large' }, 413);
   const u = await getUsage(env);
   if ((u.used || 0) + file.size > quotaTotal(env)) return json({ error: 'Quota exceeded' }, 413);
+  if (isInternalPath(dir)) return json({ error: 'Bad path' }, 400);
   const pubRule = await checkDirRule(env, dir, sanitizeName(file.name), file.size);
   if (pubRule) return json({ error: pubRule.error }, 403);
   try {
@@ -5813,16 +6183,28 @@ async function handleClearDlStats(env) {
 }
 
 // ===== Folder Password =====
-async function handleSetFolderPass(env, dirPath, password) {
+async function handleSetFolderPass(env, dirPath, password, oldPassword, sessionToken) {
   dirPath = normPath(dirPath);
+  if (isInternalPath(dirPath)) return json({ error: 'Bad path' }, 400);
+  const cur = await env.STORE.get('dirpass:' + dirPath, 'json');
+  if (cur) {
+    // 已存在锁：必须提供旧密码，或当前会话已解锁该目录，否则任何会话都能一键清锁
+    let ok = false;
+    if (oldPassword) ok = await verifyPassword(oldPassword, cur);
+    if (!ok && sessionToken) {
+      try {
+        const u = await env.STORE.get('unlock:' + sessionToken + ':' + dirPath, 'json');
+        ok = !!(u && Date.now() < u.exp);
+      } catch (e) {}
+    }
+    if (!ok) return json({ error: 'Current password required', needPassword: true }, 403);
+  }
   if (!password) {
     await env.STORE.delete('dirpass:' + dirPath);
     kvInvalidate('dirpass-list'); kvInvalidate('dirpass:' + dirPath);
     return json({ ok: true, removed: true });
   }
-  const salt = randToken().substring(0, 16);
-  const hash = await hashPassword(password, salt);
-  await env.STORE.put('dirpass:' + dirPath, JSON.stringify({ hash, salt }));
+  await env.STORE.put('dirpass:' + dirPath, JSON.stringify(await makePasswordRecord(password)));
   kvInvalidate('dirpass-list'); kvInvalidate('dirpass:' + dirPath);
   return json({ ok: true });
 }
@@ -5852,63 +6234,77 @@ function crc32Update(crc, buf) {
 // files: [{ key, name, size }]；上限由调用方保证
 function streamZip(env, files, filename) {
   const enc = new TextEncoder();
+  // 状态机 + pull 驱动：消费者拉一次才读一块，天然具备背压，避免慢速下载把内存撑爆
+  const st = { phase: 'next', fi: 0, reader: null, crc: 0xFFFFFFFF, size: 0, offset: 0, localOffset: 0, nameBytes: null };
+  const central = [];
   const stream = new ReadableStream({
-    async start(controller) {
-      let offset = 0;
-      const central = [];
-      const put = (u8) => { controller.enqueue(u8); offset += u8.length; };
+    async pull(controller) {
       try {
-        for (const f of files) {
-          const nameBytes = enc.encode(f.name);
-          const localOffset = offset;
-          const lh = new Uint8Array(30);
-          const lv = new DataView(lh.buffer);
-          lv.setUint32(0, 0x04034B50, true); lv.setUint16(4, 20, true);
-          lv.setUint16(6, 0x0008, true);                     // 使用数据描述符（CRC/大小后置）
-          lv.setUint16(8, 0, true); lv.setUint16(10, 0, true); lv.setUint16(12, 0, true);
-          lv.setUint32(14, 0, true); lv.setUint32(18, 0, true); lv.setUint32(22, 0, true);
-          lv.setUint16(26, nameBytes.length, true); lv.setUint16(28, 0, true);
-          put(lh); put(nameBytes);
-          let crc = 0xFFFFFFFF, size = 0;
-          let obj = null;
-          try { obj = await env.DRIVE.get(f.key); } catch (e) { obj = null; }
-          if (obj && obj.body) {
-            const reader = obj.body.getReader();
-            for (;;) {
-              const r = await reader.read();
-              if (r.done) break;
-              const chunk = r.value instanceof Uint8Array ? r.value : new Uint8Array(r.value);
-              crc = crc32Update(crc, chunk);
-              size += chunk.length;
-              put(chunk);
+        for (;;) {
+          if (st.phase === 'data') {
+            if (st.reader) {
+              const r = await st.reader.read();
+              if (!r.done) {
+                const chunk = r.value instanceof Uint8Array ? r.value : new Uint8Array(r.value);
+                st.crc = crc32Update(st.crc, chunk);
+                st.size += chunk.length;
+                st.offset += chunk.length;
+                controller.enqueue(chunk);
+                return;
+              }
+              st.reader = null;
             }
+            const crcFinal = (st.crc ^ 0xFFFFFFFF) >>> 0;
+            const dd = new Uint8Array(16);
+            const dv = new DataView(dd.buffer);
+            dv.setUint32(0, 0x08074B50, true); dv.setUint32(4, crcFinal, true);
+            dv.setUint32(8, st.size, true); dv.setUint32(12, st.size, true);
+            st.offset += dd.length;
+            controller.enqueue(dd);
+            const ch = new Uint8Array(46 + st.nameBytes.length);
+            const cv = new DataView(ch.buffer);
+            cv.setUint32(0, 0x02014B50, true); cv.setUint16(4, 20, true); cv.setUint16(6, 20, true);
+            cv.setUint16(8, 0x0008, true); cv.setUint16(10, 0, true); cv.setUint16(12, 0, true); cv.setUint16(14, 0, true);
+            cv.setUint32(16, crcFinal, true); cv.setUint32(20, st.size, true); cv.setUint32(24, st.size, true);
+            cv.setUint16(28, st.nameBytes.length, true); cv.setUint32(42, st.localOffset, true);
+            ch.set(st.nameBytes, 46);
+            central.push(ch);
+            st.phase = 'next'; st.nameBytes = null;
+            continue;
           }
-          const crcFinal = (crc ^ 0xFFFFFFFF) >>> 0;
-          const dd = new Uint8Array(16);
-          const dv = new DataView(dd.buffer);
-          dv.setUint32(0, 0x08074B50, true);
-          dv.setUint32(4, crcFinal, true);
-          dv.setUint32(8, size, true);
-          dv.setUint32(12, size, true);
-          put(dd);
-          const ch = new Uint8Array(46 + nameBytes.length);
-          const cv = new DataView(ch.buffer);
-          cv.setUint32(0, 0x02014B50, true); cv.setUint16(4, 20, true); cv.setUint16(6, 20, true);
-          cv.setUint16(8, 0x0008, true); cv.setUint16(10, 0, true); cv.setUint16(12, 0, true); cv.setUint16(14, 0, true);
-          cv.setUint32(16, crcFinal, true); cv.setUint32(20, size, true); cv.setUint32(24, size, true);
-          cv.setUint16(28, nameBytes.length, true); cv.setUint32(42, localOffset, true);
-          ch.set(nameBytes, 46);
-          central.push(ch);
+          if (st.phase === 'next') {
+            if (st.fi >= files.length) {
+              let cdSize = 0;
+              for (const c of central) { controller.enqueue(c); cdSize += c.length; }
+              const eocd = new Uint8Array(22);
+              const ev = new DataView(eocd.buffer);
+              ev.setUint32(0, 0x06054B50, true);
+              ev.setUint16(8, central.length, true); ev.setUint16(10, central.length, true);
+              ev.setUint32(12, cdSize, true); ev.setUint32(16, st.offset, true);
+              controller.enqueue(eocd);
+              controller.close();
+              return;
+            }
+            const f = files[st.fi++];
+            st.nameBytes = enc.encode(f.name);
+            st.localOffset = st.offset;
+            const lh = new Uint8Array(30);
+            const lv = new DataView(lh.buffer);
+            lv.setUint32(0, 0x04034B50, true); lv.setUint16(4, 20, true);
+            lv.setUint16(6, 0x0008, true);
+            lv.setUint16(8, 0, true); lv.setUint16(10, 0, true); lv.setUint16(12, 0, true);
+            lv.setUint32(14, 0, true); lv.setUint32(18, 0, true); lv.setUint32(22, 0, true);
+            lv.setUint16(26, st.nameBytes.length, true); lv.setUint16(28, 0, true);
+            st.offset += lh.length + st.nameBytes.length;
+            controller.enqueue(lh); controller.enqueue(st.nameBytes);
+            st.crc = 0xFFFFFFFF; st.size = 0; st.phase = 'data';
+            let obj = null;
+            try { obj = await env.DRIVE.get(f.key); } catch (e) { obj = null; }
+            st.reader = (obj && obj.body) ? obj.body.getReader() : null;
+            return;
+          }
+          return;
         }
-        let cdSize = 0;
-        for (const c of central) { put(c); cdSize += c.length; }
-        const eocd = new Uint8Array(22);
-        const ev = new DataView(eocd.buffer);
-        ev.setUint32(0, 0x06054B50, true);
-        ev.setUint16(8, central.length, true); ev.setUint16(10, central.length, true);
-        ev.setUint32(12, cdSize, true); ev.setUint32(16, offset, true);
-        put(eocd);
-        controller.close();
       } catch (e) {
         try { controller.error(e); } catch (e2) {}
       }
@@ -6020,6 +6416,7 @@ async function handleShareZip(env, req, shareToken, g) {
   const r = await collectZipFiles(env, dir, '', { maxFiles: 500, maxBytes: 512 * 1024 * 1024 });
   if (!r.files.length) return json({ error: 'Empty folder' }, 404);
   if (r.hitLimit) return json({ error: 'Too large to zip (max 500 files / 512MB)' }, 413);
+  if (d.once && !await consumeShareOnce(env, shareToken)) return json({ error: 'Download already used', once: true }, 410);
   await shareCount(env, shareToken, d);   // 打包下载计入一次访问
   const folderName = r.dir.replace(/\/+$/, '').split('/').pop() || 'files';
   return streamZip(env, r.files, folderName + '.zip');
@@ -6027,9 +6424,17 @@ async function handleShareZip(env, req, shareToken, g) {
 
 // ===== 远程 URL 抓取（离线下载）：带 SSRF 防护 =====
 const DNS_CACHE = new Map();   // host -> {t, blocked}，避免每条通知都做一次 DoH 查询
+function isBlockedV6(h) {
+  if (!h) return true;
+  if (h === '::' || h === '::1') return true;
+  if (/^::ffff:/i.test(h)) return isBlockedHost(h.substring(7));
+  if (/^(fc|fd|fe[89ab]|ff)/i.test(h)) return true;
+  return false;
+}
 function isBlockedHost(hostname) {
   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
   if (!h) return true;
+  if (h.indexOf(':') >= 0) return isBlockedV6(h);
   if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.home.arpa')) return true;
   if (h === '::1' || h === '0:0:0:0:0:0:0:1') return true;
   if (/^(fc|fd|fe[89a-f])/.test(h)) return true;
@@ -6045,26 +6450,30 @@ function isBlockedHost(hostname) {
   }
   return false;
 }
-async function resolveAndCheckHost(hostname) {
-  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '').split(':')[0];
+async function resolveAndCheckHost(hostname, failClosed) {
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
   if (!h) return true;
   if (isBlockedHost(h)) return true;
+  // IP 字面量：只做本地判断
   if (/^[\d.]+$/.test(h) || h.indexOf(':') >= 0) return isBlockedHost(h);
-  // 结果缓存 5 分钟：notifyWebhook 每次通知都要校验，避免重复 DoH 查询与延迟
   const now = Date.now();
   const hit = DNS_CACHE.get(h);
   if (hit && now - hit.t < 300000) return hit.blocked;
   let blocked = false;
+  const query = async (type) => {
+    const dns = await fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(h) + '&type=' + type, { headers: { accept: 'application/dns-json' } });
+    if (!dns.ok) throw new Error('doh ' + dns.status);
+    const dj = await dns.json();
+    for (const a of ((dj && dj.Answer) || [])) { if (a && isBlockedHost(String(a.data))) return true; }
+    return false;
+  };
   try {
-    const dns = await fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(h) + '&type=A', { headers: { accept: 'application/dns-json' } });
-    if (dns.ok) {
-      const dj = await dns.json();
-      const answers = (dj && dj.Answer) || [];
-      for (const a of answers) {
-        if (a && a.type === 1 && isBlockedHost(String(a.data))) { blocked = true; break; }
-      }
-    }
-  } catch (e) { return false; }   // 查询失败时不缓存，保持原有放行语义
+    blocked = await query('A');
+    if (!blocked) blocked = await query('AAAA');
+  } catch (e) {
+    // 高风险调用（URL 抓取/导入/Webhook 配置）解析失败时 fail-closed；webhook 发送保持放行
+    return failClosed ? true : false;
+  }
   if (DNS_CACHE.size > 500) DNS_CACHE.clear();
   DNS_CACHE.set(h, { t: now, blocked });
   return blocked;
@@ -6077,9 +6486,10 @@ async function handleFetchUrl(req, env, b) {
   let u;
   try { u = new URL(raw); } catch (e) { return json({ error: 'Bad url' }, 400); }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return json({ error: 'Only http(s)' }, 400);
-  if (await resolveAndCheckHost(u.hostname)) return json({ error: 'Blocked host' }, 403);
+  if (await resolveAndCheckHost(u.hostname, true)) return json({ error: 'Blocked host' }, 403);
   const dir = normPath((b && b.dir) || '/');
   if (await isPathLocked(env, dir, '')) return json({ locked: true, path: dir }, 423);
+  if (isInternalPath(dir)) return json({ error: 'Bad path' }, 400);
   const maxBytes = (Number(env && env.FETCH_MAX_BYTES) > 0) ? Number(env.FETCH_MAX_BYTES) : 200 * 1024 * 1024;
   const MAX_REDIRECTS = 5;
   let current = u.toString();
@@ -6093,7 +6503,7 @@ async function handleFetchUrl(req, env, b) {
         let next;
         try { next = new URL(loc, current); } catch (e) { return json({ error: 'Bad redirect' }, 502); }
         if (next.protocol !== 'http:' && next.protocol !== 'https:') return json({ error: 'Blocked redirect' }, 403);
-        if (await resolveAndCheckHost(next.hostname)) return json({ error: 'Blocked host' }, 403);
+        if (await resolveAndCheckHost(next.hostname, true)) return json({ error: 'Blocked host' }, 403);
         current = next.toString();
         continue;
       }
@@ -6165,6 +6575,12 @@ async function instantStore(env, hash, name, dir, size) {
   const key = dir.replace(/^\//, '') + finalName;
   const mime = (obj.httpMetadata && obj.httpMetadata.contentType) || '';
   const sz = obj.size || size || 0;
+  if (idx.size && sz !== idx.size) { try { await env.STORE.delete('hash:' + hash); } catch (e) {} return { hit: false }; }
+  if (size && sz !== size) return { hit: false };
+  const u = await getUsage(env);
+  if ((u.used || 0) + sz > quotaTotal(env)) return { hit: false };
+  const ruleChk = await checkDirRule(env, dir, sanitizeName(name || idx.key.split('/').pop() || 'file'), sz);
+  if (ruleChk) return { hit: false };
   if (pathTooLong('/' + key)) return { hit: false };
   const room = await dirRoom(env, dir, 1);
   if (room) return { hit: false };
@@ -6223,7 +6639,7 @@ async function applyAutoArchive(env, dirPath, name, mime) {
     for (const seg of archiveSubdir(rule.mode, name, mime).split('/').filter(Boolean)) {
       const s = sanitizeName(seg);
       if (!s) continue;
-      await ensureDir(env, cur, s);
+      if (!await ensureDir(env, cur, s)) return dirPath;
       cur = cur + s + '/';
     }
     return cur;
@@ -6249,6 +6665,7 @@ function parseZip(buf) {
   if (cdOffset + cdSize > buf.length) return { error: 'Bad zip (CD out of range)' };
 
   const entries = [];
+  const seenDataStarts = new Set();
   let pos = cdOffset;
   const td = new TextDecoder('utf-8');
   for (let i = 0; i < total && pos + 46 <= buf.length; i++) {
@@ -6271,13 +6688,19 @@ function parseZip(buf) {
     const dataStart = localOffset + 30 + lNameLen + lExtraLen;
     if (dataStart + compSize > buf.length) return { error: 'Bad zip (data out of range)' };
     if (method !== 0) return { error: '仅支持 STORE（无压缩）的 ZIP，请先用本网盘打包' };
+    // 只信实际数据大小：声明值必须与实际一致，防止"声明小、写入大"绕过配额
+    if (uncompSize !== compSize) return { error: 'Bad zip (size mismatch)' };
+    // 多个条目复用同一段数据 → 放大写出，直接拒绝
+    if (seenDataStarts.has(dataStart)) return { error: 'Bad zip (duplicate data segment)' };
+    seenDataStarts.add(dataStart);
     const data = buf.subarray(dataStart, dataStart + compSize);
-    entries.push({ name, data, size: uncompSize });
+    entries.push({ name, data, size: compSize });
   }
   return { entries };
 }
 async function handleUnzip(env, zipPath) {
   zipPath = '/' + zipPath.replace(/^\/+/, '');
+  if (isInternalPath(zipPath)) return internalDenied();
   const key = zipPath.replace(/^\//, '');
   const obj = await env.DRIVE.get(key);
   if (!obj) return json({ error: 'Not found' }, 404);
@@ -6292,12 +6715,14 @@ async function handleUnzip(env, zipPath) {
   const parentDir = parentOf(zipPath);
   const zipName = key.split('/').pop();
   const folderName = sanitizeName(zipName.replace(/\.zip$/i, '')) || 'unzipped';
-  await ensureDir(env, parentDir, folderName);
+  if (!await ensureDir(env, parentDir, folderName)) return json({ error: 'Name conflicts with a file' }, 409);
   const targetDir = parentDir + folderName + '/';
 
   const usage0 = await getUsage(env);
   let usedNow = usage0.used || 0;
   let created = 0, totalSize = 0;
+  const writtenKeys = [];
+  try {
   for (const e of parsed.entries) {
     // 总量与配额双重上限
     if (e.size > UNZIP_MAX_OUT_BYTES || totalSize + e.size > UNZIP_MAX_OUT_BYTES) return json({ error: '解压总量过大（上限 ' + Math.round(UNZIP_MAX_OUT_BYTES / 1048576) + 'MB，已解出 ' + Math.round(totalSize / 1048576) + 'MB）' }, 413);
@@ -6310,12 +6735,14 @@ async function handleUnzip(env, zipPath) {
     for (const seg of relParts) {
       const safe = sanitizeName(seg);
       if (!safe) continue;
-      await ensureDir(env, curDir, safe);
+      if (!await ensureDir(env, curDir, safe)) throw new Error('Name conflict: ' + safe);
       curDir = curDir + safe + '/';
     }
     const targetKey = curDir.replace(/^\//, '') + fname;
-    await putAndMirror(env, targetKey, e.data, { httpMetadata: { contentType: 'application/octet-stream' } });
     const existing = await findDirItem(env, curDir, fname);
+    if (existing.item && existing.item.type === 'dir') throw new Error('Name conflict with folder: ' + fname);
+    await putAndMirror(env, targetKey, e.data, { httpMetadata: { contentType: 'application/octet-stream' } });
+    writtenKeys.push(targetKey);
     if (!existing.item) {
       const up = await upsertDirItem(env, curDir, { name: fname, type: 'file', size: e.size, mime: '', time: new Date().toISOString() });
       if (up && up.ok === false) return json({ error: up.error, limit: up.limit }, 507);
@@ -6328,6 +6755,12 @@ async function handleUnzip(env, zipPath) {
       await upsertDirItem(env, curDir, Object.assign({}, existing.item, { size: e.size, time: new Date().toISOString() }));
     }
     created++; totalSize += e.size;
+  }
+  } catch (err) {
+    // 失败回滚：删除本次已写入的对象，避免留下半解压产物
+    for (const k of writtenKeys) { try { await deleteAndMirror(env, k); } catch (e2) {} }
+    const msg = String((err && err.message) || err).slice(0, 160);
+    return json({ error: 'Unzip failed: ' + msg }, /conflict/i.test(msg) ? 409 : 500);
   }
   return json({ ok: true, created, totalSize, dir: targetDir });
 }
@@ -6347,13 +6780,13 @@ function page(env) {
 <link rel="icon" href="/icon.svg">
 <link rel="apple-touch-icon" href="/icon.svg">
 <title>${escHtml(brand.title)}</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js" defer></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" defer></script>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
-<script src="https://cdn.jsdelivr.net/npm/exifreader@4.23.3/dist/exif-reader.js" defer></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js" integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.7/purify.min.js" integrity="sha384-XQqX/4yiUGu+oyr87jvWzRuqBUK/adrY0DunhL+tID9m/9dwSpV8h9Fk/Sg6ifVQ" crossorigin="anonymous" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous" defer></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" integrity="sha384-wH75j6z1lH97ZOpMOInqhgKzFkAInZPPSPlZpYKYTOqsaizPvhQZmAtLcPKXpLyH" crossorigin="anonymous">
+<script src="https://cdn.jsdelivr.net/npm/exifreader@4.23.3/dist/exif-reader.js" integrity="sha384-lV3Kc4L1YkqB4DCasecdSWo5RQEXp9Mc9eeiV6opSzVKpk2Id2jELgNodSyTCDqq" crossorigin="anonymous" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" integrity="sha384-3zSEDfvllQohrq0PHL1fOXJuC/jSOO34H46t6UQfobFOmxE5BpjjaIJY5F2/bMnU" crossorigin="anonymous" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" integrity="sha384-NrKB+u6Ts6AtkIhwPixiKTzgSKNblyhlk0Sohlgar9UHUBzai/sgnNNWWd291xqt" crossorigin="anonymous" defer></script>
 <script>
 (function(){try{
   var pref=localStorage.getItem('dth')||'auto';
@@ -7539,10 +7972,10 @@ body.dragging #dropZone{display:flex}
         <button class="sort-btn" data-s="time">日期</button>
       </div>
     </div>
-    <button id="btnZip" class="tb-btn" title="打包下载当前目录">📦 <span data-l="zip">打包</span></button>
-    <button id="btnShareDir" class="tb-btn" title="分享当前目录">🔗 <span data-l="share">分享</span></button>
+    <button id="tbZip" class="tb-btn" title="打包下载当前目录">📦 <span data-l="zip">打包</span></button>
+    <button id="tbShareDir" class="tb-btn" title="分享当前目录">🔗 <span data-l="share">分享</span></button>
     <button id="btnMulti" class="tb-btn" title="多选">☑ <span data-l="multi">多选</span></button>
-    <button id="btnTrash" class="tb-btn" title="回收站">🗑 <span data-l="trash">回收站</span></button>
+    <button id="tbTrash" class="tb-btn" title="回收站">🗑 <span data-l="trash">回收站</span></button>
     <button id="btnSettings" class="tb-btn" title="设置">⚙ <span data-l="settings">设置</span></button>
   </div>
   <div id="dropZone"><span class="drop-icon">⬇</span><span data-l="dropHint">拖拽文件到此处上传</span></div>
@@ -7598,6 +8031,11 @@ body.dragging #dropZone{display:flex}
 <div class="ctxmenu" id="ctxMenu"></div>
 <script>
 var tk=sessionStorage.getItem('dt')||'',cur='/',viewMode=localStorage.getItem('dv')||'grid',sortKey=localStorage.getItem('ds')||'name',sortAsc=true,selected={},searchMode=false,searchResults=[],favMode=false,recentMode=false,filterType='',filterAge='';
+var MTK='';
+function mediaTok(){return MTK||tk}
+function refreshMediaToken(){if(!tk)return Promise.resolve();return api('/api/media-token').then(function(d){if(d&&d.token)MTK=d.token}).catch(function(){})}
+function authDownload(url,name){fetch(url,{headers:{'Authorization':'Bearer '+tk}}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.blob()}).then(function(b){var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name||'download';document.body.appendChild(a);a.click();setTimeout(function(){try{URL.revokeObjectURL(a.href)}catch(e){};if(a.parentNode)a.parentNode.removeChild(a)},1500)}).catch(function(){alert(lang==='zh'?'下载失败':'Download failed')})}
+refreshMediaToken();setInterval(function(){if(tk)refreshMediaToken()},300000);
 var lang=localStorage.getItem('dl')||'zh';
 var currentItems=[];
 var previewIdx=-1;
@@ -7773,7 +8211,7 @@ function render(){
       html='<div class="file-grid gallery">';
       media.forEach(function(it){
         var p=it.path||cur;
-        var gsrc=(it.hasThumb?'/api/thumb?path=':'/api/preview?path=')+encodeURIComponent(p+it.name)+'&token='+tk;
+        var gsrc=(it.hasThumb?'/api/thumb?path=':'/api/preview?path=')+encodeURIComponent(p+it.name)+'&token='+mediaTok();
         var isV=(it.mime||'').indexOf('video/')===0;
         html+='<div class="gitem" data-p="'+esc(p)+'" data-n="'+esc(it.name)+'" data-t="file" data-m="'+esc(it.mime||'')+'">';
         // 视频没有缩略图时按 <video> 渲染，避免全部显示成破图
@@ -7789,11 +8227,11 @@ function render(){
         html+='<div class="gitem" data-p="'+esc(p)+'" data-n="'+esc(it.name)+'" data-t="'+it.type+'" data-m="'+esc(it.mime||'')+'">';
         html+='<input type="checkbox" data-chk="'+esc(p+it.name)+'" />';
         if(it.type==='file'&&it.hasThumb){
-          html+='<img class="gthumb" src="/api/thumb?path='+encodeURIComponent(p+it.name)+'&token='+tk+'" loading="lazy" />';
+          html+='<img class="gthumb" src="/api/thumb?path='+encodeURIComponent(p+it.name)+'&token='+mediaTok()+'" loading="lazy" />';
         }else if(it.type==='file'&&(it.mime||'').indexOf('video/')===0){
           html+='<div class="gicon">'+getIcon(it)+'</div>';
         }else if(it.type==='file'&&isImage(it)){
-          html+='<img class="gthumb" src="/api/preview?path='+encodeURIComponent(p+it.name)+'&token='+tk+'" loading="lazy" />';
+          html+='<img class="gthumb" src="/api/preview?path='+encodeURIComponent(p+it.name)+'&token='+mediaTok()+'" loading="lazy" />';
         }else{
           html+='<div class="gicon">'+getIcon(it)+'</div>';
         }
@@ -8112,6 +8550,7 @@ document.getElementById('btnSidebar').onclick=function(){document.getElementById
 function rowDir(el){var r=(el&&el.closest)?el.closest('[data-p]'):null;return (r&&r.getAttribute('data-p'))||cur}
 function enterDir(p,name){cur=normP(p)+name+'/';setMode('');load()}
 function setMode(m){
+  QUERY.on=false;QUERY.items=[];
   searchMode=(m==='search');favMode=(m==='fav');recentMode=(m==='recent');tagFilterMode=(m==='tag');
   if(m!=='tag')tagFilterName='';
 }
@@ -8156,7 +8595,7 @@ function bindEvents(c){
   c.querySelectorAll('[data-dlrow]').forEach(function(b){b.onclick=function(e){
     if(e&&e.stopPropagation)e.stopPropagation();
     var p=rowDir(b)+b.getAttribute('data-dlrow');
-    window.open('/api/download?path='+encodeURIComponent(p)+'&token='+tk,'_blank');
+    window.open('/api/download?path='+encodeURIComponent(p)+'&token='+mediaTok(),'_blank');
   }});
   // 行内 ⋯ 菜单
   c.querySelectorAll('[data-rm]').forEach(function(b){b.onclick=function(e){
@@ -8172,9 +8611,13 @@ function bindEvents(c){
   c.querySelectorAll('[data-cp]').forEach(function(b){b.onclick=function(){showMove(b.getAttribute('data-cp'),rowDir(b))}});
   c.querySelectorAll('[data-lockrow]').forEach(function(b){b.onclick=function(){
     var dir=rowDir(b);
-    var pw=prompt(lang==='zh'?'为该目录设置密码（留空清除）：':'Folder password (empty to clear):','');
-    if(pw===null)return;
-    api('/api/folder-pass',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:dir,password:pw})}).then(function(){load()});
+    api('/api/folder-pass?path='+encodeURIComponent(dir)).then(function(st){
+      var oldPw='';
+      if(st&&st.has){oldPw=prompt(lang==='zh'?'当前目录密码：':'Current folder password:','');if(oldPw===null)return}
+      var pw=prompt(lang==='zh'?'为该目录设置密码（留空清除）：':'Folder password (empty to clear):','');
+      if(pw===null)return;
+      api('/api/folder-pass',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:dir,password:pw,oldPassword:oldPw})}).then(function(r){if(r&&r.error)alert(r.error);load()});
+    });
   }});
   c.querySelectorAll('[data-enc]').forEach(function(b){b.onclick=function(){
     var n=b.getAttribute('data-enc');
@@ -8257,10 +8700,10 @@ document.getElementById('batchClr').onclick=function(){selected={};render()};
 document.getElementById('batchCopy').onclick=function(){clipFromSelection('copy')};
 document.getElementById('batchCut').onclick=function(){clipFromSelection('cut');render()};
 document.getElementById('batchDel').onclick=function(){var keys=Object.keys(selected);if(!keys.length||!confirm('Delete '+keys.length+'?'))return;api('/api/batch-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:keys})}).then(function(){selected={};load()})};
-document.getElementById('batchDl').onclick=function(){Object.keys(selected).forEach(function(n){window.open('/api/download?path='+encodeURIComponent(n)+'&token='+tk,'_blank')})};
+document.getElementById('batchDl').onclick=function(){Object.keys(selected).forEach(function(n){window.open('/api/download?path='+encodeURIComponent(n)+'&token='+mediaTok(),'_blank')})};
 document.getElementById('batchZip').onclick=function(){
   var keys=Object.keys(selected);if(!keys.length)return;
-  fetch('/api/zip-multi?token='+tk,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:keys})})
+  fetch('/api/zip-multi',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+tk},body:JSON.stringify({paths:keys})})
     .then(function(r){if(!r.ok){return r.json().then(function(d){alert((d&&d.error)||'failed')})}return r.blob()})
     .then(function(b){if(!b)return;var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='files.zip';document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},1500)})
     .catch(function(){alert('failed')});
@@ -8282,6 +8725,7 @@ function doShareDir(dirPath){
   });
 }
 document.getElementById('btnShareDir').onclick=function(){doShareDir(cur)};
+document.getElementById('tbShareDir').onclick=function(){doShareDir(cur)};
 document.getElementById('btnFetchUrl').onclick=function(){
   var url=prompt('远程文件 URL（http / https）','');if(!url)return;
   var nm=prompt('保存文件名（留空则自动识别）','')||'';
@@ -8307,7 +8751,8 @@ document.getElementById('searchInput').onkeydown=function(e){if(e.key==='Enter')
 function doSearch(){var q=document.getElementById('searchInput').value.trim();if(!q){setMode('');load();return}api('/api/search?q='+encodeURIComponent(q)+'&path=/').then(function(d){setMode('search');searchResults=d.results||[];render()})}
 document.getElementById('btnFav').onclick=function(){var on=!favMode;setMode(on?'fav':'');render()};
 document.getElementById('btnRecent').onclick=function(){var on=!recentMode;setMode(on?'recent':'');render()};
-document.getElementById('btnZip').onclick=function(){window.open('/api/zip?path='+encodeURIComponent(cur)+'&token='+tk,'_blank')};
+document.getElementById('btnZip').onclick=function(){window.open('/api/zip?path='+encodeURIComponent(cur)+'&token='+mediaTok(),'_blank')};
+document.getElementById('tbZip').onclick=function(){window.open('/api/zip?path='+encodeURIComponent(cur)+'&token='+mediaTok(),'_blank')};
 
 
 // ===== QR Code for Share =====
@@ -8389,9 +8834,16 @@ document.getElementById('btnULink').onclick=function(){
   });
 };
 document.getElementById('btnLock').onclick=function(){
-  var pw=prompt(t('setPw'),'');
-  if(pw===null)return;
-  api('/api/folder-pass',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur,password:pw})}).then(function(){alert(pw?t('pwSet'):t('pwRm'))});
+  api('/api/folder-pass?path='+encodeURIComponent(cur)).then(function(st){
+    var oldPw='';
+    if(st&&st.has){oldPw=prompt((lang==='zh'?'当前目录密码：':'Current folder password:'),'');if(oldPw===null)return}
+    var pw=prompt(t('setPw'),'');
+    if(pw===null)return;
+    api('/api/folder-pass',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur,password:pw,oldPassword:oldPw})}).then(function(r){
+      if(r&&r.error){alert(r.error);return}
+      alert(pw?t('pwSet'):t('pwRm'));
+    });
+  });
 };
 document.getElementById('btnLang').onclick=function(){lang=lang==='zh'?'en':'zh';localStorage.setItem('dl',lang);render()};
 document.getElementById('btnView').onclick=function(){cycleView()};
@@ -8559,7 +9011,7 @@ function plLyrics(name){
   }
   if(!hit)return Promise.resolve(null);
   var p=encodeURIComponent((hit.path||cur)+hit.name);
-  return fetch('/api/preview?path='+p+'&token='+tk).then(function(r){return r.text()}).then(function(txt){
+  return fetch('/api/preview?path='+p+'&token='+mediaTok()).then(function(r){return r.text()}).then(function(txt){
     var lines=[],re=/\\[(\\d+):(\\d+(?:\\.\\d+)?)\\](.*)/g,m;
     while((m=re.exec(txt))){lines.push({t:parseInt(m[1],10)*60+parseFloat(m[2]),s:m[3].trim()})}
     lines.sort(function(a,b){return a.t-b.t});
@@ -8576,7 +9028,7 @@ function playPlaylist(idx){
   playlistIdx=idx;PL.idx=idx;
   var it=audios[idx];
   var adir=it.path||cur;
-  var src='/api/preview?path='+encodeURIComponent(adir+it.name)+'&token='+tk;
+  var src='/api/preview?path='+encodeURIComponent(adir+it.name)+'&token='+mediaTok();
   var box=document.getElementById('pvContent');
   var h='<div id="plCover" style="text-align:center"></div>';
   h+='<audio controls autoplay src="'+src+'" id="plAudio" style="width:100%"></audio>';
@@ -8656,7 +9108,7 @@ function startSlideshow(){
   function showNext(){
     var it=imgs[idx];
     var sdir=it.path||cur;
-    var src='/api/preview?path='+encodeURIComponent(sdir+it.name)+'&token='+tk;
+    var src='/api/preview?path='+encodeURIComponent(sdir+it.name)+'&token='+mediaTok();
     var box=document.getElementById('pvContent');
     box.innerHTML='<img src="'+src+'" style="max-width:100%;max-height:65vh;border-radius:8px" /><div class="exif-bar" id="exifBar"></div><div style="text-align:center;margin-top:8px;font-size:13px;color:var(--sys-text-2)">'+(idx+1)+' / '+imgs.length+' · '+esc(it.name)+'</div>';
     loadExif(src);
@@ -8713,7 +9165,7 @@ function doPreview(name,mime,idx,base){
   name=it.name;mime=it.mime||'';
   var idir=it.path||base||cur;
   stopSlideshow();   // 打开新预览时先停掉上一次的幻灯片，避免定时器持续覆盖内容
-  var path=encodeURIComponent(idir+name);var src='/api/preview?path='+path+'&token='+tk;var box=document.getElementById('pvContent');var html='';
+  var path=encodeURIComponent(idir+name);var src='/api/preview?path='+path+'&token='+mediaTok();var box=document.getElementById('pvContent');var html='';
   if((mime||'').indexOf('image/')===0){html='<img src="'+src+'" /><button class="mdl screenshot-btn" onclick="startSlideshow()" style="position:absolute;top:14px;left:18px;z-index:20">▶ '+t('slideshow')+'</button>'}
   else if((mime||'').indexOf('video/')===0)html='<video controls autoplay src="'+src+'" id="pvVideo"></video><button class="mdl screenshot-btn" onclick="takeScreenshot()">📷 '+t('screenshot')+'</button>';
   else if((mime||'').indexOf('audio/')===0){
@@ -8764,7 +9216,7 @@ function doPreview(name,mime,idx,base){
     }
   })}
   document.getElementById('pvModal').classList.add('show');
-  document.getElementById('pvDl').onclick=function(){window.open('/api/download?path='+path+'&token='+tk,'_blank')};
+  document.getElementById('pvDl').onclick=function(){window.open('/api/download?path='+path+'&token='+mediaTok(),'_blank')};
   document.getElementById('pvEdit').onclick=function(){closePv();editText(name,idir)};
   document.getElementById('pvHis').onclick=function(){closePv();showVersions(name,idir)};
   var cmtBtn=document.getElementById('pvCmt');
@@ -8806,7 +9258,7 @@ document.addEventListener('keydown',function(e){
 
 function editText(name,base){
   base=base||cur;
-  var path=encodeURIComponent(base+name);var src='/api/preview?path='+path+'&token='+tk;
+  var path=encodeURIComponent(base+name);var src='/api/preview?path='+path+'&token='+mediaTok();
   var box=document.getElementById('pvContent');
   box.innerHTML='<textarea id="edArea" spellcheck="false">Loading...</textarea><div id="edMsg"></div><div class="mtitle"><span>'+esc(name)+'</span><button class="mdl" id="edSave">'+t('save')+'</button></div>';
   document.getElementById('pvModal').classList.add('show');
@@ -8818,7 +9270,7 @@ function editText(name,base){
     var content=document.getElementById('edArea').value;
     var msg=document.getElementById('edMsg');
     if(msg){msg.textContent='';msg.style.color=''}
-    fetch('/api/save?path='+path+'&token='+tk,{method:'POST',body:content}).then(function(r){
+    fetch('/api/save?path='+path,{method:'POST',headers:{'Authorization':'Bearer '+tk},body:content}).then(function(r){
       if(r.ok){closePv();load();return}
       // 保存失败（413/403/400 等）必须告知用户，不能照常关窗让内容丢失
       return r.json().then(function(d){
@@ -8866,7 +9318,7 @@ function showCtx(x,y,name,type,mime,base){
   if(type==='dir')h+='<div class="mi" data-a="shrd">📁 '+t('share')+'</div>';
   menu.innerHTML=h;menu.style.left=Math.min(x,window.innerWidth-190)+'px';menu.style.top=Math.min(y,window.innerHeight-260)+'px';menu.classList.add('show');
   menu.onclick=function(e){var a=e.target.getAttribute('data-a');if(!a)return;menu.classList.remove('show');
-    if(a==='dl')window.open('/api/download?path='+encodeURIComponent(base+name)+'&token='+tk,'_blank');
+    if(a==='dl')window.open('/api/download?path='+encodeURIComponent(base+name)+'&token='+mediaTok(),'_blank');
     else if(a==='shr')doShare(name,base);
     else if(a==='shrd')doShareDir(base+name+'/');
     else if(a==='his')showVersions(name,base);
@@ -9024,1013 +9476,6 @@ function showNote(name,base){
   document.addEventListener('click',function(e){if(!menu.contains(e.target)&&e.target!==mbtn)closeMenu()});
   document.addEventListener('keydown',function(e){if(e.key==='Escape')closeMenu()});
 })();
-document.getElementById('btnTrash').onclick=showTrash;
-document.getElementById('trClose').onclick=function(){document.getElementById('trModal').classList.remove('show')};
-document.getElementById('trModal').onclick=function(e){if(e.target===this)this.classList.remove('show')};
-function showTrash(){
-  api('/api/trash').then(function(d){
-    var items=d.items||[];
-    var box=document.getElementById('trContent');
-    if(!items.length){box.innerHTML='<p style="color:var(--sys-text-3);text-align:center;padding:24px">'+t('trashEmpty')+'</p>';document.getElementById('trModal').classList.add('show');return}
-    var h='<div style="margin-bottom:12px;display:flex;gap:10px;align-items:center;font-size:13px"><input type="checkbox" id="trAll" style="width:18px;height:18px;accent-color:var(--sys-blue)"><label for="trAll" style="cursor:pointer;color:var(--sys-text-2);font-weight:500">全选</label><span style="flex:1"></span><button id="trBatchRst" class="btn gray small">'+t('batchRestore')+'</button><button id="trBatchPg" class="btn danger small">'+t('batchPurge')+'</button></div>';
-    items.forEach(function(it){
-      var id=esc(it.id||it.name);
-      h+='<div class="tr-row"><input type="checkbox" data-trc="'+id+'"><span class="tr-name">'+esc(it.name)+'</span><span class="tr-meta">'+fmt(it.size)+' · '+it.daysLeft+' '+t('daysLeft')+'</span>';
-      h+='<button data-rst="'+id+'" class="btn gray tiny">'+t('restore')+'</button>';
-      h+='<button data-pg="'+id+'" class="btn tiny danger">'+t('purge')+'</button></div>';
-    });
-    h+='<div style="margin-top:16px;text-align:right"><button id="trPA" class="btn danger small">'+t('emptyTrash')+'</button></div>';
-    box.innerHTML=h;document.getElementById('trModal').classList.add('show');
-
-    function getChecked(){var arr=[];box.querySelectorAll('[data-trc]:checked').forEach(function(cb){arr.push(cb.getAttribute('data-trc'))});return arr}
-    box.querySelectorAll('[data-rst]').forEach(function(b){b.onclick=function(){api('/api/restore?name='+encodeURIComponent(b.getAttribute('data-rst')),{method:'POST'}).then(function(r){if(r&&r.error)alert((lang==='zh'?'恢复失败：':'Restore failed: ')+r.error);showTrash();load()})}});
-    box.querySelectorAll('[data-pg]').forEach(function(b){b.onclick=function(){if(!confirm(t('purge')+'?'))return;api('/api/purge?name='+encodeURIComponent(b.getAttribute('data-pg')),{method:'DELETE'}).then(function(r){if(r&&r.error)alert(r.error);showTrash()})}});
-    var trAll=document.getElementById('trAll');
-    if(trAll)trAll.onchange=function(){box.querySelectorAll('[data-trc]').forEach(function(cb){cb.checked=trAll.checked})};
-    var br=document.getElementById('trBatchRst');if(br)br.onclick=function(){var arr=getChecked();if(!arr.length)return;api('/api/batch-restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:arr})}).then(function(){showTrash();load()})};
-    var bp=document.getElementById('trBatchPg');if(bp)bp.onclick=function(){var arr=getChecked();if(!arr.length)return;if(!confirm(t('batchPurge')+'?'))return;api('/api/batch-purge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:arr})}).then(showTrash)};
-    var pa=document.getElementById('trPA');if(pa)pa.onclick=function(){if(confirm(t('emptyTrash')+'?'))api('/api/purge?name=ALL',{method:'DELETE'}).then(showTrash)};
-  });
-}
-
-document.getElementById('btnLogin').onclick=function(){
-  var fd=new FormData();
-  fd.append('password',document.getElementById('pw').value);
-  var codeEl=document.getElementById('totpCode');
-  if(codeEl&&codeEl.value.trim())fd.append('code',codeEl.value.trim());
-  fetch('/api/login',{method:'POST',body:fd}).then(function(r){return r.json().then(function(d){return{ok:r.ok,d:d}})}).then(function(res){
-    var d=res.d;
-    if(d.token){tk=d.token;sessionStorage.setItem('dt',tk);show('main');loadUsage();goHome();
-      if(d.session==='stateless'){setTimeout(function(){alert(lang==='zh'?'提示：当前为无状态会话（KV 写入不可用）。修改管理员密码后此会话将失效。':'Note: stateless session (KV writes unavailable). Changing the admin password will invalidate it.')},300)}
-      return}
-    // 需要二次验证时把动态码输入框显示出来
-    if(d&&(d.totp||String(d.error||'').toLowerCase().indexOf('code')>=0)){
-      var row=document.getElementById('totpRow');if(row)row.classList.remove('hidden');
-      var el=document.getElementById('loginErr');
-      var tipEl=document.getElementById('totpTip');
-      if(!tipEl&&row){tipEl=document.createElement('div');tipEl.id='totpTip';tipEl.className='login-totp-tip';tipEl.textContent=(lang==='zh'?'该账号已开启二次验证，请输入验证器 App 中的 6 位动态码（丢失可用备用码）':'Two-factor is enabled; enter the 6-digit code from your authenticator app');row.parentNode.insertBefore(tipEl,row.nextSibling)}
-      if(el){el.textContent=''+(d.error||'');el.style.display=(d.error?'block':'none')}
-      if(codeEl)codeEl.focus();
-      return;
-    }
-    document.getElementById('loginErr').style.display='block';
-  }).catch(function(){document.getElementById('loginErr').style.display='block'});
-};
-document.getElementById('pw').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnLogin').click()};
-document.getElementById('totpCode').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnLogin').click()};
-document.getElementById('btnLogout').onclick=function(){tk='';sessionStorage.removeItem('dt');show('login')};
-
-document.getElementById('btnUp').onclick=function(){document.getElementById('fileInput').click()};
-document.getElementById('fileInput').onchange=function(e){uploadFiles(e.target.files);e.target.value=''};
-document.getElementById('dropZone').onclick=function(){document.getElementById('fileInput').click()};
-document.addEventListener('dragover',function(e){e.preventDefault();try{document.body.classList.add('dragging')}catch(_){}});
-document.addEventListener('dragleave',function(e){if(e.relatedTarget===null){try{document.body.classList.remove('dragging')}catch(_){}}});
-document.addEventListener('drop',function(e){e.preventDefault();try{document.body.classList.remove('dragging')}catch(_){}});
-window.addEventListener('dragend',function(){try{document.body.classList.remove('dragging')}catch(_){}});
-(function(){
-  var dz=document.getElementById('dropZone');
-  dz.ondragover=function(e){e.preventDefault();e.stopPropagation();dz.classList.add('over')};
-  dz.ondragleave=function(e){e.preventDefault();dz.classList.remove('over')};
-  dz.ondrop=async function(e){
-    e.preventDefault();e.stopPropagation();dz.classList.remove('over');
-    var dt=e.dataTransfer;var items=dt.items;
-    if(items&&items.length&&items[0].webkitGetAsEntry){
-      var files=[];var pending=[];
-      for(var i=0;i<items.length;i++){var entry=items[i].webkitGetAsEntry();if(entry)pending.push(walkEntry(entry,'',files));}
-      try{await Promise.all(pending)}catch(err){}
-      if(files.length)uploadFiles(files);
-    }else if(dt.files&&dt.files.length){uploadFiles(dt.files);}
-  };
-})();
-function walkEntry(entry,relPath,files){
-  return new Promise(function(resolve){
-    if(entry.isFile){
-      entry.file(function(f){try{f._relPath=relPath+f.name}catch(e){}files.push(f);resolve()},function(){resolve()});
-    }else if(entry.isDirectory){
-      var reader=entry.createReader();var all=[];
-      (function readBatch(){
-        reader.readEntries(function(batch){
-          if(!batch.length){Promise.all(all.map(function(e2){return walkEntry(e2,relPath+entry.name+'/',files)})).then(function(){resolve()});return}
-          all=all.concat(Array.prototype.slice.call(batch));readBatch();
-        },function(){resolve()});
-      })();
-    }else{resolve()}
-  });
-}
-async function makeThumb(file){
-  if(!file.type||file.type.indexOf('image/')!==0)return null;
-  if(file.size>10*1024*1024)return null;
-  try{
-    var bmp=await createImageBitmap(file);
-    var maxDim=240;var w=bmp.width,h=bmp.height;
-    var scale=Math.min(maxDim/w,maxDim/h,1);
-    w=Math.round(w*scale);h=Math.round(h*scale);
-    if(w<1||h<1)return null;
-    var canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;
-    canvas.getContext('2d').drawImage(bmp,0,0,w,h);
-    return await new Promise(function(r){canvas.toBlob(r,'image/jpeg',0.8)});
-  }catch(e){return null}
-}
-
-// ===== Client Image Compression =====
-var compressEnabled=localStorage.getItem('dCompress')==='1';
-window.toggleCompress=function(btn){compressEnabled=!compressEnabled;localStorage.setItem('dCompress',compressEnabled?'1':'0');if(btn)btn.classList.toggle('enc-active')};
-function compressImage(file){
-  return new Promise(function(resolve){
-    if(!compressEnabled||file.type.indexOf('image/')!==0||file.size<500*1024){resolve(file);return}
-    var img=new Image();
-    var url=URL.createObjectURL(file);
-    img.onload=function(){
-      URL.revokeObjectURL(url);
-      var maxW=2048,maxH=2048;
-      var w=img.width,h=img.height;
-      if(w<=maxW&&h<=maxH){resolve(file);return}
-      var ratio=Math.min(maxW/w,maxH/h);
-      w=Math.round(w*ratio);h=Math.round(h*ratio);
-      var canvas=document.createElement('canvas');
-      canvas.width=w;canvas.height=h;
-      canvas.getContext('2d').drawImage(img,0,0,w,h);
-      canvas.toBlob(function(blob){
-        if(blob&&blob.size<file.size){
-          var nf;
-          try{nf=new File([blob],file.name,{type:'image/jpeg'});if(file._relPath)nf._relPath=file._relPath}catch(e){nf=file}
-          resolve(nf);
-        }else{resolve(file)}
-      },'image/jpeg',0.85);
-    };
-    img.onerror=function(){URL.revokeObjectURL(url);resolve(file)};
-    img.src=url;
-  });
-}
-
-// ===== 命令面板（⌘K / Ctrl+K）=====
-var PALETTE={open:false,items:[],idx:0,seq:0};
-function paletteModal(){return document.getElementById('palette')}
-function paletteCommands(){
-  function go(fn){return function(){try{fn()}catch(e){console.warn(e)}}}
-  var zh=lang==='zh';
-  var list=[
-    {ic:'⬆',t:zh?'上传文件':'Upload files',s:'upload',run:go(function(){document.getElementById('fileInput').click()})},
-    {ic:'📁',t:zh?'新建文件夹':'New folder',s:'mkdir',run:go(function(){document.getElementById('folderInput').focus()})},
-    {ic:'🔎',t:zh?'搜索当前盘':'Search all',s:'search',run:go(function(){document.getElementById('searchInput').focus()})},
-    {ic:'🔄',t:zh?'刷新列表':'Refresh',s:'reload',run:go(function(){load()})},
-    {ic:'★',t:zh?'收藏视图':'Favorites',s:'fav',run:go(function(){setMode('fav');render()})},
-    {ic:'🕐',t:zh?'最近访问':'Recent',s:'recent',run:go(function(){setMode('recent');render()})},
-    {ic:'🔀',t:zh?'切换视图（网格/列表/列/图库）':'Cycle view',s:'view',run:go(function(){cycleView()})},
-    {ic:'🔤',t:zh?'排序：名称':'Sort by name',s:'sort name',run:go(function(){sortKey='name';render()})},
-    {ic:'📅',t:zh?'排序：时间':'Sort by date',s:'sort time',run:go(function(){sortKey='time';render()})},
-    {ic:'⚖',t:zh?'排序：大小':'Sort by size',s:'sort size',run:go(function(){sortKey='size';render()})},
-    {ic:'📦',t:zh?'打包当前目录':'ZIP current folder',s:'zip',run:go(function(){document.getElementById('btnZip').click()})},
-    {ic:'📁',t:zh?'分享当前目录':'Share current folder',s:'share',run:go(function(){doShareDir(cur)})},
-    {ic:'📥',t:zh?'从 WebDAV 导入':'Import WebDAV',s:'import',run:go(function(){importWebdav()})},
-    {ic:'⭐',t:zh?'上传队列与并发':'Upload queue',s:'queue',run:go(function(){document.getElementById('upQueueBar').scrollIntoView({behavior:'smooth'})})},
-    {ic:'📋',t:zh?'粘贴到当前目录':'Paste here',s:'paste',run:go(function(){pasteHere(cur)})},
-    {ic:'🗑',t:zh?'回收站':'Trash',s:'trash',run:go(function(){showTrash()})},
-    {ic:'🏷',t:zh?'标签管理':'Tags',s:'tags',run:go(function(){showTagModal()})},
-    {ic:'🔎',t:zh?'重复文件':'Duplicates',s:'dup',run:go(function(){document.getElementById('btnDup').click()})},
-    {ic:'📊',t:zh?'统计面板':'Stats',s:'stats',run:go(function(){showStats()})},
-    {ic:'📜',t:zh?'活动日志':'Activity log',s:'log',run:go(function(){showLog()})},
-    {ic:'🔗',t:zh?'分享管理':'Share manager',s:'shares',run:go(function(){showShareMgmt()})},
-    {ic:'📤',t:zh?'上传链接管理':'Upload links',s:'ulinks',run:go(function(){showULinkMgmt()})},
-    {ic:'🔑',t:zh?'访问令牌':'Tokens',s:'tokens',run:go(function(){showTokens()})},
-    {ic:'🖥',t:zh?'登录设备':'Sessions',s:'sessions',run:go(function(){showSessions()})},
-    {ic:'🛡',t:zh?'二次验证 (TOTP)':'Two-factor',s:'totp',run:go(function(){showTotp()})},
-    {ic:'🛠',t:zh?'运维与配置':'Ops & config',s:'config',run:go(function(){showOps('config')})},
-    {ic:'💾',t:zh?'备份与恢复':'Backup',s:'backup',run:go(function(){showBackup()})},
-    {ic:'🩺',t:zh?'健康检查':'Health',s:'health',run:go(function(){showHealth()})},
-    {ic:'🧹',t:zh?'孤儿文件扫描':'Orphan scan',s:'orphans',run:go(function(){showOrphans()})},
-    {ic:'🖼',t:zh?'公开相册':'Albums',s:'albums',run:go(function(){showAlbums()})},
-    {ic:'🌗',t:zh?'切换主题':'Toggle theme',s:'theme',run:go(function(){document.getElementById('btnTheme').click()})},
-    {ic:'🌐',t:zh?'切换语言':'Toggle language',s:'lang',run:go(function(){document.getElementById('btnLang').click()})},
-    {ic:'⬆',t:zh?'返回上级目录':'Go to parent',s:'parent',run:go(function(){goParent()})},
-    {ic:'🚪',t:zh?'退出登录':'Log out',s:'logout',run:go(function(){document.getElementById('btnLogout').click()})}
-  ];
-  return list;
-}
-function paletteRender(){
-  var box=document.getElementById('paletteList');
-  if(!box)return;
-  var h='';
-  if(!PALETTE.items.length){h='<div class="palette-item" style="color:var(--sys-text-3)">'+(lang==='zh'?'没有匹配结果':'No matches')+'</div>'}
-  PALETTE.items.forEach(function(it,i){
-    h+='<div class="palette-item'+(i===PALETTE.idx?' active':'')+'" data-pi="'+i+'"><span class="pi-ic">'+(it.ic||'•')+'</span><span>'+esc(it.t)+'</span>'+(it.s?('<span class="pi-sub">'+esc(it.s)+'</span>'):'')+'</div>';
-  });
-  box.innerHTML=h;
-  box.querySelectorAll('[data-pi]').forEach(function(el){
-    el.onclick=function(){paletteRun(parseInt(el.getAttribute('data-pi'),10))};
-    el.onmouseenter=function(){PALETTE.idx=parseInt(el.getAttribute('data-pi'),10);paletteRender()};
-  });
-  var act=box.querySelector('.palette-item.active');
-  if(act&&act.scrollIntoView)try{act.scrollIntoView({block:'nearest'})}catch(e){}
-}
-function paletteFilter(q){
-  var all=paletteCommands();
-  q=String(q||'').trim().toLowerCase();
-  if(!q){PALETTE.items=all.slice(0,12);PALETTE.idx=0;paletteRender();return}
-  var hit=all.filter(function(c){return (c.t+' '+(c.s||'')).toLowerCase().indexOf(q)>=0});
-  PALETTE.items=hit.slice(0,10);
-  // 同时搜文件（防抖后走服务端搜索）
-  var my=++PALETTE.seq;
-  clearTimeout(PALETTE.timer);
-  PALETTE.timer=setTimeout(function(){
-    api('/api/search?q='+encodeURIComponent(q)+'&path=/&limit=8').then(function(d){
-      if(my!==PALETTE.seq)return;
-      var res=(d.results||[]).slice(0,8).map(function(r){
-        return {ic:r.type==='dir'?'📁':getIcon(r),t:r.name,s:(r.path||''),file:r,
-          run:function(){
-            if(r.type==='dir'){cur=normP(r.path||'/')+r.name+'/';setMode('');load()}
-            else doPreview(r.name,r.mime||'',-1,r.path||'/');
-          }};
-      });
-      PALETTE.items=hit.slice(0,8).concat(res);
-      PALETTE.idx=0;paletteRender();
-    }).catch(function(){});
-  },220);
-  paletteRender();
-}
-function paletteRun(i){
-  var it=PALETTE.items[i];
-  if(!it)return;
-  paletteClose();
-  setTimeout(function(){try{it.run()}catch(e){console.warn(e)}},30);
-}
-function paletteOpen(){
-  var m=paletteModal();if(!m)return;
-  PALETTE.open=true;m.classList.add('show');
-  var inp=document.getElementById('paletteInput');
-  if(inp){inp.value='';inp.focus()}
-  paletteFilter('');
-}
-function paletteClose(){
-  var m=paletteModal();if(!m)return;
-  PALETTE.open=false;m.classList.remove('show');
-}
-document.getElementById('btnPalette').onclick=function(){paletteOpen()};
-document.getElementById('palette').onclick=function(e){if(e.target===this)paletteClose()};
-document.getElementById('paletteInput').oninput=function(){paletteFilter(this.value)};
-document.getElementById('paletteInput').onkeydown=function(e){
-  if(e.key==='ArrowDown'){e.preventDefault();PALETTE.idx=Math.min(PALETTE.idx+1,PALETTE.items.length-1);paletteRender()}
-  else if(e.key==='ArrowUp'){e.preventDefault();PALETTE.idx=Math.max(0,PALETTE.idx-1);paletteRender()}
-  else if(e.key==='Enter'){e.preventDefault();paletteRun(PALETTE.idx)}
-  else if(e.key==='Escape'){e.preventDefault();paletteClose()}
-};
-
-// ===== 视图切换 / 虚拟滚动 / 列视图 =====
-var VIEWS=['grid','list','columns','gallery'];
-function cycleView(){
-  var i=VIEWS.indexOf(viewMode);
-  viewMode=VIEWS[(i+1)%VIEWS.length];
-  try{localStorage.setItem('dv',viewMode)}catch(e){}
-  syncViewBtn();render();
-}
-function syncViewBtn(){
-  var b=document.getElementById('btnView');
-  if(!b)return;
-  var zh=lang==='zh';
-  var label=viewMode==='grid'?(zh?'网格':'Grid'):viewMode==='list'?(zh?'列表':'List'):viewMode==='columns'?(zh?'列':'Columns'):(zh?'图库':'Gallery');
-  b.innerHTML='▦ <span>'+label+'</span>';
-}
-var VIRT={rowH:46,pad:10,scroll:0,id:'vscroll'};
-function renderVirtualList(container,items,paint,bind){
-  var total=items.length;
-  var vis=Math.ceil(900/VIRT.rowH)+12;
-  var start=Math.max(0,Math.floor(VIRT.scroll/VIRT.rowH)-4);
-  var end=Math.min(total,start+vis);
-  var h='<div class="vscroll" id="'+VIRT.id+'" style="height:100%">';
-  h+='<div style="height:'+(start*VIRT.rowH)+'px"></div><ul class="file-list">';
-  for(var i=start;i<end;i++)h+=paint(items[i],i);
-  h+='</ul><div style="height:'+Math.max(0,(total-end)*VIRT.rowH)+'px"></div></div>';
-  container.innerHTML=h;
-  var sc=document.getElementById(VIRT.id);
-  if(sc){
-    sc.onscroll=function(){
-      VIRT.scroll=sc.scrollTop;
-      if(VIRT.ticking)return;
-      VIRT.ticking=true;
-      requestAnimationFrame(function(){
-        VIRT.ticking=false;
-        var s=Math.max(0,Math.floor(sc.scrollTop/VIRT.rowH)-4);
-        if(Math.abs(s-Math.floor(VIRT.scroll/VIRT.rowH))<6)return;
-        VIRT.scroll=sc.scrollTop;
-        var keep=sc.scrollTop;
-        renderVirtualList(container,items,paint,bind);
-        var ns=document.getElementById(VIRT.id);
-        if(ns)ns.scrollTop=keep;
-      });
-    };
-  }
-  bind();
-}
-
-// ===== 移动端手势（滑动返回 / 左滑多选 / 长按菜单 / 下拉刷新）=====
-function bindGestures(container){
-  var startX=0,startY=0,startT=0,row=null,moved=false;
-  container.addEventListener('touchstart',function(e){
-    if(!e.touches||e.touches.length!==1)return;
-    var t=e.touches[0];
-    startX=t.clientX;startY=t.clientY;startT=Date.now();moved=false;
-    row=e.target.closest?e.target.closest('li,.gitem'):null;
-    if(row&&row.__lp)clearTimeout(row.__lp);
-    if(row){
-      row.__lp=setTimeout(function(){
-        if(moved||!row)return;
-        var p=rowDir(row),n=row.getAttribute('data-n')||row.getAttribute('data-li')||'';
-        showCtx(startX,startY,n,(row.getAttribute('data-p')!==null&&row.getAttribute('data-t'))||'file',row.getAttribute('data-m')||'',p);
-        try{navigator.vibrate&&navigator.vibrate(10)}catch(e2){}
-      },520);
-    }
-  },{passive:true});
-  container.addEventListener('touchmove',function(e){
-    if(!e.touches||e.touches.length!==1)return;
-    var t=e.touches[0];
-    if(Math.abs(t.clientX-startX)>12||Math.abs(t.clientY-startY)>12){moved=true;if(row&&row.__lp)clearTimeout(row.__lp)}
-  },{passive:true});
-  container.addEventListener('touchend',function(e){
-    if(row&&row.__lp)clearTimeout(row.__lp);
-    if(!e.changedTouches||!e.changedTouches.length)return;
-    var t=e.changedTouches[0];
-    var dx=t.clientX-startX,dy=t.clientY-startY,dt=Date.now()-startT;
-    if(dt>700)return;
-    if(Math.abs(dy)>Math.abs(dx))return;
-    if(dx>70&&Math.abs(dy)<45){goParent();return}                  // 右滑 → 返回上级
-    if(dx<-60&&Math.abs(dy)<45&&row){                              // 左滑 → 多选
-      var cb=row.querySelector('[data-chk]');
-      if(cb){cb.checked=!cb.checked;cb.dispatchEvent(new Event('change'))}
-    }
-  },{passive:true});
-  // 下拉刷新
-  var pull=0,pulling=false;
-  container.addEventListener('touchstart',function(e){
-    if(window.scrollY<=2&&e.touches&&e.touches.length===1){pulling=true;pull=e.touches[0].clientY}
-  },{passive:true});
-  container.addEventListener('touchmove',function(e){
-    if(!pulling||!e.touches||!e.touches.length)return;
-    var dy=e.touches[0].clientY-pull;
-    if(dy>80){pulling=false;setMsgTouch(lang==='zh'?'正在刷新…':'Refreshing…');load()}
-  },{passive:true});
-  container.addEventListener('touchend',function(){pulling=false},{passive:true});
-}
-function setMsgTouch(txt){
-  var el=document.getElementById('offlineBar');
-  if(!el)return;
-  el.style.display='block';el.textContent=txt;
-  setTimeout(function(){checkOnline()},1200);
-}
-function goParent(){
-  if(cur==='/')return;
-  var parts=cur.split('/').filter(Boolean);parts.pop();
-  cur=parts.length?'/'+parts.join('/')+'/':'/';
-  setMode('');load();
-}
-
-// ===== 离线只读 =====
-function checkOnline(){
-  var bar=document.getElementById('offlineBar');
-  if(!bar)return;
-  if(navigator.onLine===false){
-    bar.style.display='block';
-    bar.textContent=(lang==='zh'?'📴 离线模式：仅可浏览（列表来自缓存，写入操作不可用）':'Offline: read-only (cached listing)');
-  }else bar.style.display='none';
-}
-window.addEventListener('online',checkOnline);
-window.addEventListener('offline',checkOnline);
-
-// ===== 系统分享 → 上传（Web Share Target）=====
-function bindShareTarget(){
-  function pullShared(count){
-    var n=parseInt(count,10)||0;
-    if(!n)return;
-    var files=[];var done=0;
-    for(var i=0;i<n;i++){
-      (function(i){
-        fetch('/shared/'+i,{cache:'no-store'}).then(function(r){
-          if(!r.ok)throw new Error('miss');
-          var nm='shared-'+i;
-          try{var raw=r.headers.get('X-File-Name');if(raw)nm=decodeURIComponent(raw)}catch(e){}
-          return r.blob().then(function(b){return new File([b],nm,{type:b.type||'application/octet-stream'})});
-        }).then(function(f){files.push(f)}).catch(function(){}).then(function(){
-          if(++done===n&&files.length)uploadFiles(files,cur);
-        });
-      })(i);
-    }
-  }
-  if(navigator.serviceWorker&&navigator.serviceWorker.addEventListener){
-    navigator.serviceWorker.addEventListener('message',function(e){
-      if(e.data&&e.data.type==='shared-files')pullShared(e.data.count);
-    });
-  }
-  try{
-    var m=/[?&]shared=(\\d+)/.exec(location.search);
-    if(m&&parseInt(m[1],10)>0){pullShared(m[1]);try{history.replaceState(null,'',location.pathname)}catch(e){}}
-  }catch(e){}
-}
-bindShareTarget();
-checkOnline();
-
-// ===== 相似图片（感知哈希 dHash + 汉明距离分组）=====
-function dHashFromBlob(blob){
-  return createImageBitmap(blob).then(function(bmp){
-    var w=9,h=8;
-    var c=document.createElement('canvas');c.width=w;c.height=h;
-    var ctx=c.getContext('2d');
-    ctx.drawImage(bmp,0,0,w,h);
-    var d=ctx.getImageData(0,0,w,h).data,bits='';
-    for(var y=0;y<h;y++){
-      for(var x=0;x<w-1;x++){
-        var i=(y*w+x)*4,j=(y*w+x+1)*4;
-        var a=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
-        var b=0.299*d[j]+0.587*d[j+1]+0.114*d[j+2];
-        bits+=(a>b)?'1':'0';
-      }
-    }
-    var hex='';
-    for(var k=0;k<64;k+=4)hex+=parseInt(bits.substr(k,4),2).toString(16);
-    try{if(bmp.close)bmp.close()}catch(e){}
-    return hex;
-  });
-}
-function phDistance(a,b){
-  if(!a||!b||a.length!==b.length)return 99;
-  var n=0;
-  for(var i=0;i<a.length;i++){
-    var x=parseInt(a[i],16)^parseInt(b[i],16);
-    while(x){n+=x&1;x>>=1}
-  }
-  return n;
-}
-function imgUrl(p){return '/api/thumb?path='+encodeURIComponent(p)+'&token='+tk}
-function simModal(){
-  var m=document.getElementById('simModal');
-  if(!m){
-    m=document.createElement('div');m.id='simModal';m.className='modal-bg';
-    m.innerHTML='<div class="modal" style="min-width:460px;max-width:820px"><button class="mclose" id="simClose">✕</button><h3>🖼 '+(lang==='zh'?'相似图片':'Similar images')+'</h3><div id="simContent"></div></div>';
-    document.body.appendChild(m);
-    document.getElementById('simClose').onclick=function(){m.classList.remove('show')};
-    m.onclick=function(e){if(e.target===m)m.classList.remove('show')};
-  }
-  return m;
-}
-function showSimilar(){
-  var m=simModal(),box=document.getElementById('simContent');
-  box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">'+(lang==='zh'?'正在分析当前目录的图片…':'Analyzing images…')+'</p>';
-  m.classList.add('show');
-  var threshold=parseInt(localStorage.getItem('dSimTh')||'8',10)||8;
-  api('/api/media?path='+encodeURIComponent(cur)+'&kind=image&limit=800').then(function(d){
-    var items=(d.items||[]).filter(function(it){return it.mime&&it.mime.indexOf('image/')===0});
-    if(!items.length){box.innerHTML='<p style="text-align:center;color:var(--sys-text-3);padding:20px">'+(lang==='zh'?'当前目录没有图片（可先进入含图片的目录）':'No images in this folder')+'</p>';return}
-    function render(autoIndex){
-      var indexed=items.filter(function(it){return it.ph});
-      var groups=[];
-      indexed.forEach(function(it){
-        var placed=false;
-        for(var g=0;g<groups.length;g++){
-          if(phDistance(groups[g][0].ph,it.ph)<=threshold){groups[g].push(it);placed=true;break}
-        }
-        if(!placed)groups.push([it]);
-      });
-      var multi=groups.filter(function(g){return g.length>1});
-      var h='<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">'
-        +'<span class="dup-path">'+(lang==='zh'?'相似阈值（越小越严格）':'Threshold')+'</span>'
-        +'<input id="simTh" type="number" min="0" max="20" value="'+threshold+'" style="width:70px;padding:5px 8px">'
-        +'<button id="simApply" class="btn gray tiny">'+(lang==='zh'?'重新分组':'Re-group')+'</button>'
-        +'<span style="flex:1"></span><span class="dup-path" id="simStat">'+indexed.length+'/'+items.length+' '+(lang==='zh'?'张已建索引':'indexed')+'</span>'
-        +'<button id="simIndex" class="btn tiny">'+(lang==='zh'?'为剩余图片建索引':'Index rest')+'</button></div>';
-      if(!multi.length)h+='<p style="text-align:center;color:var(--sys-text-3);padding:14px">'+(lang==='zh'?'没有发现相似图片':'No similar images found')+'</p>';
-      multi.forEach(function(g){
-        h+='<div style="margin-bottom:14px;padding:10px;background:var(--sys-fill);border-radius:12px">';
-        h+='<div class="dup-path" style="margin-bottom:6px">'+g.length+' '+(lang==='zh'?'张相似':'similar')+'</div>';
-        h+='<div style="display:flex;gap:8px;flex-wrap:wrap">';
-        g.forEach(function(it){
-          h+='<div style="width:118px"><img src="'+imgUrl(it.k)+'" loading="lazy" style="width:118px;height:92px;object-fit:cover;border-radius:8px;background:var(--sys-fill-2)">'
-            +'<div style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(it.name)+'">'+esc(it.name)+'</div>'
-            +'<div class="dup-path" style="font-size:10.5px">'+fmt(it.size)+'</div>'
-            +'<button class="btn tiny danger" data-simdel="'+esc(it.k)+'" style="margin-top:2px">'+(lang==='zh'?'删除':'Del')+'</button></div>';
-        });
-        h+='</div></div>';
-      });
-      box.innerHTML=h;
-      var ap=document.getElementById('simApply');
-      if(ap)ap.onclick=function(){threshold=Math.max(0,Math.min(20,parseInt(document.getElementById('simTh').value,10)||0));try{localStorage.setItem('dSimTh',String(threshold))}catch(e){}render(false)};
-      var ix=document.getElementById('simIndex');
-      if(ix)ix.onclick=function(){indexMissing(items,render)};
-      box.querySelectorAll('[data-simdel]').forEach(function(b){b.onclick=function(){
-        var k=b.getAttribute('data-simdel');
-        if(!confirm((lang==='zh'?'删除 ':'Delete ')+k+'?'))return;
-        api('/api/delete?path='+encodeURIComponent('/'+k),{method:'DELETE'}).then(function(){load();showSimilar()});
-      }});
-      if(autoIndex&&indexed.length<items.length)indexMissing(items,render);
-    }
-    render(true);
-  }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">Error</p>'});
-}
-// 为缺少 ph 的图片补算感知哈希（每次最多 30 张，避免一次跑太久）
-function indexMissing(items,render){
-  var todo=items.filter(function(it){return !it.ph}).slice(0,30);
-  if(!todo.length)return;
-  var stat=document.getElementById('simStat');
-  var done=0;
-  function step(){
-    if(done>=todo.length){render(false);return}
-    var it=todo[done++];
-    fetch('/api/preview?path='+encodeURIComponent('/'+it.k)+'&token='+tk)
-      .then(function(r){return r.blob()})
-      .then(function(b){return dHashFromBlob(b)})
-      .then(function(hh){return api('/api/phash',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'/'+it.k,hash:hh})})})
-      .then(function(){it.ph='1';if(stat)stat.textContent=(lang==='zh'?'建索引 ':'indexing ')+done+'/'+todo.length})
-      .catch(function(){it.ph='skip'})
-      .then(function(){setTimeout(step,20)});
-  }
-  step();
-}
-
-// ===== 图片批处理（缩放 / 压缩 / 水印 / 旋转）=====
-function imgToolsModal(){
-  var m=document.getElementById('imgToolsModal');
-  if(!m){
-    m=document.createElement('div');m.id='imgToolsModal';m.className='modal-bg';
-    m.innerHTML='<div class="modal" style="min-width:420px;max-width:640px"><button class="mclose" id="imgToolsClose">✕</button><h3>🖌 '+(lang==='zh'?'图片批处理':'Image tools')+'</h3><div id="imgToolsContent"></div></div>';
-    document.body.appendChild(m);
-    document.getElementById('imgToolsClose').onclick=function(){m.classList.remove('show')};
-    m.onclick=function(e){if(e.target===m)m.classList.remove('show')};
-  }
-  return m;
-}
-function showImgTools(){
-  var m=imgToolsModal(),box=document.getElementById('imgToolsContent');
-  var sel=Object.keys(selected);
-  var imgs=sel.filter(function(p){return /\\.(jpe?g|png|webp|gif|bmp|avif)$/i.test(p)});
-  var h='<div class="dup-path" style="margin-bottom:8px">'+(lang==='zh'?'已选 ':'Selected ')+sel.length+' · '+(lang==='zh'?'其中图片 ':'images ')+imgs.length+'</div>';
-  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'最大边长 (px，0=不改)':'Max edge (px)')+'</span><input id="itEdge" type="number" value="2048" style="flex:1;padding:6px 10px"></div>';
-  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'JPEG 质量 (1-100)':'Quality')+'</span><input id="itQ" type="number" value="82" style="flex:1;padding:6px 10px"></div>';
-  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'旋转角度':'Rotate')+'</span><select id="itRot" style="flex:1;padding:6px 10px"><option value="0">0°</option><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select></div>';
-  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'水印文字（可空）':'Watermark text')+'</span><input id="itWm" placeholder="© your name" style="flex:1;padding:6px 10px"></div>';
-  h+='<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="flex:0 0 44%">'+(lang==='zh'?'水印位置':'Watermark pos')+'</span><select id="itWmPos" style="flex:1;padding:6px 10px"><option value="br">'+(lang==='zh'?'右下':'bottom-right')+'</option><option value="bl">'+(lang==='zh'?'左下':'bottom-left')+'</option><option value="tr">'+(lang==='zh'?'右上':'top-right')+'</option><option value="center">'+(lang==='zh'?'居中':'center')+'</option></select></div>';
-  h+='<label style="display:flex;gap:8px;align-items:center;margin:8px 0;font-size:13.5px"><input type="checkbox" id="itCopy" checked>'+(lang==='zh'?'另存为副本（-edit 后缀），不覆盖原图':'Save as copy (-edit)')+'</label>';
-  h+='<div id="itMsg" style="font-size:13px;min-height:18px"></div>';
-  h+='<div style="text-align:right"><button id="itRun" class="btn small" '+(imgs.length?'':'disabled')+'>'+(lang==='zh'?'开始处理':'Run')+'</button></div>';
-  box.innerHTML=h;
-  m.classList.add('show');
-  document.getElementById('itRun').onclick=function(){runImgTools(imgs)};
-}
-async function runImgTools(paths){
-  if(!paths||!paths.length)return;
-  var edge=parseInt(document.getElementById('itEdge').value,10)||0;
-  var q=Math.max(1,Math.min(100,parseInt(document.getElementById('itQ').value,10)||82))/100;
-  var rot=parseInt(document.getElementById('itRot').value,10)||0;
-  var wm=(document.getElementById('itWm').value||'').trim();
-  var wpos=document.getElementById('itWmPos').value;
-  var asCopy=document.getElementById('itCopy').checked;
-  var msg=document.getElementById('itMsg');
-  var ok=0,fail=0;
-  for(var i=0;i<paths.length;i++){
-    var p=paths[i];
-    var div=makeUpItem(p.split('/').filter(Boolean).pop());
-    div.querySelector('.upst').textContent='…';
-    try{
-      var r=await fetch('/api/preview?path='+encodeURIComponent(p)+'&token='+tk);
-      if(!r.ok)throw new Error('HTTP '+r.status);
-      var blob=await r.blob();
-      var bmp=await createImageBitmap(blob);
-      var w=bmp.width,hgt=bmp.height;
-      if(edge>0&&Math.max(w,hgt)>edge){var s=edge/Math.max(w,hgt);w=Math.round(w*s);hgt=Math.round(hgt*s)}
-      var canvas=document.createElement('canvas');
-      if(rot===90||rot===270){canvas.width=hgt;canvas.height=w}else{canvas.width=w;canvas.height=hgt}
-      var ctx=canvas.getContext('2d');
-      ctx.save();
-      if(rot===90){ctx.translate(canvas.width,0);ctx.rotate(Math.PI/2)}
-      else if(rot===180){ctx.translate(canvas.width,canvas.height);ctx.rotate(Math.PI)}
-      else if(rot===270){ctx.translate(0,canvas.height);ctx.rotate(-Math.PI/2)}
-      ctx.drawImage(bmp,0,0,w,hgt);
-      ctx.restore();
-      if(wm){
-        var fs=Math.max(12,Math.round(Math.min(canvas.width,canvas.height)/22));
-        ctx.font='600 '+fs+'px -apple-system,system-ui,sans-serif';
-        ctx.fillStyle='rgba(255,255,255,0.82)';
-        ctx.shadowColor='rgba(0,0,0,0.5)';ctx.shadowBlur=6;
-        var tw=ctx.measureText(wm).width,pad=Math.round(fs*0.6);
-        var x=canvas.width-tw-pad,y=canvas.height-pad;
-        if(wpos==='bl')x=pad;
-        else if(wpos==='tr')y=fs+pad;
-        else if(wpos==='center'){x=(canvas.width-tw)/2;y=canvas.height/2}
-        ctx.fillText(wm,x,y);
-      }
-      var out=await new Promise(function(res){canvas.toBlob(res,'image/jpeg',q)});
-      if(!out)throw new Error('encode failed');
-      var dir=parentOf(p),name=p.split('/').filter(Boolean).pop();
-      var finalName=asCopy?name.replace(/(\\.[^.]+)$/,'-edit$1'):name;
-      var fd=new FormData();
-      fd.append('file',new File([out],finalName,{type:'image/jpeg'}));
-      await new Promise(function(res,rej){
-        var xhr=new XMLHttpRequest();
-        xhr.open('POST','/api/upload?path='+encodeURIComponent(dir)+'&token='+tk);
-        xhr.upload.onprogress=function(e){if(e.lengthComputable)div.querySelector('.upfill').style.width=Math.round(e.loaded/e.total*100)+'%'};
-        xhr.onload=function(){if(xhr.status>=200&&xhr.status<300)res();else rej(new Error('HTTP '+xhr.status))};
-        xhr.onerror=function(){rej(new Error('network'))};
-        xhr.send(fd);
-      });
-      div.querySelector('.upfill').style.width='100%';
-      div.querySelector('.upst').textContent=t('upDone');
-      div.querySelector('.upst').style.color='var(--sys-green)';
-      ok++;
-    }catch(e){
-      div.querySelector('.upst').textContent=(e&&e.message)||t('upFail');
-      div.querySelector('.upst').style.color='var(--sys-red)';
-      fail++;
-    }
-    if(msg)msg.textContent=(ok+fail)+'/'+paths.length;
-    setTimeout(function(){if(div.parentNode)div.parentNode.removeChild(div)},2500);
-  }
-  if(msg){msg.style.color=fail?'var(--sys-red)':'var(--sys-green)';msg.textContent=(lang==='zh'?'完成 ':'done ')+ok+(fail?(' / '+(lang==='zh'?'失败 ':'failed ')+fail):'')}
-  load();
-}
-
-// ===== 收藏分组 =====
-function favGroupsModal(){
-  var m=document.getElementById('favgModal');
-  if(!m){
-    m=document.createElement('div');m.id='favgModal';m.className='modal-bg';
-    m.innerHTML='<div class="modal" style="min-width:440px;max-width:680px"><button class="mclose" id="favgClose">✕</button><h3 id="favgTitle">★ '+(lang==='zh'?'收藏分组':'Favorite groups')+'</h3><div id="favgContent"></div></div>';
-    document.body.appendChild(m);
-    document.getElementById('favgClose').onclick=function(){m.classList.remove('show')};
-    m.onclick=function(e){if(e.target===m)m.classList.remove('show')};
-  }
-  return m;
-}
-function showFavGroups(){
-  var m=favGroupsModal(),box=document.getElementById('favgContent');
-  document.getElementById('favgTitle').textContent='★ '+(lang==='zh'?'收藏分组':'Favorite groups');
-  m.classList.add('show');
-  function paint(){
-    api('/api/favgroups').then(function(d){
-      var groups=d.groups||[];
-      var h='<div class="dup-path" style="margin-bottom:8px">'+(lang==='zh'?'共 ':'total ')+(d.total||0)+' ★ · '+(lang==='zh'?'未分组 ':'ungrouped ')+((d.ungrouped||[]).length)+'</div>';
-      h+='<div style="display:flex;gap:6px;margin-bottom:10px"><input id="fgName" placeholder="'+(lang==='zh'?'新分组名称':'New group name')+'" style="flex:1;padding:7px 10px"><button id="fgAdd" class="btn small">'+(lang==='zh'?'新建':'Create')+'</button></div>';
-      groups.forEach(function(g){
-        h+='<div style="margin-bottom:12px;background:var(--sys-fill);border-radius:12px;padding:10px">';
-        h+='<div style="display:flex;gap:6px;align-items:center"><input value="'+esc(g.name)+'" data-fgrnm="'+esc(g.name)+'" style="width:150px;padding:5px 8px"><span class="dup-path" style="flex:1">'+(g.paths||[]).length+'</span>'
-          +'<button class="btn gray tiny" data-fgrn="'+esc(g.name)+'">'+(lang==='zh'?'重命名':'Rename')+'</button>'
-          +'<button class="btn tiny danger" data-fgrd="'+esc(g.name)+'">✕</button></div>';
-        (g.paths||[]).slice(0,40).forEach(function(p){
-          h+='<div class="token-row" style="padding:4px 0"><span class="dup-path" style="flex:1;overflow:hidden;text-overflow:ellipsis">'+esc(p)+'</span>'
-            +'<button class="btn tiny" data-fgo="'+esc(p)+'">'+(lang==='zh'?'打开':'Open')+'</button>'
-            +'<button class="btn tiny danger" data-fgr="'+esc(p)+'">✕</button></div>';
-        });
-        h+='</div>';
-      });
-      if((d.ungrouped||[]).length){
-        h+='<div style="margin-bottom:8px;font-size:13px;font-weight:600">'+(lang==='zh'?'未分组收藏':'Ungrouped')+'</div>';
-        (d.ungrouped||[]).slice(0,40).forEach(function(p){
-          h+='<div class="token-row" style="padding:4px 0"><span class="dup-path" style="flex:1;overflow:hidden;text-overflow:ellipsis">'+esc(p)+'</span>'
-            +'<input data-fgassign="'+esc(p)+'" placeholder="'+(lang==='zh'?'分到…':'group…')+'" style="width:110px;padding:4px 8px"></div>';
-        });
-      }
-      box.innerHTML=h;
-      document.getElementById('fgAdd').onclick=function(){
-        var n=document.getElementById('fgName').value.trim();if(!n)return;
-        api('/api/favgroups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}).then(paint);
-      };
-      box.querySelectorAll('[data-fgrd]').forEach(function(b){b.onclick=function(){api('/api/favgroups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({delete:b.getAttribute('data-fgrd')})}).then(paint)}});
-      box.querySelectorAll('[data-fgrn]').forEach(function(b){b.onclick=function(){
-        var from=b.getAttribute('data-fgrn');
-        var inp=box.querySelector('[data-fgrnm="'+from+'"]');
-        var to=inp?inp.value.trim():'';
-        if(!to||to===from)return;
-        api('/api/favgroups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({renameFrom:from,renameTo:to})}).then(paint);
-      }});
-      box.querySelectorAll('[data-fgr]').forEach(function(b){b.onclick=function(){
-        api('/api/favgroups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({setPath:b.getAttribute('data-fgr'),group:''})}).then(paint);
-      }});
-      box.querySelectorAll('[data-fgo]').forEach(function(b){b.onclick=function(){
-        var p=b.getAttribute('data-fgo');
-        var dir=p.substring(0,p.lastIndexOf('/')+1)||'/';
-        cur=dir;QUERY.on=false;setMode('');load();m.classList.remove('show');
-      }});
-      box.querySelectorAll('[data-fgassign]').forEach(function(inp){
-        function commit(){
-          var g=inp.value.trim();if(!g)return;
-          api('/api/favgroups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({setPath:inp.getAttribute('data-fgassign'),group:g})}).then(paint);
-        }
-        inp.onchange=commit;
-        inp.onkeydown=function(e){if(e.key==='Enter')commit()};
-      });
-    }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">Error</p>'});
-  }
-  paint();
-}
-
-// ===== 元数据导出 / 导入 =====
-function showMetaIO(){
-  var m=favGroupsModal(),box=document.getElementById('favgContent');
-  document.getElementById('favgTitle').textContent='🏷 '+(lang==='zh'?'元数据导出 / 导入':'Metadata export / import');
-  m.classList.add('show');
-  var h='<div style="font-size:12.5px;color:var(--sys-text-3);line-height:1.7;margin-bottom:10px">'
-    +'<b>'+(lang==='zh'?'导出':'Export')+'</b>：'+(lang==='zh'?'把当前目录（含子目录）的标签、备注、收藏、大小/时间等元数据导出为 JSON 或 CSV（不含文件内容）。':'Exports tags/notes/favorites/size/time as JSON or CSV (no file contents).')+'<br>'
-    +'<b>'+(lang==='zh'?'导入':'Import')+'</b>：'+(lang==='zh'?'把 JSON 元数据套用到现有文件（仅匹配已存在的文件，可合并或覆盖标签）。':'Applies JSON metadata to existing files only.')+'</div>';
-  h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
-    +'<button id="miJson" class="btn small">⬇ JSON</button>'
-    +'<button id="miCsv" class="btn gray small">⬇ CSV</button>'
-    +'<button id="miImp" class="btn gray small">⬆ '+(lang==='zh'?'导入 JSON':'Import JSON')+'</button>'
-    +'<select id="miMode" style="padding:6px 8px"><option value="merge">'+(lang==='zh'?'合并标签':'merge tags')+'</option><option value="replace">'+(lang==='zh'?'覆盖标签':'replace tags')+'</option></select>'
-    +'<input id="miFile" type="file" accept=".json,application/json" style="display:none">'
-    +'</div><div id="miOut" style="font-size:13px;max-height:44vh;overflow:auto"></div>';
-  box.innerHTML=h;
-  document.getElementById('miJson').onclick=function(){window.open('/api/export-meta?path='+encodeURIComponent(cur)+'&format=download&token='+tk,'_blank')};
-  document.getElementById('miCsv').onclick=function(){window.open('/api/export-meta?path='+encodeURIComponent(cur)+'&format=csv&token='+tk,'_blank')};
-  var fi=document.getElementById('miFile');
-  document.getElementById('miImp').onclick=function(){fi.click()};
-  fi.onchange=function(){
-    var f=fi.files&&fi.files[0];if(!f)return;
-    var out=document.getElementById('miOut');
-    out.textContent='…';
-    var rd=new FileReader();
-    rd.onload=function(){
-      var payload=null;
-      try{payload=JSON.parse(rd.result)}catch(e){out.textContent=(lang==='zh'?'JSON 解析失败':'Bad JSON');return}
-      api('/api/import-meta',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payload:payload,mode:document.getElementById('miMode').value})}).then(function(r){
-        if(r&&r.ok){
-          out.innerHTML='<div style="color:var(--sys-green)">'+(lang==='zh'?'导入完成':'Imported')+'</div>'
-            +'<div class="dup-path">'+(lang==='zh'?'匹配 ':'matched ')+r.matched+' · '+(lang==='zh'?'缺失 ':'missing ')+r.missing+' · '+(lang==='zh'?'标签写入 ':'tags ')+r.tagsWritten+' · '+(lang==='zh'?'备注写入 ':'notes ')+r.notesWritten+' · ★ '+r.favAdded+'</div>';
-          load();renderTagSidebar();
-        }else out.textContent=(r&&r.error)||'failed';
-      });
-    };
-    rd.readAsText(f);
-  };
-}
-
-var UQ=[], upSeq=0;
-function upConcurrency(){var n=parseInt(localStorage.getItem('dUpConc')||'',10);return (n>=1&&n<=6)?n:2}
-function setUpConcurrency(n){try{localStorage.setItem('dUpConc',String(n))}catch(e){}renderQueueBar();pump()}
-function taskOf(div){for(var i=0;i<UQ.length;i++)if(UQ[i].div===div)return UQ[i];return null}
-function uploadFiles(files,dir){
-  if(!files||!files.length)return;
-  dir=dir||cur;
-  for(var i=0;i<files.length;i++){
-    var f=files[i];
-    var task={id:'u'+(++upSeq),file:f,name:f.name,size:f.size,dir:dir,relPath:f._relPath||'',status:'waiting',progress:0,div:null,thumb:null,uploadId:null,msg:'',prepared:false};
-    makeUpItem(task);
-    UQ.push(task);
-  }
-  renderQueueBar();pump();
-}
-function pump(){
-  var active=0,i;
-  for(i=0;i<UQ.length;i++)if(UQ[i].status==='uploading')active++;
-  var conc=upConcurrency();
-  for(i=0;i<UQ.length&&active<conc;i++){
-    if(UQ[i].status==='waiting'){runTask(UQ[i]);active++}
-  }
-  renderQueueBar();
-}
-async function runTask(task){
-  if(task.status!=='waiting')return;
-  task.status='uploading';task.msg='';paintTask(task);renderQueueBar();
-  try{
-    var file=task.file;
-    if(!task.prepared){
-      if(file.type&&file.type.indexOf('image/')===0){try{file=await compressImage(file)}catch(e){}}
-      if(task.status!=='uploading'){finishTask(task,'paused');return}
-      var th=null;try{th=await makeThumb(file)}catch(e){}
-      task.workFile=file;task.thumb=th;task.prepared=true;
-      if(task.status!=='uploading'){finishTask(task,'paused');return}
-    }
-    file=task.workFile||file;
-    if(file.size>CHUNK_SIZE)await uploadChunked(task,file);
-    else await uploadSimple(task,file);
-  }catch(e){
-    if(task.status==='uploading'){task.status='failed';task.msg=(e&&e.taskMsg)||(e&&e.message)||t('upFail')}
-  }
-  if(task.status==='uploading')task.status='done';
-  finishTask(task,task.status);
-}
-function finishTask(task,status){
-  if(status)task.status=status;
-  paintTask(task);renderQueueBar();
-  if(task.status==='done'){
-    setTimeout(function(){removeTask(task)},1800);
-    var more=UQ.some(function(x){return (x.status==='uploading'||x.status==='waiting')&&x!==task});
-    if(!more)setTimeout(load,400);
-  }
-}
-function removeTask(task){
-  for(var i=0;i<UQ.length;i++)if(UQ[i]===task)UQ.splice(i,1);
-  if(task.div&&task.div.parentNode)task.div.parentNode.removeChild(task.div);
-  renderQueueBar();
-}
-function pauseTask(task){
-  if(task.status==='waiting'||task.status==='uploading'){
-    task.status='paused';
-    if(task.xhr){try{task.xhr.abort()}catch(e){}}
-    paintTask(task);renderQueueBar();
-  }
-}
-function resumeTask(task){
-  if(task.status==='paused'||task.status==='failed'){task.status='waiting';task.msg='';paintTask(task);pump()}
-}
-function cancelTask(task){
-  task.canceled=true;task.status='canceled';
-  if(task.xhr){try{task.xhr.abort()}catch(e){}}
-  removeTask(task);
-}
-function renderTaskActs(task){
-  var box=task.div?task.div.querySelector('.upacts'):null;if(!box)return;
-  var st=task.status,h='';
-  if(st==='uploading'||st==='waiting')h+='<button data-act="pause" title="'+t('pause')+'">⏸</button>';
-  if(st==='paused'||st==='failed')h+='<button data-act="resume" title="'+t('resume')+'">▶</button>';
-  if(st==='failed')h+='<button data-act="retry" title="'+t('retry')+'">↻</button>';
-  if(st!=='done')h+='<button data-act="cancel" title="'+t('cancel')+'">✕</button>';
-  box.innerHTML=h;
-  box.querySelectorAll('[data-act]').forEach(function(b){
-    b.onclick=function(e){
-      e.stopPropagation();
-      var a=b.getAttribute('data-act');
-      if(a==='pause')pauseTask(task);
-      else if(a==='resume')resumeTask(task);
-      else if(a==='retry')resumeTask(task);
-      else if(a==='cancel')cancelTask(task);
-    };
-  });
-}
-function paintTask(task){
-  if(!task.div)return;
-  var fill=task.div.querySelector('.upfill'),st=task.div.querySelector('.upst');
-  if(fill)fill.style.width=(task.progress||0)+'%';
-  if(st){
-    if(task.status==='waiting')st.textContent=t('upQueue')+'…';
-    else if(task.status==='paused')st.textContent=t('pause');
-    else if(task.status==='failed')st.textContent=task.msg||t('upFail');
-    else if(task.status==='done')st.textContent=t('upDone');
-    else st.textContent=(task.progress||0)+'%';
-    st.style.color=task.status==='failed'?'var(--sys-red)':(task.status==='done'?'var(--sys-green)':'');
-  }
-  renderTaskActs(task);
-}
-function renderQueueBar(){
-  var bar=document.getElementById('upQueueBar');if(!bar)return;
-  var waiting=0,active=0,paused=0,failed=0;
-  UQ.forEach(function(x){
-    if(x.status==='waiting')waiting++;else if(x.status==='uploading')active++;
-    else if(x.status==='paused')paused++;else if(x.status==='failed')failed++;
-  });
-  uploadQueue=waiting+active+paused;
-  if(!UQ.length){bar.innerHTML='';bar.style.display='none';return}
-  var h='<span class="upq-t">'+t('upQueue')+' · '+active+'/'+(waiting+paused)+(failed?(' · <span style="color:var(--sys-red)">'+t('upFail')+' '+failed+'</span>'):'')+'</span>';
-  h+='<span style="flex:1"></span>';
-  h+='<label class="upq-l">'+t('conc')+' <select id="upConcSel">'+[1,2,3,4,5,6].map(function(n){return '<option value="'+n+'"'+(n===upConcurrency()?' selected':'')+'>'+n+'</option>'}).join('')+'</select></label>';
-  h+='<button id="upPauseAll" class="btn gray tiny">'+t('pauseAll')+'</button>';
-  h+='<button id="upResumeAll" class="btn gray tiny">'+t('resumeAll')+'</button>';
-  h+='<button id="upClearDone" class="btn gray tiny">'+t('clearDone')+'</button>';
-  bar.innerHTML=h;bar.style.display='flex';
-  var sel=document.getElementById('upConcSel');if(sel)sel.onchange=function(){setUpConcurrency(parseInt(sel.value,10)||2)};
-  var pa=document.getElementById('upPauseAll');if(pa)pa.onclick=function(){UQ.forEach(function(x){if(x.status==='waiting'||x.status==='uploading')pauseTask(x)})};
-  var ra=document.getElementById('upResumeAll');if(ra)ra.onclick=function(){UQ.forEach(function(x){if(x.status==='paused'||x.status==='failed')resumeTask(x)})};
-  var cd=document.getElementById('upClearDone');if(cd)cd.onclick=function(){UQ.filter(function(x){return x.status==='done'||x.status==='failed'}).forEach(removeTask)};
-}
-function makeUpItem(x){
-  var task=(x&&typeof x==='object')?x:null;
-  var name=task?task.name:String(x==null?'':x);
-  var list=document.getElementById('upList');
-  var div=document.createElement('div');div.className='upitem';
-  div.innerHTML='<span class="upname">'+esc(name)+'</span><div class="upbar"><div class="upfill" style="width:0%"></div></div><span class="upst">0%</span><span class="upacts"></span>';
-  list.appendChild(div);
-  if(task){task.div=div;paintTask(task)}
-  return div;
-}
-function setProgress(div,pct){
-  var task=taskOf(div);
-  if(task){task.progress=pct;paintTask(task);return}
-  if(!div)return;
-  var f=div.querySelector('.upfill'),s=div.querySelector('.upst');
-  if(f)f.style.width=pct+'%';
-  if(s)s.textContent=pct+'%';
-}
-function setDone(div){
-  var task=taskOf(div);
-  if(task){task.progress=100;finishTask(task,'done');return}
-  if(!div)return;
-  var f=div.querySelector('.upfill'),s=div.querySelector('.upst');
-  if(f)f.style.width='100%';
-  if(s){s.textContent=t('upDone');s.style.color='var(--sys-green)'}
-  setTimeout(function(){if(div.parentNode)div.parentNode.removeChild(div)},1500);
-  load();
-}
-function setFail(div,msg){
-  var task=taskOf(div);
-  if(task){task.msg=msg||t('upFail');finishTask(task,'failed');return}
-  if(!div)return;
-  var s=div.querySelector('.upst');
-  if(s){s.textContent=msg||t('upFail');s.style.color='var(--sys-red)'}
-}
-// ===== 秒传 / 断点续传 =====
-async function sha256File(file){
-  if(!file||file.size>64*1024*1024)return '';
-  try{
-    var buf=await file.arrayBuffer();
-    var h=await crypto.subtle.digest('SHA-256',buf);
-    return Array.from(new Uint8Array(h)).map(function(b){return b.toString(16).padStart(2,'0')}).join('');
-  }catch(e){return ''}
-}
-function pendList(){try{return JSON.parse(localStorage.getItem('du_pending')||'[]')}catch(e){return[]}}
-function pendSave(l){try{localStorage.setItem('du_pending',JSON.stringify(l.slice(-20)))}catch(e){}}
-function pendFind(file,dir){var l=pendList(),t=Date.now();for(var i=0;i<l.length;i++){var p=l[i];if(p.name===file.name&&p.size===file.size&&p.dir===dir&&(t-p.ts<86400000))return p}return null}
-function pendAdd(rec){var l=pendList().filter(function(p){return p.uploadId!==rec.uploadId});l.push(rec);pendSave(l)}
-function pendRemove(id){pendSave(pendList().filter(function(p){return p.uploadId!==id}))}
-function pendPrune(){var t=Date.now();var l=pendList().filter(function(p){return p&&p.uploadId&&(t-(p.ts||0)<86400000)});pendSave(l);return l}
-function showPending(){
-  var l=pendPrune();
-  var box=document.getElementById('pendBox');
-  if(!l.length){alert(lang==='zh'?'没有未完成的上传记录':'No pending uploads');return}
-  var h='<div style="font-size:12px;color:var(--sys-text-3);margin-bottom:8px">'+t('resumeTitle')+'</div>';
-  l.forEach(function(p){
-    h+='<div class="token-row"><span class="token-name">'+esc(p.name)+'</span><span class="dup-path">'+fmt(p.size)+' · '+esc(new Date(p.ts).toLocaleString())+'</span></div>';
-  });
-  h+='<div style="margin-top:12px;text-align:right"><button id="pendClear" class="btn danger small">'+t('clearPend')+'</button></div>';
-  if(!box){box=document.createElement('div');box.id='pendBox';box.className='modal-bg';box.innerHTML='<div class="modal" style="min-width:340px;max-width:520px"><button class="mclose" id="pendClose">✕</button><h3>'+t('resumeTitle')+'</h3><div id="pendContent"></div></div>';document.body.appendChild(box);}
-  document.getElementById('pendContent').innerHTML=h;
-  box.classList.add('show');
-  document.getElementById('pendClose').onclick=function(){box.classList.remove('show')};
-  document.getElementById('pendClear').onclick=function(){try{localStorage.removeItem('du_pending')}catch(e){}box.classList.remove('show');renderQueueBar()};
-}
-async function uploadSimple(task,file){
-  var hash=await sha256File(file);
-  if(hash){
-    try{
-      var ic=await api('/api/instant-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hash:hash,name:file.name,size:file.size,dir:task.dir})});
-      if(ic&&ic.hit){task.progress=100;return}
-    }catch(e){}
-  }
-  if(task.status!=='uploading')return;
-  var fd=new FormData();fd.append('file',file);
-  if(task.thumb)fd.append('thumb',task.thumb,'thumb.jpg');
-  if(task.relPath)fd.append('relPath',task.relPath);
-  if(hash)fd.append('hash',hash);
-  await new Promise(function(resolve,reject){
-    var xhr=new XMLHttpRequest();task.xhr=xhr;
-    xhr.open('POST','/api/upload?path='+encodeURIComponent(task.dir)+'&token='+tk);
-    xhr.upload.onprogress=function(e){if(e.lengthComputable){task.progress=Math.round(e.loaded/e.total*100);paintTask(task)}};
-    xhr.onload=function(){
-      task.xhr=null;
-      if(task.status!=='uploading'){resolve();return}
-      if(xhr.status>=200&&xhr.status<300){task.progress=100;resolve();return}
-      var msg=t('upFail');
-      if(xhr.status===423)msg=t('upLocked');
-      else if(xhr.status===413)msg=(lang==='zh'?'超出配额或文件过大':'Quota or size limit');
-      else if(xhr.status===507)msg=(lang==='zh'?'目录已满':'Directory full');
-      var err=new Error(msg);err.taskMsg=msg;reject(err);
-    };
-    xhr.onerror=function(){task.xhr=null;if(task.status==='uploading'){var e=new Error(t('upFail'));e.taskMsg=t('upFail');reject(e)}else resolve()};
-    xhr.onabort=function(){task.xhr=null;resolve()};
-    xhr.send(fd);
-  });
-}
-async function uploadChunked(task,file){
-  var totalChunks=Math.ceil(file.size/CHUNK_SIZE);
-  var hash=await sha256File(file);
-  var uploadId=null,got=[];
-  var pend=pendFind(file,task.dir);
-  if(pend){
-    try{
-      var st=await api('/api/chunk-status?id='+encodeURIComponent(pend.uploadId));
-      if(st&&st.chunks){uploadId=pend.uploadId;got=st.got||[]}
-      else pendRemove(pend.uploadId);
-    }catch(e){}
-  }
-  if(task.status!=='uploading')return;
-  if(!uploadId){
-    var init=await api('/api/chunk-init',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fileName:file.name,totalSize:file.size,hash:hash,path:task.dir,mime:file.type})});
-    if(init.instant){task.progress=100;return}
-    if(!init.uploadId)throw new Error(t('upFail'));
-    uploadId=init.uploadId;
-    pendAdd({uploadId:uploadId,name:file.name,size:file.size,dir:task.dir,ts:Date.now()});
-  }
-  task.uploadId=uploadId;
-  var gotSet={};got.forEach(function(i){gotSet[i]=1});
-  var CONC=Math.min(4,totalChunks);
-  var next=0,doneCount=got.length,aborted=false;
-  task.progress=Math.round(doneCount/totalChunks*100);paintTask(task);
-  async function worker(){
-    while(true){
-      if(aborted||task.status!=='uploading'){aborted=true;return}
-      var i=next++;
-      if(i>=totalChunks)return;
-      if(gotSet[i])continue;
-      var chunk=file.slice(i*CHUNK_SIZE,(i+1)*CHUNK_SIZE);
-      var r=await fetch('/api/chunk-upload/'+uploadId+'/'+i+'?token='+tk,{method:'POST',body:chunk});
-      if(!r.ok){aborted=true;var e=new Error('chunk '+i+' HTTP '+r.status);e.taskMsg=t('upFail');throw e}
-      doneCount++;task.progress=Math.round(doneCount/totalChunks*100);paintTask(task);
-    }
-  }
-  var workers=[];for(var w=0;w<CONC;w++)workers.push(worker());
-  try{await Promise.all(workers)}catch(e){if(task.status==='uploading')throw e;return}
-  if(task.status!=='uploading')return;   // 暂停：保留断点记录，继续时从已收分片续传
-  var done=await api('/api/chunk-complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uploadId:uploadId})});
-  if(done&&done.ok){pendRemove(uploadId);task.progress=100}
-  else{var e2=new Error((done&&done.error)||t('upFail'));e2.taskMsg=(done&&done.error)||t('upFail');throw e2}
-}
-
-document.getElementById('btnMk').onclick=function(){var n=document.getElementById('folderInput').value.trim();if(!n)return;api('/api/mkdir?path='+encodeURIComponent(cur),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}).then(function(){document.getElementById('folderInput').value='';load()})};
-document.getElementById('folderInput').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnMk').click()};
-
 // ===== 视图路由：概览（落地页） / 文件页 =====
 var currentView='home', currentNav='home';
 function applyView(){
@@ -10105,7 +9550,7 @@ function dashHtml(d){
   recent.slice(0,7).forEach(function(it){
     var full=(it.path||'/')+it.name,isImg=it.type==='file'&&(it.mime||'').indexOf('image/')===0;
     h+='<div class="ritem" data-rp="'+esc(full)+'" data-rn="'+esc(it.name)+'" data-rm="'+esc(it.mime||'')+'" data-rt="'+esc(it.type||'file')+'">'
-     +(isImg?'<img loading="lazy" src="/api/thumb?path='+encodeURIComponent(full)+'&token='+tk+'">':'<span class="ri-ic">'+getIcon(it)+'</span>')
+     +(isImg?'<img loading="lazy" src="/api/thumb?path='+encodeURIComponent(full)+'&token='+mediaTok()+'">':'<span class="ri-ic">'+getIcon(it)+'</span>')
      +'<span class="ri-tx">'+esc(it.name)+'</span><span class="ri-sub">'+esc(it.path||'/')+'</span></div>';
   });
   h+='</div></section>';
@@ -10149,89 +9594,8 @@ function bindDash(box,d){
   box.querySelectorAll('[data-dtag]').forEach(function(b){ b.onclick=function(){ goFiles('files');tagFilterMode=true;tagFilterName=b.getAttribute('data-dtag');favMode=false;recentMode=false;searchMode=false;QUERY.on=false;load(); }; });
   box.querySelectorAll('[data-dgo]').forEach(function(el){ el.onclick=function(){ cur=el.getAttribute('data-dgo');goFiles('files');setMode('');load(); }; });
 }
-// 侧栏底部：主题 / 密度 / 主题色 / 语言 / 退出
-function hexToRgba(hex,a){
-  var h=String(hex||'').replace('#','');
-  if(h.length===3)h=h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
-  var n=parseInt(h,16);
-  if(!isFinite(n))return 'rgba(10,132,255,'+a+')';
-  return 'rgba('+((n>>16)&255)+','+((n>>8)&255)+','+(n&255)+','+a+')';
-}
-function applyDensity(v){
-  v=(v==='compact')?'compact':'cozy';
-  document.documentElement.setAttribute('data-density',v);
-  try{localStorage.setItem('dDensity',v)}catch(e){}
-}
-function applyAccent(c){
-  c=/^#[0-9a-fA-F]{6}$/.test(String(c||''))?String(c):'#0a84ff';
-  var r=document.documentElement;
-  if(r&&r.style&&r.style.setProperty){
-    r.style.setProperty('--sys-blue',c);
-    r.style.setProperty('--sys-blue-hover',c);
-    r.style.setProperty('--sys-blue-soft',hexToRgba(c,0.14));
-  }
-  try{localStorage.setItem('dAccent',c)}catch(e){}
-}
-(function initAppearance(){
-  try{applyDensity(localStorage.getItem('dDensity')||'compact')}catch(e){}
-  try{var a=localStorage.getItem('dAccent');if(a)applyAccent(a)}catch(e){}
-  try{if(localStorage.getItem('dSidebar')==='0'){var lay0=document.querySelector('.layout');if(lay0)lay0.classList.add('sidebar-hidden')}}catch(e){}
-})();
-// 顶部「＋」新建菜单 / 搜索折叠
-(function bindAppBar(){
-  var btnNew=document.getElementById('btnNew'),menu=document.getElementById('newMenu');
-  if(btnNew&&menu){
-    btnNew.onclick=function(e){
-      e.stopPropagation();
-      var open=menu.classList.contains('show');
-      document.querySelectorAll('.pop-menu.show').forEach(function(m){if(m!==menu)m.classList.remove('show')});
-      menu.classList.toggle('show',!open);
-    };
-    menu.querySelectorAll('[data-new]').forEach(function(b){
-      b.onclick=function(){
-        var k=b.getAttribute('data-new');
-        menu.classList.remove('show');
-        if(k==='file')document.getElementById('fileInput').click();
-        else if(k==='files'){var fi=document.getElementById('fileInput');if(fi){fi.setAttribute('webkitdirectory','');fi.click();setTimeout(function(){fi.removeAttribute('webkitdirectory')},500)}}
-        else if(k==='dir'){
-          var w=document.getElementById('folderInputWrap');
-          if(w){w.style.display='flex';var inp=document.getElementById('folderInput');if(inp){inp.focus();inp.select()}}
-        }
-        else if(k==='text'){
-          var nm=prompt(lang==='zh'?'文件名（会自动补 .txt）':'File name','note.txt');
-          if(!nm)return;
-          if(!/\\.\\w+$/.test(nm))nm+='.txt';
-          var dirp=cur.substring(0,cur.lastIndexOf('/')+1)||'/';
-          api('/api/save?path='+encodeURIComponent(dirp+nm),{method:'POST',headers:{'Content-Type':'text/plain'},body:''}).then(function(r){
-            if(r&&r.ok){goFiles('files');load();setTimeout(function(){try{editText(nm,dirp)}catch(e){}},300)}
-          });
-        }
-        else if(k==='folder-pw'){
-          try{
-            showOps('rules');
-          }catch(e){}
-        }
-      };
-    });
-  }
-  // 工具栏：刷新 / 多选 / 设置 / 排序菜单
-  (function(){
-    var r=document.getElementById('btnRefresh'); if(r)r.onclick=function(){load()};
-    var m=document.getElementById('btnMulti'); if(m)m.onclick=function(){toggleSelMode()};
-    var stt=document.getElementById('btnSettings'); if(stt)stt.onclick=function(){try{showOps('config')}catch(e){}};
-    var so=document.getElementById('btnSort');
-    if(so)so.onclick=function(e){
-      e.stopPropagation();
-      var menu=document.getElementById('sortMenu'); if(!menu)return;
-      var open=menu.classList.contains('show');
-      document.querySelectorAll('.pop-menu.show').forEach(function(x){x.classList.remove('show')});
-      menu.classList.toggle('show',!open);
-    };
-  })();
-  document.addEventListener('click',function(e){if(!menu.contains(e.target)&&e.target!==mbtn)closeMenu()});
-  document.addEventListener('keydown',function(e){if(e.key==='Escape')closeMenu()});
-})();
 document.getElementById('btnTrash').onclick=showTrash;
+document.getElementById('tbTrash').onclick=showTrash;
 document.getElementById('trClose').onclick=function(){document.getElementById('trModal').classList.remove('show')};
 document.getElementById('trModal').onclick=function(e){if(e.target===this)this.classList.remove('show')};
 function showTrash(){
@@ -10267,7 +9631,7 @@ document.getElementById('btnLogin').onclick=function(){
   if(codeEl&&codeEl.value.trim())fd.append('code',codeEl.value.trim());
   fetch('/api/login',{method:'POST',body:fd}).then(function(r){return r.json().then(function(d){return{ok:r.ok,d:d}})}).then(function(res){
     var d=res.d;
-    if(d.token){tk=d.token;sessionStorage.setItem('dt',tk);show('main');loadUsage();goHome();
+    if(d.token){tk=d.token;MTK='';sessionStorage.setItem('dt',tk);refreshMediaToken().then(function(){show('main');loadUsage();goHome();});
       if(d.session==='stateless'){setTimeout(function(){alert(lang==='zh'?'提示：当前为无状态会话（KV 写入不可用）。修改管理员密码后此会话将失效。':'Note: stateless session (KV writes unavailable). Changing the admin password will invalidate it.')},300)}
       return}
     // 需要二次验证时把动态码输入框显示出来
@@ -10285,7 +9649,11 @@ document.getElementById('btnLogin').onclick=function(){
 };
 document.getElementById('pw').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnLogin').click()};
 document.getElementById('totpCode').onkeydown=function(e){if(e.key==='Enter')document.getElementById('btnLogin').click()};
-document.getElementById('btnLogout').onclick=function(){tk='';sessionStorage.removeItem('dt');show('login')};
+document.getElementById('btnLogout').onclick=function(){
+  api('/api/logout',{method:'POST'}).catch(function(){});
+  try{if(navigator.serviceWorker&&navigator.serviceWorker.controller)navigator.serviceWorker.controller.postMessage({type:'clear-data'})}catch(e){}
+  tk='';sessionStorage.removeItem('dt');show('login');
+};
 
 document.getElementById('btnUp').onclick=function(){document.getElementById('fileInput').click()};
 document.getElementById('fileInput').onchange=function(e){uploadFiles(e.target.files);e.target.value=''};
@@ -10497,7 +9865,7 @@ function syncViewBtn(){
   var label=viewMode==='grid'?(zh?'网格':'Grid'):viewMode==='list'?(zh?'列表':'List'):viewMode==='columns'?(zh?'列':'Columns'):(zh?'图库':'Gallery');
   b.innerHTML='▦ <span>'+label+'</span>';
 }
-var VIRT={rowH:46,pad:10,scroll:0,id:'vscroll'};
+var VIRT={rowH:38,pad:10,scroll:0,id:'vscroll'};
 function renderVirtualList(container,items,paint,bind){
   var total=items.length;
   var vis=Math.ceil(900/VIRT.rowH)+12;
@@ -10531,6 +9899,8 @@ function renderVirtualList(container,items,paint,bind){
 
 // ===== 移动端手势（滑动返回 / 左滑多选 / 长按菜单 / 下拉刷新）=====
 function bindGestures(container){
+  if(container.__gbBound)return;   // 每次 render 复用同一个 #fileList，只绑定一次，避免监听器累积
+  container.__gbBound=true;
   var startX=0,startY=0,startT=0,row=null,moved=false;
   container.addEventListener('touchstart',function(e){
     if(!e.touches||e.touches.length!==1)return;
@@ -10665,7 +10035,7 @@ function phDistance(a,b){
   }
   return n;
 }
-function imgUrl(p){return '/api/thumb?path='+encodeURIComponent(p)+'&token='+tk}
+function imgUrl(p){return '/api/thumb?path='+encodeURIComponent(p)+'&token='+mediaTok()}
 function simModal(){
   var m=document.getElementById('simModal');
   if(!m){
@@ -10739,7 +10109,7 @@ function indexMissing(items,render){
   function step(){
     if(done>=todo.length){render(false);return}
     var it=todo[done++];
-    fetch('/api/preview?path='+encodeURIComponent('/'+it.k)+'&token='+tk)
+    fetch('/api/preview?path='+encodeURIComponent('/'+it.k)+'&token='+mediaTok())
       .then(function(r){return r.blob()})
       .then(function(b){return dHashFromBlob(b)})
       .then(function(hh){return api('/api/phash',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'/'+it.k,hash:hh})})})
@@ -10794,7 +10164,7 @@ async function runImgTools(paths){
     var div=makeUpItem(p.split('/').filter(Boolean).pop());
     div.querySelector('.upst').textContent='…';
     try{
-      var r=await fetch('/api/preview?path='+encodeURIComponent(p)+'&token='+tk);
+      var r=await fetch('/api/preview?path='+encodeURIComponent(p)+'&token='+mediaTok());
       if(!r.ok)throw new Error('HTTP '+r.status);
       var blob=await r.blob();
       var bmp=await createImageBitmap(blob);
@@ -10829,7 +10199,7 @@ async function runImgTools(paths){
       fd.append('file',new File([out],finalName,{type:'image/jpeg'}));
       await new Promise(function(res,rej){
         var xhr=new XMLHttpRequest();
-        xhr.open('POST','/api/upload?path='+encodeURIComponent(dir)+'&token='+tk);
+        xhr.open('POST','/api/upload?path='+encodeURIComponent(dir));xhr.setRequestHeader('Authorization','Bearer '+tk);
         xhr.upload.onprogress=function(e){if(e.lengthComputable)div.querySelector('.upfill').style.width=Math.round(e.loaded/e.total*100)+'%'};
         xhr.onload=function(){if(xhr.status>=200&&xhr.status<300)res();else rej(new Error('HTTP '+xhr.status))};
         xhr.onerror=function(){rej(new Error('network'))};
@@ -10941,8 +10311,8 @@ function showMetaIO(){
     +'<input id="miFile" type="file" accept=".json,application/json" style="display:none">'
     +'</div><div id="miOut" style="font-size:13px;max-height:44vh;overflow:auto"></div>';
   box.innerHTML=h;
-  document.getElementById('miJson').onclick=function(){window.open('/api/export-meta?path='+encodeURIComponent(cur)+'&format=download&token='+tk,'_blank')};
-  document.getElementById('miCsv').onclick=function(){window.open('/api/export-meta?path='+encodeURIComponent(cur)+'&format=csv&token='+tk,'_blank')};
+  document.getElementById('miJson').onclick=function(){authDownload('/api/export-meta?path='+encodeURIComponent(cur)+'&format=download','drive-meta.json')};
+  document.getElementById('miCsv').onclick=function(){authDownload('/api/export-meta?path='+encodeURIComponent(cur)+'&format=csv','drive-meta.csv')};
   var fi=document.getElementById('miFile');
   document.getElementById('miImp').onclick=function(){fi.click()};
   fi.onchange=function(){
@@ -11173,7 +10543,7 @@ async function uploadSimple(task,file){
   if(hash)fd.append('hash',hash);
   await new Promise(function(resolve,reject){
     var xhr=new XMLHttpRequest();task.xhr=xhr;
-    xhr.open('POST','/api/upload?path='+encodeURIComponent(task.dir)+'&token='+tk);
+    xhr.open('POST','/api/upload?path='+encodeURIComponent(task.dir));xhr.setRequestHeader('Authorization','Bearer '+tk);
     xhr.upload.onprogress=function(e){if(e.lengthComputable){task.progress=Math.round(e.loaded/e.total*100);paintTask(task)}};
     xhr.onload=function(){
       task.xhr=null;
@@ -11222,7 +10592,7 @@ async function uploadChunked(task,file){
       if(i>=totalChunks)return;
       if(gotSet[i])continue;
       var chunk=file.slice(i*CHUNK_SIZE,(i+1)*CHUNK_SIZE);
-      var r=await fetch('/api/chunk-upload/'+uploadId+'/'+i+'?token='+tk,{method:'POST',body:chunk});
+      var r=await fetch('/api/chunk-upload/'+uploadId+'/'+i,{method:'POST',headers:{'Authorization':'Bearer '+tk},body:chunk});
       if(!r.ok){aborted=true;var e=new Error('chunk '+i+' HTTP '+r.status);e.taskMsg=t('upFail');throw e}
       doneCount++;task.progress=Math.round(doneCount/totalChunks*100);paintTask(task);
     }
@@ -11325,7 +10695,7 @@ function applyAccent(c){
     var h=String(location.hash||'');
     if(/#\\/?home/.test(h)){navTo('home');return}
     var m=/#\\/files(.*)$/.exec(h);
-    if(m){var p=decodeURIComponent(m[1]||'/')||'/';cur=p;goFiles('files');setMode('');load();return}
+    if(m){var p='/';try{p=decodeURIComponent(m[1]||'/')||'/'}catch(e){}cur=p;goFiles('files');setMode('');load();return}
     if(/#\\/fav/.test(h)){navTo('fav');return}
     if(/#\\/recent/.test(h)){navTo('recent');return}
   });
@@ -11509,13 +10879,15 @@ async function deriveKey(password,salt){
 async function doEncrypt(name,encrypt){
   var pw=document.getElementById('encPwInput').value;
   if(!pw){alert('Password required');return}
+  if(!name){alert(lang==='zh'?'请从文件行内选择要加密/解密的文件':'Pick a file first');return}
   var status=document.getElementById('encStatus');
   status.textContent='Processing...';
   try{
     var path=base+name;
-    var res=await fetch('/api/preview?path='+encodeURIComponent(path)+'&token='+tk);
+    var res=await fetch('/api/preview?path='+encodeURIComponent(path)+'&token='+mediaTok());
     if(!res.ok)throw new Error('Download failed');
     var data=await res.arrayBuffer();
+    if(data.byteLength>100*1024*1024)throw new Error(lang==='zh'?'文件过大（客户端加密上限 100MB）':'File too large for client-side encryption (100MB)');
     var salt=crypto.getRandomValues(new Uint8Array(16));
     var iv=crypto.getRandomValues(new Uint8Array(12));
     var key=await deriveKey(pw,salt);
@@ -11544,11 +10916,15 @@ async function doEncrypt(name,encrypt){
     var fd=new FormData();
     fd.append('file',blob,newName);
     var xhr=new XMLHttpRequest();
-    xhr.open('POST','/api/upload?path='+encodeURIComponent(base)+'&token='+tk);
+    xhr.open('POST','/api/upload?path='+encodeURIComponent(base));xhr.setRequestHeader('Authorization','Bearer '+tk);
     xhr.onload=function(){
       if(xhr.status>=200&&xhr.status<300){
         status.textContent=encrypt?t('encDone'):t('decDone');
         status.style.color='var(--sys-green)';
+        // 加密只是生成 .enc 副本；询问是否删除明文原件，否则"加密"不提供任何机密性
+        if(encrypt&&confirm(lang==='zh'?'已生成加密副本。是否删除明文原件？\\n（删除后只能凭密码解密 .enc 文件）':'Encrypted copy saved. Delete the plaintext original?\\n(You will need the password to decrypt the .enc file)')){
+          api('/api/delete?path='+encodeURIComponent(base+name),{method:'DELETE'}).catch(function(){});
+        }
         setTimeout(function(){document.getElementById('encModal').classList.remove('show');load()},800);
       }else{status.textContent=t('encFail');status.style.color='var(--sys-red)'}
     };
@@ -11678,7 +11054,7 @@ function renderLog(){
   var rs=document.getElementById('logReset');
   if(rs)rs.onclick=function(){logFilter='';logQuery={q:'',from:'',to:''};logFetch()};
   var cs=document.getElementById('logCsv');
-  if(cs)cs.onclick=function(){window.open('/api/log.csv?token='+encodeURIComponent(tk),'_blank')};
+  if(cs)cs.onclick=function(){authDownload('/api/log.csv','drive-log.csv')};
 }
 
 
@@ -11707,8 +11083,10 @@ function showTokens(){
     if(addBtn)addBtn.onclick=function(){
       var name=document.getElementById('tkName').value.trim()||'Token';
       var perm=document.getElementById('tkPerm').value;
-      api('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,perm:perm})}).then(function(r){
+      var pw=prompt((lang==='zh'?'管理员密码：':'Admin password:'),'');if(pw===null)return;
+      api('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,perm:perm,password:pw})}).then(function(r){
         if(r.token){prompt((lang==='zh'?'新令牌（请保存）：':'New token:'),r.token);try{navigator.clipboard.writeText(r.token)}catch(e){}}
+        else alert((r&&r.error)||'failed');
         showTokens();
       });
     };
@@ -12099,8 +11477,7 @@ function showTotp(){
     if(startBtn)startBtn.onclick=function(){totpSetup()};
     var againBtn=document.getElementById('totpAgain');
     if(againBtn)againBtn.onclick=function(){totpSetup()};
-    // pending（已有待确认密钥）时直接显示出二维码，省一次点击
-    if(!d.enabled&&d.pending)try{totpSetup()}catch(e){}
+    // pending 状态不自动生成（生成需要管理员口令），由用户点击按钮触发
     var offBtn=document.getElementById('totpOff');
     if(offBtn)offBtn.onclick=function(){
       var msg=document.getElementById('totpMsg');
@@ -12129,15 +11506,14 @@ function bindCopyCodes(){
   };
 }
 function totpSetup(){
+  var pw=prompt((lang==='zh'?'请输入管理员密码以继续：':'Admin password:'),'');
+  if(!pw)return;
   var host=document.getElementById('totpContent');
   var box=document.getElementById('totpSetupBox');
   if(!box){box=document.createElement('div');box.id='totpSetupBox';host.appendChild(box)}
-  api('/api/totp/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:location.hostname||'PersonalDrive'})}).then(function(d){
-    if(!d||!d.secret){var m=document.getElementById('totpMsg2');if(m){m.style.color='var(--sys-red)';m.textContent=(d&&d.error)||'failed'}return}
-    var grouped=d.secret.replace(/(.{4})/g,'$1 ').trim();
+  api('/api/totp/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:location.hostname||'PersonalDrive',password:pw})}).then(function(d){
+    if(!d||!d.otpauth){var m=document.getElementById('totpMsg2');if(m){m.style.color='var(--sys-red)';m.textContent=(d&&d.error)||'failed'}return}
     var h='<div style="text-align:center;margin:10px 0"><div id="totpQR" style="display:inline-block;padding:8px;background:#fff;border-radius:10px"></div></div>';
-    h+='<div class="dup-path" style="word-break:break-all">'+esc(grouped)+'</div>';
-    h+='<div style="margin-top:8px"><button id="totpCopySecret" class="btn gray tiny">'+(lang==='zh'?'复制密钥':'Copy secret')+'</button></div>';
     h+='<label style="font-size:13px;color:var(--sys-text-2);display:block;margin:10px 0 4px">'+(lang==='zh'?'输入验证器上的 6 位码':'6-digit code')+'</label>';
     h+='<input id="totpEnableCode" inputmode="numeric" autocomplete="one-time-code" style="width:100%;padding:10px 14px">';
     h+='<div style="margin-top:10px;text-align:right"><button id="totpDoEnable" class="btn small">'+(lang==='zh'?'启用':'Enable')+'</button></div>';
@@ -12147,9 +11523,8 @@ function totpSetup(){
       if(typeof QRCode!=='undefined'){new QRCode(document.getElementById('totpQR'),{text:d.otpauth,width:168,height:168,correctLevel:QRCode.CorrectLevel.M})}
       else{document.getElementById('totpQR').textContent='QR lib not loaded'}
     }catch(e){}
-    document.getElementById('totpCopySecret').onclick=function(){try{navigator.clipboard.writeText(d.secret)}catch(e){};this.textContent=(lang==='zh'?'已复制':'Copied')};
     document.getElementById('totpDoEnable').onclick=function(){
-      api('/api/totp/enable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:document.getElementById('totpEnableCode').value})}).then(function(r){
+      api('/api/totp/enable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:document.getElementById('totpEnableCode').value,password:pw})}).then(function(r){
         if(r&&r.ok){
           document.getElementById('totpCodes').innerHTML=totpCodesHtml(r.backupCodes);
           bindCopyCodes();
@@ -12238,13 +11613,19 @@ function opsConfig(box){
     h+='<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end"><button id="cfgReset" class="btn gray small">'+(lang==='zh'?'全部恢复默认':'Reset')+'</button><button id="cfgSave" class="btn small">'+(lang==='zh'?'保存':'Save')+'</button></div>';
     box.innerHTML=h;
     document.getElementById('cfgSave').onclick=function(){
-      var patch={};
+      var patch={};var bad=[];
       groups.forEach(function(g){g[1].forEach(function(f){
         var el=document.getElementById('cfg_'+f[0]);if(!el)return;
         if(f[2]==='bool')patch[f[0]]=el.checked;
-        else{var val=(el.value||'').trim();patch[f[0]]=val===''?null:(f[2]==='number'?Number(val):val)}
+        else{
+          var val=(el.value||'').trim();
+          if(val==='')patch[f[0]]=null;
+          else if(f[2]==='number'){var nv=Number(val);if(!isFinite(nv)){bad.push(f[1]);return}patch[f[0]]=nv}
+          else patch[f[0]]=val;
+        }
       })});
       var msg=document.getElementById('cfgMsg');
+      if(bad.length){msg.style.color='var(--sys-red)';msg.textContent=(lang==='zh'?'请填写有效数字：':'Invalid numbers: ')+bad.join('、');return}
       api('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({patch:patch})}).then(function(r){
         if(r&&r.ok){msg.style.color='var(--sys-green)';msg.textContent=(lang==='zh'?'已保存并立即生效':'Saved');showOps('config')}
         else{msg.style.color='var(--sys-red)';msg.textContent=(r&&r.error)||'failed'}
@@ -12324,9 +11705,10 @@ function opsCron(box){
       });
     };
     box.querySelectorAll('[data-crun]').forEach(function(b){b.onclick=function(){
+      var pw=prompt((lang==='zh'?'管理员密码：':'Admin password:'),'');if(pw===null)return;
       b.textContent='…';
-      api('/api/cron',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:b.getAttribute('data-crun')})}).then(function(r){
-        if(r&&r.result)alert(JSON.stringify(r.result));showOps('cron');
+      api('/api/cron',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:b.getAttribute('data-crun'),password:pw})}).then(function(r){
+        if(r&&r.result)alert(JSON.stringify(r.result));else if(r&&r.error)alert(r.error);showOps('cron');
       });
     }});
     box.querySelectorAll('[data-cdel]').forEach(function(b){b.onclick=function(){
@@ -12495,7 +11877,7 @@ function loadBackups(){
         else{m.style.color='var(--sys-red)';m.textContent=(r&&r.error)||'failed'}
       }).catch(function(){m.style.color='var(--sys-red)';m.textContent='failed'});
     };
-    box.querySelectorAll('[data-bkdl]').forEach(function(b){b.onclick=function(){window.open('/api/backup-download?key='+encodeURIComponent(b.getAttribute('data-bkdl'))+'&token='+tk,'_blank')}});
+    box.querySelectorAll('[data-bkdl]').forEach(function(b){b.onclick=function(){authDownload('/api/backup-download?key='+encodeURIComponent(b.getAttribute('data-bkdl')),'backup.json')}});
     box.querySelectorAll('[data-bkrs]').forEach(function(b){b.onclick=function(){askRestore(b.getAttribute('data-bkrs'))}});
     box.querySelectorAll('[data-bkdf]').forEach(function(b){b.onclick=function(){
       var key=b.getAttribute('data-bkdf');b.textContent='…';
@@ -12595,8 +11977,9 @@ function showOrphans(){
     h+='<div id="orMsg" style="margin-top:10px;font-size:13px;min-height:18px"></div>';
     box.innerHTML=h;
     function run(mode){
+      var pw=prompt((lang==='zh'?'管理员密码：':'Admin password:'),'');if(pw===null)return;
       var m=document.getElementById('orMsg');m.style.color='var(--sys-text-3)';m.textContent=(lang==='zh'?'处理中...':'working...');
-      api('/api/purge-orphans',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})}).then(function(r){
+      api('/api/purge-orphans',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,password:pw})}).then(function(r){
         if(r&&r.ok){m.style.color='var(--sys-green)';m.textContent=(lang==='zh'?'已删除 ':'deleted ')+r.deleted+(lang==='zh'?' 个对象，移除 ':' objects, removed ')+r.removed+(lang==='zh'?' 条记录':' entries');load();}
         else{m.style.color='var(--sys-red)';m.textContent=(r&&r.error)||'failed'}
       }).catch(function(){m.style.color='var(--sys-red)';m.textContent='failed'});
@@ -12678,9 +12061,10 @@ function showApi(){
     h+='<div style="font-size:12px;color:var(--sys-text-3);margin-top:12px;line-height:1.8">'+(lang==='zh'?'也可以用 WebDAV 挂载：<code>'+host+'/dav/</code>，用户名随便填、密码填令牌。':'WebDAV: '+host+'/dav/ with any username and the token as password.')+'</div>';
     box.innerHTML=h;
     document.getElementById('apiNew').onclick=function(){
-      api('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'script',perm:'rw'})}).then(function(r){
+      var pw=prompt((lang==='zh'?'管理员密码：':'Admin password:'),'');if(pw===null)return;
+      api('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'script',perm:'rw',password:pw})}).then(function(r){
         if(r&&r.token){prompt((lang==='zh'?'新令牌（请保存）：':'New token:'),r.token);showApi()}
-        else document.getElementById('apiMsg').textContent='failed';
+        else document.getElementById('apiMsg').textContent=(r&&r.error)||'failed';
       });
     };
   }).catch(function(){box.innerHTML='<p style="text-align:center;color:var(--sys-red);padding:16px">'+(lang==='zh'?'加载失败':'Failed')+'</p>'});
@@ -12741,6 +12125,7 @@ async function handleWebDAV(req, env) {
     try { davPath = decodeURIComponent(url.pathname.replace(/^\/dav/, '') || '/'); }
     catch (e) { davPath = url.pathname.replace(/^\/dav/, '') || '/'; }
     const np = davPathNorm(davPath);
+    if (isInternalPath(np)) return new Response('Not Found', { status: 404 });
 
     const auth = req.headers.get('Authorization') || '';
     // 同时支持 Bearer（脚本/API）与 Basic（操作系统 WebDAV 客户端：用户名任意，密码填令牌）
@@ -12829,11 +12214,12 @@ async function handleWebDAV(req, env) {
       if (!fileName) return new Response('Bad Request', { status: 400 });
       if (await isPathLocked(env, dirPath, '')) return new Response('Locked', { status: 423 });
       const safeName = sanitizeName(fileName);
-      // H1: 上限与配额前置检查（流式写入，避免整块入内存）
+      // H1: 上限与配额前置检查（上限改用 MAX_UPLOAD_MB 配置）
       const clen = Number(req.headers.get('Content-Length') || 0);
-      if (clen > 100 * 1024 * 1024) return new Response('File too large', { status: 413 });
+      if (clen > maxUploadBytes(env)) return new Response('File too large', { status: 413 });
       const existing = await findDirItem(env, dirPath, safeName);
       const oldItem = existing.item;
+      if (oldItem && oldItem.type === 'dir') return new Response('Conflict (name is a folder)', { status: 409 });
       const delta = oldItem ? (clen ? clen - (oldItem.size || 0) : 0) : clen;
       if (delta > 0) {
         const u = await getUsage(env);
@@ -12842,18 +12228,33 @@ async function handleWebDAV(req, env) {
       const key = dirPath.replace(/^\//, '') + safeName;
       const contentType = req.headers.get('Content-Type') || 'application/octet-stream';
       if (clen > 0) {
-        await putAndMirror(env, key, req.body, { httpMetadata: { contentType } });
-        await addUsage(env, delta, oldItem ? 0 : 1);
+        // 必须先快照旧对象再覆盖：否则 pushVersion 读到的是新内容，旧版本永久丢失
         if (oldItem) await pushVersion(env, key, oldItem);
+        await putAndMirror(env, key, req.body, { httpMetadata: { contentType } });
         if (oldItem && oldItem.hasThumb) await deleteThumb(env, key);
         const entry = { name: safeName, type: 'file', size: clen, mime: contentType, time: new Date().toISOString() };
-        await upsertDirItem(env, dirPath, entry);
+        const upRes = await upsertDirItem(env, dirPath, entry);
+        if (upRes && upRes.ok === false) {
+          // 元数据失败：优先从刚保存的版本恢复旧对象，避免文件消失
+          let restored = false;
+          try {
+            const lst = await listVersions(env, key);
+            if (lst && lst.length) { const vo = await env.DRIVE.get(VERSIONS_PREFIX + key + '/' + lst[0].ts); if (vo) { await putAndMirror(env, key, vo.body, { httpMetadata: vo.httpMetadata }); restored = true; } }
+          } catch (e2) {}
+          if (!restored && oldItem) {
+            try { await upsertDirItem(env, dirPath, entry); } catch (e3) {}
+            return new Response('Storage full (content kept)', { status: 507 });
+          }
+          if (!restored) { try { await deleteAndMirror(env, key); } catch (e2) {} }
+          return new Response('Storage full', { status: 507 });
+        }
+        await addUsage(env, delta, oldItem ? 0 : 1);
         await addLog(env, 'up', np, clen + ' bytes (WebDAV)');
         return new Response('', { status: 201 });
       }
-      // Content-Length 缺失（chunked）：限 100MB 后落盘，仍做配额检查
+      // Content-Length 缺失（chunked）：按 MAX_UPLOAD_MB 限流后落盘，仍做配额检查
       const buf = await req.arrayBuffer();
-      if (buf.byteLength > 100 * 1024 * 1024) return new Response('File too large', { status: 413 });
+      if (buf.byteLength > maxUploadBytes(env)) return new Response('File too large', { status: 413 });
       // 必须按实际写入的字节数算配额（此前的 delta 基于 Content-Length=0，覆盖上传会被少算）
       const realDelta = oldItem ? (buf.byteLength - (oldItem.size || 0)) : buf.byteLength;
       if (realDelta > 0) {
@@ -12864,7 +12265,8 @@ async function handleWebDAV(req, env) {
       await putAndMirror(env, key, buf, { httpMetadata: { contentType } });
       if (oldItem && oldItem.hasThumb) await deleteThumb(env, key);
       const entry2 = { name: safeName, type: 'file', size: buf.byteLength, mime: contentType, time: new Date().toISOString() };
-      await upsertDirItem(env, dirPath, entry2);
+      const up2 = await upsertDirItem(env, dirPath, entry2);
+      if (up2 && up2.ok === false) { try { await deleteAndMirror(env, key); } catch (e3) {} return new Response('Storage full', { status: 507 }); }
       await addUsage(env, realDelta, oldItem ? 0 : 1);
       await addLog(env, 'up', np, buf.byteLength + ' bytes (WebDAV)');
       return new Response('', { status: 201 });
@@ -12882,9 +12284,12 @@ async function handleWebDAV(req, env) {
       const destDir = parentOf(destNp);
       const destName = sanitizeName(destNp.split('/').filter(Boolean).pop() || '');
       if (!destName) return new Response('Bad Request', { status: 400 });
+      // 源=目标：幂等无操作（否则"先写后删"会把文件删掉）
+      if (destNp === np) return new Response(null, { status: 204 });
       if (await isPathLocked(env, destDir, '')) return new Response('Locked', { status: 423 });
       // 目标已存在：按 Overwrite 头处理
       const existingDest = await findDirItem(env, destDir, destName);
+      if (existingDest.item && existingDest.item.type === 'dir') return new Response('Conflict (destination is a folder)', { status: 409 });
       const overwrite = (req.headers.get('Overwrite') || 'T').toUpperCase() === 'T';
       if (existingDest.item && !overwrite) return new Response('Precondition Failed', { status: 412 });
       const srcDirNp = parentOf(np);
@@ -12901,7 +12306,8 @@ async function handleWebDAV(req, env) {
         try { await pushVersion(env, newKey, existingDest.item); } catch (e) {}
       }
       await putAndMirror(env, newKey, buf, { httpMetadata: meta });
-      await upsertDirItem(env, destDir, { name: destName, type: 'file', size: buf.byteLength, mime: meta.contentType || '', time: new Date().toISOString() });
+      const upMove = await upsertDirItem(env, destDir, { name: destName, type: 'file', size: buf.byteLength, mime: meta.contentType || '', time: new Date().toISOString() });
+      if (upMove && upMove.ok === false) return new Response('Storage full', { status: 507 });
       if (method === 'MOVE') {
         await removeDirItem(env, srcDirNp, srcNameNp);
         await deleteAndMirror(env, srcKey);
@@ -12988,18 +12394,20 @@ export default {
         if (!publicUploadDir(env)) return html(errorPage('公开上传未开启'));
         return html(publicUploadPage(env));
       }
-      if (p === '/api/public-upload' && req.method === 'POST') return await handlePublicUpload(req, env);
+      if (p === '/api/public-upload' && req.method === 'POST') { const rl = publicRateLimit(env, req, 'pubup', 60); if (rl) return rl; return await handlePublicUpload(req, env); }
       // Web Share Target 兜底：Service Worker 未激活时，POST 会直接到这里
       if (p === '/share-target' && req.method === 'POST') {
         return new Response(null, { status: 303, headers: { Location: '/?shared=0' } });
       }
 
       if (p.startsWith('/a/')) {
+        const rl = publicRateLimit(env, req, 'album', 300); if (rl) return rl;
         const id = p.substring(3);
         if (!id) return html(errorPage('相册不存在'));
         return html(albumPage(id.substring(0, 32)));
       }
       if (p.startsWith('/album/')) {
+        const rl = publicRateLimit(env, req, 'album', 300); if (rl) return rl;
         const rest = p.substring(7);
         const slash = rest.indexOf('/');
         const id = slash < 0 ? rest : rest.substring(0, slash);
@@ -13010,6 +12418,7 @@ export default {
       }
 
       if (p.startsWith('/s/')) {
+        const rl = publicRateLimit(env, req, 'share', 300); if (rl) return rl;
         const rest = p.substring(3);
         const slash = rest.indexOf('/');
         const name = slash < 0 ? rest : rest.substring(0, slash);
@@ -13039,7 +12448,8 @@ export default {
             if (!full.startsWith(base)) return json({ error: 'Forbidden' }, 403);
             target = full.replace(/\/+$/, '') || '/';
           } else target = '/' + String(d.path || '').replace(/^\/+/, '');
-          return json({ comments: await getComments(env, target), allowComment: d.allowComment !== false });
+          const list = await getComments(env, target);
+          return json({ comments: list.map(c => ({ id: c.id, t: c.t, by: c.by, text: c.text })), allowComment: d.allowComment !== false });
         }
         const sd = resolved ? resolved.data : null;
         if (!sd) return html(errorPage('分享链接无效或已过期'));
@@ -13048,13 +12458,24 @@ export default {
       }
 
       if (p.startsWith('/u/')) {
+        const rl = publicRateLimit(env, req, 'ulink', 60); if (rl) return rl;
         const token = p.substring(3);
         const link = await env.STORE.get('ulink:' + token, 'json');
         if (!link || Date.now() > link.exp) return html(errorPage('上传链接无效或已过期'));
         return html(uploadPage(token));
       }
-      if (p.startsWith('/api/upload-link/') && req.method === 'POST') return await handleUploadViaLink(req, env, p.substring('/api/upload-link/'.length));
+      if (p.startsWith('/api/upload-link/') && req.method === 'POST') { const rl = publicRateLimit(env, req, 'ulink', 60); if (rl) return rl; return await handleUploadViaLink(req, env, p.substring('/api/upload-link/'.length)); }
 
+      // 大请求体早拒绝：避免 formData()/arrayBuffer() 先缓冲整个 body 才发现超限（Worker 128MB 内存）
+      const _cl = Number(req.headers.get('content-length') || 0);
+      if (p === '/api/upload') {
+        const simpleMax = Math.min(maxUploadBytes(env), 100 * 1024 * 1024);
+        if (_cl && _cl > simpleMax) return json({ error: 'File too large for simple upload, use chunked upload', max: simpleMax, useChunked: true }, 413);
+      } else if (p === '/api/public-upload') {
+        if (_cl && _cl > publicUploadMax(env) + 1024 * 1024) return json({ error: 'File too large', max: publicUploadMax(env) }, 413);
+      } else if ((p.startsWith('/api/upload-link/') || (p.startsWith('/dav') && req.method === 'PUT')) && _cl && _cl > maxUploadBytes(env) + 1024 * 1024) {
+        return json({ error: 'File too large', max: maxUploadBytes(env) }, 413);
+      }
       if (p.startsWith('/dav')) return await handleWebDAV(req, env);
 
       if (p.startsWith('/api/')) {
@@ -13069,7 +12490,7 @@ export default {
         }
         if (!auth.ok) return json({ error: 'Unauthorized' }, 401);
         // 按会话/令牌限流（防单令牌刷爆 KV 读写配额）：写方法走写桶，读方法走读桶
-        const rlRes = await rateLimitCheck(env, extractToken(req), req.method !== 'GET' && req.method !== 'HEAD');
+        const rlRes = await rateLimitCheck(env, auth.token || extractToken(req), req.method !== 'GET' && req.method !== 'HEAD');
         if (rlRes && rlRes.limited) {
           return new Response(JSON.stringify({ error: 'Too many requests', retryAfter: rlRes.retryAfter }), {
             status: 429,
@@ -13080,8 +12501,14 @@ export default {
         const requireRw = (auth.perm === 'rw');
         const denyRo = () => json({ error: 'Read-only token' }, 403);
         try {
-          if (p === '/api/list') return await handleList(env, url.searchParams.get('path') || '/', url.searchParams.get('size') === '1', extractToken(req));
-          if (p === '/api/unlock' && req.method === 'POST') { const b = await req.json(); return await handleUnlockDir(env, extractToken(req), b.path, b.password); }
+          if (p === '/api/logout' && req.method === 'POST') return await handleLogout(req, env);
+          if (p === '/api/media-token' && req.method === 'GET') return json(await issueMediaToken(env));
+          if (p === '/api/list') {
+            const lp = url.searchParams.get('path') || '/';
+            if (isInternalPath(lp)) return internalDenied();
+            return await handleList(env, lp, url.searchParams.get('size') === '1', extractToken(req));
+          }
+          if (p === '/api/unlock' && req.method === 'POST') { const b = await req.json(); return await handleUnlockDir(env, extractToken(req), b.path, b.password, req); }
           if (p === '/api/upload' && req.method === 'POST') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handleUpload(req, env, url.searchParams.get('path') || '/'); }
           if (p === '/api/download') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handleDownload(env, req, url.searchParams.get('path') || ''); }
           if (p === '/api/preview') { const g = await guard(env, req, url.searchParams.get('path')); if (g) return g; return await handlePreview(env, req, url.searchParams.get('path') || ''); }
@@ -13104,8 +12531,8 @@ export default {
           if (p === '/api/admin-pass' && req.method === 'POST') { const b = await req.json(); return await handleAdminPassSet(env, b.current, b.next); }
           // 二次验证（TOTP）
           if (p === '/api/totp' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleTotpGet(env); }
-          if (p === '/api/totp/setup' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json().catch(() => ({})); return await handleTotpSetup(env, (b && b.label) || (env.DRIVE_TITLE || 'PersonalDrive')); }
-          if (p === '/api/totp/enable' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleTotpEnable(env, b.code); }
+          if (p === '/api/totp/setup' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json().catch(() => ({})); return await handleTotpSetup(env, (b && b.label) || (env.DRIVE_TITLE || 'PersonalDrive'), b && b.password); }
+          if (p === '/api/totp/enable' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleTotpEnable(env, b.code, b.password); }
           if (p === '/api/totp/disable' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleTotpDisable(env, b.password, b.code); }
           if (p === '/api/totp/backup' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleTotpBackup(env, b.password, b.code); }
           // 防外链：签发限时直链（可绑定请求 IP）
@@ -13118,12 +12545,12 @@ export default {
           if (p === '/api/sessions' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleListSessions(env, extractToken(req)); }
           if (p === '/api/session-revoke' && req.method === 'POST') { const b = await req.json(); return await handleRevokeSession(env, b.id, !!b.all); }
           if (p === '/api/duplicates') return await handleDuplicates(env);
-          if (p === '/api/note' && req.method === 'GET') return await handleGetNote(env, url.searchParams.get('path') || '');
-          if (p === '/api/note' && req.method === 'POST') { const b = await req.json(); return await handleSetNote(env, b.path, b.note); }
+          if (p === '/api/note' && req.method === 'GET') { const g = await guard(env, req, url.searchParams.get('path') || ''); if (g) return g; return await handleGetNote(env, url.searchParams.get('path') || ''); }
+          if (p === '/api/note' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.path); if (g) return g; return await handleSetNote(env, b.path, b.note); }
           if (p === '/api/tag' && req.method === 'POST') { const b = await req.json(); return await handleTagFile(env, b.path, b.tags); }
           if (p === '/api/tags' && req.method === 'GET') {
             const f = url.searchParams.get('filter');
-            if (f === '__get__') return json({ tags: await getFileTags(env, '/' + String(url.searchParams.get('path') || '').replace(/^\/+/, '')) });
+            if (f === '__get__') { const tp = '/' + String(url.searchParams.get('path') || '').replace(/^\/+/, ''); const g = await guard(env, req, tp); if (g) return g; return json({ tags: await getFileTags(env, tp) }); }
             if (f) return await handleTagFilter(env, f, url.searchParams.get('mode') || 'any', csvList(url.searchParams.get('more')));
             return await handleGetTags(env);
           }
@@ -13146,7 +12573,11 @@ export default {
           if (p === '/api/share' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.path); if (g) return g; return await handleShare(env, b.path, b.days, b.max, b.password, b.dir, b); }
           if (p === '/api/share/update' && req.method === 'POST') { const b = await req.json(); return await handleShareUpdate(env, b.token, b); }
           if (p === '/api/share-stats' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleShareStats(env, url.searchParams.get('token') || ''); }
-          if (p === '/api/comments' && (req.method === 'GET' || req.method === 'POST' || req.method === 'DELETE')) return await handleComments(env, req, url);
+          if (p === '/api/comments' && (req.method === 'GET' || req.method === 'POST' || req.method === 'DELETE')) {
+            const cp = url.searchParams.get('path') || '';
+            if (cp) { const g = await guard(env, req, cp); if (g) return g; }
+            return await handleComments(env, req, url);
+          }
           // 运维与配置
           if (p === '/api/config' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleConfigGet(env); }
           if (p === '/api/config' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleConfigSet(env, b); }
@@ -13161,9 +12592,9 @@ export default {
           if (p === '/api/upload-link-create' && req.method === 'POST') { const b = await req.json(); return await handleCreateUploadLink(env, b.path, b.days, b.max); }
           if (p === '/api/upload-links' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleListUploadLinks(env); }
           if (p === '/api/upload-link' && req.method === 'DELETE') { const b = await req.json(); return await handleDeleteUploadLink(env, b.token); }
-          if (p === '/api/folder-pass' && req.method === 'POST') { const b = await req.json(); return await handleSetFolderPass(env, b.path, b.password); }
+          if (p === '/api/folder-pass' && req.method === 'POST') { const b = await req.json(); return await handleSetFolderPass(env, b.path, b.password, b.oldPassword, extractToken(req)); }
           if (p === '/api/folder-pass' && req.method === 'GET') return json({ has: !!(await env.STORE.get('dirpass:' + normPath(url.searchParams.get('path') || '/'), 'json')) });
-          if (p === '/api/trash') return await handleTrash(env);
+          if (p === '/api/trash') { if (!requireRw) return denyRo(); return await handleTrash(env); }
           if (p === '/api/restore' && req.method === 'POST') { const r = await handleRestore(env, url.searchParams.get('name') || ''); return json(r, r.status || 200); }
           if (p === '/api/batch-restore' && req.method === 'POST') { const b = await req.json(); return await handleBatchRestore(env, b.ids); }
           if (p === '/api/purge' && req.method === 'DELETE') return await handlePurge(env, url.searchParams.get('name') || '');
@@ -13181,7 +12612,17 @@ export default {
           if (p === '/api/backends' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleListBackends(env); }
           if (p === '/api/backends/check' && req.method === 'POST') return await handleCheckBackends(env);
           if (p === '/api/tokens' && req.method === 'GET') { if (!requireRw) return denyRo(); return json({ tokens: (await getAccessTokens(env)).map(t => ({ id: t.token.substring(0, 6) + '****', name: t.name, perm: t.perm, exp: t.exp || null })) }); }
-          if (p === '/api/tokens' && req.method === 'POST') { const b = await req.json(); const tokens = await getAccessTokens(env); const nt = { name: b.name || 'Token', token: randToken(), perm: b.perm === 'rw' ? 'rw' : 'ro', exp: b.exp || null }; tokens.push(nt); await saveAccessTokens(env, tokens); return json({ ok: true, token: nt.token }); }
+          if (p === '/api/tokens' && req.method === 'POST') {
+            if (!requireRw) return denyRo();
+            const b = await req.json();
+            if (!await checkAdminPassword(env, b.password || '')) return json({ error: 'Wrong password' }, 403);
+            const tokens = await getAccessTokens(env);
+            const expRaw = Number(b.exp);
+            const exp = (Number.isFinite(expRaw) && expRaw > Date.now()) ? expRaw : Date.now() + 30 * 86400 * 1000;
+            const nt = { name: b.name || 'Token', token: randToken(), perm: b.perm === 'rw' ? 'rw' : 'ro', exp };
+            tokens.push(nt); await saveAccessTokens(env, tokens);
+            return json({ ok: true, token: nt.token, exp });
+          }
           if (p === '/api/tokens' && req.method === 'DELETE') { const b = await req.json(); const id = String(b.id || b.token || ''); const mask = id.replace(/\*+$/, ''); const tokens = (await getAccessTokens(env)).filter(t => t.token !== id && !(mask.length >= 6 && t.token.startsWith(mask))); await saveAccessTokens(env, tokens); return json({ ok: true }); }
           if (p === '/api/stats') { if (!requireRw) return denyRo(); return await handleStatsFull(env); }
           if (p === '/api/dashboard') { if (!requireRw) return denyRo(); return await handleDashboard(env, extractToken(req)); }
@@ -13193,7 +12634,7 @@ export default {
           if (p === '/api/backup-restore' && req.method === 'POST') { const b = await req.json(); return await handleBackupRestore(env, b.key, b.password); }
           if (p === '/api/health' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleHealth(env); }
           if (p === '/api/scan-orphans' && req.method === 'POST') return await handleScanOrphans(env);
-          if (p === '/api/purge-orphans' && req.method === 'POST') { const b = await req.json(); return await handlePurgeOrphans(env, b.mode || 'objects'); }
+          if (p === '/api/purge-orphans' && req.method === 'POST') { const b = await req.json(); return await handlePurgeOrphans(env, b.mode || 'objects', b.password); }
           if (p === '/api/webhook' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleGetWebhook(env); }
           if (p === '/api/webhook' && req.method === 'POST') { const b = await req.json(); return await handleSetWebhook(env, b); }
           if (p === '/api/webhook-test' && req.method === 'POST') return await handleWebhookTest(env);
@@ -13204,7 +12645,7 @@ export default {
             path: url.searchParams.get('path') || '/',
             kind: url.searchParams.get('kind') || 'media',
             limit: url.searchParams.get('limit') || ''
-          });
+          }, extractToken(req));
           if (p === '/api/phash' && req.method === 'POST') { const b = await req.json(); return await handleSetPhash(env, b); }
           // 检索与组织
           if (p === '/api/query' && req.method === 'GET') return await handleQuery(env, {
@@ -13230,16 +12671,18 @@ export default {
           if (p === '/api/tags/batch' && req.method === 'POST') { const b = await req.json(); return await handleTagBatch(env, b.paths, b.add, b.remove, b.mode); }
           if (p === '/api/tags/auto' && req.method === 'POST') { const b = await req.json(); return await handleTagAuto(env, b); }
           if (p === '/api/favgroups' && (req.method === 'GET' || req.method === 'POST')) { if (!requireRw) return denyRo(); return await handleFavGroups(env, req); }
-          if (p === '/api/export-meta' && req.method === 'GET') { if (!requireRw) return denyRo(); return await handleExportMeta(env, {
+          if (p === '/api/export-meta' && req.method === 'GET') { if (!requireRw) return denyRo();
+            const g = await guard(env, req, url.searchParams.get('path') || '/'); if (g) return g;
+            return await handleExportMeta(env, {
             path: url.searchParams.get('path') || '/',
             format: url.searchParams.get('format') || ''
           }); }
           if (p === '/api/import-meta' && req.method === 'POST') { if (!requireRw) return denyRo(); const b = await req.json(); return await handleImportMeta(env, b); }
           if (p === '/api/albums' && req.method === 'DELETE') { const b = await req.json(); return await handleDeleteAlbum(env, b.id); }
-          if (p === '/api/recent' && req.method === 'GET') return await handleGetRecent(env);
+          if (p === '/api/recent' && req.method === 'GET') return await handleGetRecent(env, extractToken(req));
           if (p === '/api/recent' && req.method === 'POST') { const b = await req.json(); await addRecent(env, b.path); return json({ ok: true }); }
-          if (p === '/api/favs' && req.method === 'GET') { return json({ items: await enrichPathItems(env, await getFavs(env)) }); }
-          if (p === '/api/fav' && req.method === 'POST') { const b = await req.json(); await toggleFav(env, b.path); return json({ ok: true }); }
+          if (p === '/api/favs' && req.method === 'GET') { return json({ items: await enrichPathItems(env, await getFavs(env), extractToken(req)) }); }
+          if (p === '/api/fav' && req.method === 'POST') { const b = await req.json(); const g = await guard(env, req, b.path); if (g) return g; await toggleFav(env, b.path); return json({ ok: true }); }
         } catch (e) { console.error(e); return json({ error: 'Internal error' }, 500); }
         return json({ error: 'Not found' }, 404);
       }
@@ -13252,28 +12695,25 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
-      try {
-        // 1) 回收站过期清理（TRASH_DAYS，默认 30 天）
-        await gcTrash(env, 5000);
-        // 1.5) 用户自定义定时任务（TTL 目录 / 清空目录 / 自动归档）
-        try { await runAllCronJobs(env, 10); } catch (e) { console.error('cron jobs failed:', e); }
-        // 2) 未完成上传的分片回收（CHUNK_GC_HOURS，默认 24 小时）
-        const chunksGone = await gcChunks(env, 5000);
-        // 3) 版本/缩略图等内部对象的失效回收
-        const internalGone = await gcInternalObjects(env, 2000);
-        // 4) 用量校准（避免计数漂移导致配额形同虚设）
-        try { await recalcUsage(env); } catch (e) {}
-        // 5) 遥测缓冲落盘
-        try { await flushTelemetry(env); } catch (e) {}
-        // 6) 每日自动快照（当天已有则跳过）
-        try {
-          const listed = await env.DRIVE.list({ prefix: BACKUP_PREFIX, limit: 200 });
-          const objs = listed.objects || [];
-          const recent = objs.some(function (o) { return o.uploaded && (Date.now() - new Date(o.uploaded).getTime() < 20 * 3600 * 1000); });
-          if (!recent) await createBackup(env, 'auto');
-        } catch (e) { console.error('Backup failed:', e); }
-        console.log('scheduled: chunks=' + chunksGone + ' internal=' + internalGone);
-      } catch (e) { console.error('Scheduled cleanup failed:', e); }
+      const stats = { chunks: 0, internal: 0, trash: 0, steps: [] };
+      // 每一步独立 try/catch：任何一步超时/超限都不能拖垮后续内务与备份
+      const step = async (name, fn) => {
+        try { const r = await fn(); stats.steps.push(name + ':ok'); return r; }
+        catch (e) { stats.steps.push(name + ':fail'); console.error('scheduled step failed:', name, (e && e.message) || e); return null; }
+      };
+      stats.trash = await step('trash', async () => await gcTrash(env, 5000)) || 0;
+      await step('cron', async () => await runAllCronJobs(env, 10));
+      stats.chunks = await step('chunks', async () => await gcChunks(env, 5000)) || 0;
+      stats.internal = await step('internal', async () => await gcInternalObjects(env, 2000)) || 0;
+      await step('recalc', async () => await recalcUsage(env));
+      await step('telemetry', async () => await flushTelemetry(env));
+      await step('backup', async () => {
+        const listed = await env.DRIVE.list({ prefix: BACKUP_PREFIX, limit: 200 });
+        const objs = listed.objects || [];
+        const recent = objs.some(function (o) { return o.uploaded && (Date.now() - new Date(o.uploaded).getTime() < 20 * 3600 * 1000); });
+        if (!recent) { const br = await createBackup(env, 'auto'); if (br && br.ok === false) console.error('Backup failed:', br.error || br); }
+      });
+      console.log('scheduled:', JSON.stringify(stats));
     })());
   }
 };
